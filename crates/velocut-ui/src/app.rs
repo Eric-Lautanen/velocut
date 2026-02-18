@@ -6,11 +6,11 @@ use velocut_media::audio::cleanup_audio_temp;
 use crate::context::AppContext;
 use crate::theme::configure_style;
 use crate::modules::{
-    EditorModule,  // must be in scope for .ui() calls on concrete module types
+    EditorModule,
     timeline::TimelineModule,
     preview_module::PreviewModule,
     library::LibraryModule,
-    export::ExportModule,
+    export_module::ExportModule,
     audio_module::AudioModule,
     video_module::VideoModule,
 };

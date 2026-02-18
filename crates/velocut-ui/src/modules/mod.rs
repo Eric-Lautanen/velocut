@@ -8,7 +8,7 @@
 pub mod timeline;
 pub mod preview_module;
 pub mod library;
-pub mod export;
+pub mod export_module;
 pub mod video_module;
 pub mod audio_module;
 
