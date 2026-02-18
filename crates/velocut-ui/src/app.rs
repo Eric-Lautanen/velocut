@@ -3,6 +3,8 @@ use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
 use velocut_core::media_types::PlaybackFrame;
 use velocut_media::{MediaWorker, MediaResult};
+use velocut_media::audio::cleanup_audio_temp;
+use crate::context::AppContext;
 use crate::theme::{configure_style, ACCENT, DARK_BG_2, DARK_BORDER};
 use crate::modules::{
     EditorModule,
@@ -10,6 +12,7 @@ use crate::modules::{
     preview::PreviewModule,
     library::LibraryModule,
     export::ExportModule,
+    audio::AudioModule,
     ThumbnailCache,
 };
 use crate::paths::app_ffmpeg_dir;
@@ -17,13 +20,9 @@ use eframe::egui;
 use ffmpeg_sidecar::command::ffmpeg_is_installed;
 use ffmpeg_sidecar::download::unpack_ffmpeg;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
-use rodio::{OutputStream, OutputStreamBuilder, Sink, Decoder};
-use std::fs::File;
-use std::collections::HashMap as RodioHashMap;
 use rfd::FileDialog;
 
 #[derive(Serialize, Deserialize)]
@@ -63,24 +62,13 @@ impl Default for DownloadProgress {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct VeloCutApp {
-    state:           ProjectState,
-    modules:         Vec<Box<dyn EditorModule>>,
-    thumbnail_cache: ThumbnailCache,
-    frame_cache:     HashMap<Uuid, egui::TextureHandle>,
-    frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
-    media_worker:    MediaWorker,
-    last_frame_req:     Option<(Uuid, u32)>,
-    prev_playing:       bool,
-    playback_media_id:  Option<Uuid>,  // tracks which clip the playback thread is decoding
-    /// Wall-clock instant the scrub head last moved (for debounce)
-    scrub_last_moved:   Option<std::time::Instant>,
-    /// The coarse bucket (2 s grid) last requested for background prefetch
-    scrub_coarse_req:   Option<(Uuid, u32)>,
-    ffmpeg_ready:    bool,
-    dl_progress:     Option<Arc<Mutex<DownloadProgress>>>,
-    // Audio (rodio 0.21)
-    audio_stream:    Option<OutputStream>,
-    audio_sinks:     RodioHashMap<Uuid, Sink>,
+    state:        ProjectState,
+    context:      AppContext,
+    modules:      Vec<Box<dyn EditorModule>>,
+    /// Commands emitted by modules each frame, processed after the UI pass
+    pending_cmds: Vec<EditorCommand>,
+    ffmpeg_ready: bool,
+    dl_progress:  Option<Arc<Mutex<DownloadProgress>>>,
 }
 
 impl VeloCutApp {
@@ -118,54 +106,155 @@ impl VeloCutApp {
 
         let media_worker = MediaWorker::new();
         for clip in &state.library {
-            if !clip.duration_probed {
-                media_worker.probe_clip(clip.id, clip.path.clone());
-            } else if let Some(thumb) = &clip.thumbnail_path {
-                media_worker.reload_thumbnail(clip.id, thumb.clone());
-            }
+            // Always re-probe on startup — thumbnails and audio are runtime-only
+            // (temp WAVs deleted on exit, textures not serialized). Duration and
+            // waveform peaks are already in state so probe just refreshes visuals.
+            media_worker.probe_clip(clip.id, clip.path.clone());
         }
 
-        // rodio 0.21 audio setup
-        let audio_stream = OutputStreamBuilder::open_default_stream().ok();
-        let audio_sinks = RodioHashMap::new();
+        let context = AppContext::new(media_worker);
 
         Self {
             state,
+            context,
             modules: vec![
                 Box::new(LibraryModule),
                 Box::new(PreviewModule),
                 Box::new(TimelineModule),
                 Box::new(ExportModule::default()),
+                Box::new(AudioModule::new()),
             ],
-            thumbnail_cache: HashMap::new(),
-            frame_cache:     HashMap::new(),
-            frame_bucket_cache: HashMap::new(),
-            media_worker,
-            last_frame_req:     None,
-            prev_playing:       false,
-            playback_media_id:  None,
-            scrub_last_moved:   None,
-            scrub_coarse_req:   None,
+            pending_cmds: Vec::new(),
             ffmpeg_ready,
             dl_progress,
-            audio_stream,
-            audio_sinks,
+        }
+    }
+
+    fn process_command(&mut self, cmd: EditorCommand) {
+        match cmd {
+            // ── Playback ─────────────────────────────────────────────────────
+            EditorCommand::Play => {
+                let total = self.state.total_duration();
+                if total > 0.0 && self.state.current_time >= total - 0.1 {
+                    self.state.current_time = 0.0;
+                }
+                self.state.is_playing = true;
+            }
+            EditorCommand::Pause => {
+                self.state.is_playing = false;
+            }
+            EditorCommand::Stop => {
+                self.state.is_playing   = false;
+                self.state.current_time = 0.0;
+            }
+            EditorCommand::SetPlayhead(t) => {
+                self.state.current_time = t;
+                // Clear audio sinks whenever the playhead is moved manually —
+                // the existing sink decoder is at the wrong position and must
+                // be rebuilt with a fresh seek when playback resumes.
+                self.context.audio_sinks.clear();
+                self.context.audio_was_playing = false;
+            }
+            EditorCommand::SetVolume(v) => {
+                self.state.volume = v;
+            }
+            EditorCommand::ToggleMute => {
+                self.state.muted = !self.state.muted;
+            }
+
+            // ── Library ──────────────────────────────────────────────────────
+            EditorCommand::ImportFile(path) => {
+                self.state.add_to_library(path);
+            }
+            EditorCommand::DeleteLibraryClip(id) => {
+                self.state.selected_library_clip = None;
+                if let Some(apath) = self.state.library.iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.audio_path.clone())
+                {
+                    self.state.pending_audio_cleanup.push(apath);
+                }
+                self.state.library.retain(|c| c.id != id);
+                self.state.timeline.retain(|c| c.media_id != id);
+            }
+            EditorCommand::SelectLibraryClip(id) => {
+                self.state.selected_library_clip = id;
+            }
+
+            // ── Timeline ─────────────────────────────────────────────────────
+            EditorCommand::AddToTimeline { media_id, at_time } => {
+                self.state.add_to_timeline(media_id, at_time);
+            }
+            EditorCommand::DeleteTimelineClip(id) => {
+                self.state.timeline.retain(|c| c.id != id);
+                if self.state.selected_timeline_clip == Some(id) {
+                    self.state.selected_timeline_clip = None;
+                }
+            }
+            EditorCommand::SelectTimelineClip(id) => {
+                self.state.selected_timeline_clip = id;
+            }
+            EditorCommand::MoveTimelineClip { id, new_start } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.start_time = new_start;
+                }
+            }
+            EditorCommand::SplitClipAt(_t) => {
+                // TODO: implement split
+            }
+            EditorCommand::TrimClipStart { id, new_source_offset, new_duration } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.source_offset = new_source_offset;
+                    tc.duration      = new_duration;
+                }
+            }
+            EditorCommand::TrimClipEnd { id, new_duration } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.duration = new_duration;
+                }
+            }
+
+            // ── Export ───────────────────────────────────────────────────────
+            EditorCommand::RenderMP4 { filename, width, height, fps } => {
+                eprintln!("[export] Render requested: {filename} {width}x{height} @ {fps}fps");
+                // TODO: kick off ffmpeg render pipeline
+            }
+
+            // ── View / UI ────────────────────────────────────────────────────
+            EditorCommand::SetAspectRatio(ar) => {
+                self.state.aspect_ratio = ar;
+            }
+            EditorCommand::SetTimelineZoom(z) => {
+                self.state.timeline_zoom = z;
+            }
+            EditorCommand::ClearSaveStatus => {
+                self.state.save_status = None;
+            }
+            EditorCommand::RequestSaveFramePicker { path, timestamp } => {
+                self.state.pending_save_pick = Some((path, timestamp));
+            }
+            EditorCommand::SaveFrameToDisk { path, timestamp } => {
+                // Direct save (no dialog) — used for programmatic frame export
+                if let Some(lib) = self.state.library.iter().find(|l| l.path == path) {
+                    self.context.media_worker.extract_frame_hq(lib.id, path, timestamp, std::path::PathBuf::new());
+                }
+            }
         }
     }
 
     fn poll_media(&mut self, ctx: &egui::Context) {
         // Clean up temp WAVs for deleted clips
         for path in self.state.pending_audio_cleanup.drain(..) {
-            MediaWorker::cleanup_audio_temp(&path);
+            cleanup_audio_temp(&path);
         }
 
         let pending: Vec<_> = self.state.pending_probes.drain(..).collect();
         for (id, path) in pending {
-            self.media_worker.probe_clip(id, path);
+            self.context.media_worker.probe_clip(id, path);
         }
         let extracts: Vec<_> = self.state.pending_extracts.drain(..).collect();
         for (id, path, ts, dest) in extracts {
-            self.media_worker.extract_frame_hq(id, path, ts, dest);
+            self.context.media_worker.extract_frame_hq(id, path, ts, dest);
         }
         if let Some((path, ts)) = self.state.pending_save_pick.take() {
             let stem = path.file_stem()
@@ -180,7 +269,7 @@ impl VeloCutApp {
                 .add_filter("PNG", &["png"])
                 .save_file()
             {
-                self.media_worker.extract_frame_hq(Uuid::nil(), path, ts, dest);
+                self.context.media_worker.extract_frame_hq(Uuid::nil(), path, ts, dest);
             }
         }
         // ── Drain playback frame buffer ───────────────────────────────────────
@@ -189,7 +278,7 @@ impl VeloCutApp {
         // name per media id means egui reuses the GPU allocation each frame.
         {
             let mut last: Option<PlaybackFrame> = None;
-            while let Ok(f) = self.media_worker.pb_rx.try_recv() { last = Some(f); }
+            while let Ok(f) = self.context.media_worker.pb_rx.try_recv() { last = Some(f); }
             if let Some(f) = last {
                 let tex = ctx.load_texture(
                     format!("pb-{}", f.id),
@@ -198,12 +287,12 @@ impl VeloCutApp {
                     ),
                     egui::TextureOptions::LINEAR,
                 );
-                self.frame_cache.insert(f.id, tex);
+                self.context.frame_cache.insert(f.id, tex);
                 ctx.request_repaint();
             }
         }
 
-        while let Ok(result) = self.media_worker.rx.try_recv() {
+        while let Ok(result) = self.context.media_worker.rx.try_recv() {
             match result {
                 MediaResult::AudioPath { id, path } => {
                     eprintln!("[audio] AudioPath arrived id={id} path={}", path.display());
@@ -223,7 +312,7 @@ impl VeloCutApp {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.thumbnail_cache.insert(id, tex);
+                    self.context.thumbnail_cache.insert(id, tex);
                     ctx.request_repaint();
                 }
                 MediaResult::Waveform { id, peaks } => {
@@ -275,10 +364,10 @@ impl VeloCutApp {
                     // so that both coarse prefetch and fine decode populate the same lookup.
                     // The timestamp we used to request is reconstructed from last_frame_req;
                     // for coarse results we use scrub_coarse_req bucket scaled back up.
-                    let bucket = self.last_frame_req
+                    let bucket = self.context.last_frame_req
                         .filter(|(rid, _)| *rid == id)
                         .map(|(_, b)| b)
-                        .or_else(|| self.scrub_coarse_req
+                        .or_else(|| self.context.scrub_coarse_req
                             .filter(|(rid, _)| *rid == id)
                             .map(|(_, cb)| cb * 8)) // coarse bucket (2 s) → fine bucket (¼ s)
                         .unwrap_or_else(|| {
@@ -291,13 +380,13 @@ impl VeloCutApp {
                                 })
                                 .unwrap_or(0)
                         });
-                    if self.frame_bucket_cache.len() >= 128 {
-                        let to_remove: Vec<_> = self.frame_bucket_cache.keys()
+                    if self.context.frame_bucket_cache.len() >= 128 {
+                        let to_remove: Vec<_> = self.context.frame_bucket_cache.keys()
                             .take(32).copied().collect();
-                        for k in to_remove { self.frame_bucket_cache.remove(&k); }
+                        for k in to_remove { self.context.frame_bucket_cache.remove(&k); }
                     }
-                    self.frame_bucket_cache.insert((id, bucket), tex.clone());
-                    self.frame_cache.insert(id, tex);
+                    self.context.frame_bucket_cache.insert((id, bucket), tex.clone());
+                    self.context.frame_cache.insert(id, tex);
                     ctx.request_repaint();
                 }
                 MediaResult::Error { id, msg } => {
@@ -308,142 +397,109 @@ impl VeloCutApp {
     }
 
     fn tick_preview_frame(&mut self) {
-        let just_started = self.state.is_playing && !self.prev_playing;
-        let just_stopped  = !self.state.is_playing && self.prev_playing;
-        self.prev_playing = self.state.is_playing;
+        let just_started  = self.state.is_playing && !self.context.prev_playing;
+        let just_stopped  = !self.state.is_playing && self.context.prev_playing;
+        self.context.prev_playing = self.state.is_playing;
 
-        // Find the clip currently under the playhead.
         let current_clip = self.state.timeline.iter().find(|c| {
             self.state.current_time >= c.start_time
                 && self.state.current_time < c.start_time + c.duration
         }).cloned();
 
         if self.state.is_playing {
-            // ── Playback mode ────────────────────────────────────────────────
             if let Some(clip) = &current_clip {
-                let clip_changed = Some(clip.media_id) != self.playback_media_id;
+                let clip_changed = Some(clip.media_id) != self.context.playback_media_id;
                 if just_started || clip_changed {
-                    self.playback_media_id = Some(clip.media_id);
+                    self.context.playback_media_id = Some(clip.media_id);
                     if let Some(lib) = self.state.library.iter().find(|l| l.id == clip.media_id) {
                         let local_ts = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         let aspect   = self.state.active_video_ratio();
-                        self.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
+                        self.context.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
                     }
                 }
             }
             return;
         }
 
-        // ── Scrub / pause mode ───────────────────────────────────────────────
         if just_stopped {
-            self.media_worker.stop_playback();
-            self.playback_media_id = None;
-            self.last_frame_req    = None;
-            self.scrub_last_moved  = None;
-            self.scrub_coarse_req  = None;
+            self.context.media_worker.stop_playback();
+            self.context.playback_media_id = None;
+            self.context.last_frame_req    = None;
+            self.context.scrub_last_moved  = None;
+            self.context.scrub_coarse_req  = None;
         }
 
         let Some(clip) = current_clip else {
-            self.last_frame_req   = None;
-            self.scrub_last_moved = None;
-            self.scrub_coarse_req = None;
+            self.context.last_frame_req   = None;
+            self.context.scrub_last_moved = None;
+            self.context.scrub_coarse_req = None;
             return;
         };
 
-        let local_t  = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
-        // Fine bucket: 1/4 s grid — coarse enough to hit cache often, fine enough for editing
-        let fine_bucket  = (local_t * 4.0) as u32;
-        // Coarse bucket: 2 s grid — for background prefetch of nearby frames
-        let coarse_bucket = (local_t / 2.0) as u32;
-        let fine_key   = (clip.media_id, fine_bucket);
+        let local_t       = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
+        let fine_bucket   = (local_t * 4.0) as u32;          // ¼s grid
+        let coarse_bucket = (local_t / 2.0) as u32;          // 2s grid
+        let fine_key      = (clip.media_id, fine_bucket);
 
-        // ── Detect scrub movement ────────────────────────────────────────────
-        let scrub_moved = self.last_frame_req.map(|k| k != fine_key).unwrap_or(true);
+        let scrub_moved = self.context.last_frame_req.map(|k| k != fine_key).unwrap_or(true);
+
         if scrub_moved {
-            self.scrub_last_moved = Some(std::time::Instant::now());
+            self.context.scrub_last_moved = Some(std::time::Instant::now());
 
-            // Evict stale clip frame when crossing to a different clip
-            if let Some((prev_id, _)) = self.last_frame_req {
+            if let Some((prev_id, _)) = self.context.last_frame_req {
                 if prev_id != clip.media_id {
-                    self.frame_cache.remove(&prev_id);
-                    self.scrub_coarse_req = None;
+                    self.context.frame_cache.remove(&prev_id);
+                    self.context.scrub_coarse_req = None;
                 }
             }
-            self.last_frame_req = Some(fine_key);
+            self.context.last_frame_req = Some(fine_key);
 
-            // ── Layer 1: instant — show nearest already-decoded frame ────────
-            // Walk backwards through fine buckets (up to 2 s) to find a cached frame.
+            // ── Layer 1 (0ms): show nearest cached frame instantly ───────────
             let found_nearby = (0..=8u32).find_map(|delta| {
                 let b = fine_bucket.saturating_sub(delta);
-                self.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
+                self.context.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
             });
             if let Some(cached) = found_nearby {
-                self.frame_cache.insert(clip.media_id, cached);
-                // Don't return — still kick off a background decode below
+                self.context.frame_cache.insert(clip.media_id, cached);
             }
-        } else {
-            // Scrub hasn't moved — if we already have a frame, nothing to do
-            if self.frame_cache.contains_key(&clip.media_id) {
-                // ── Layer 3 (fine decode): fire only after 150 ms of idle ────
-                let idle_long_enough = self.scrub_last_moved
-                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
-                    .unwrap_or(false);
-                if !idle_long_enough { return; }
-                // Already have exact frame for this bucket? Done.
-                if self.frame_bucket_cache.contains_key(&fine_key) { return; }
-                // Request precise frame now that the user has stopped scrubbing
+
+            // ── Layer 2 (per fine bucket): decode exact current position ─────
+            // Fire on every ¼s bucket change — the latest-wins slot in MediaWorker
+            // means rapid scrubbing only ever decodes the most recent position.
+            if !self.context.frame_bucket_cache.contains_key(&fine_key) {
                 if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
                     let aspect = self.state.active_video_ratio();
                     let ts     = fine_bucket as f64 / 4.0;
-                    self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+                    self.context.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
                 }
-                return;
             }
-        }
 
-        // ── Layer 2: coarse prefetch — kick off a background decode on 2 s grid
-        // This fills the cache for nearby positions so scrubbing hits Layer 1 immediately.
-        let coarse_key = (clip.media_id, coarse_bucket);
-        if self.scrub_coarse_req != Some(coarse_key) {
-            self.scrub_coarse_req = Some(coarse_key);
-            if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
-                let aspect = self.state.active_video_ratio();
-                let ts     = coarse_bucket as f64 * 2.0;
-                self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+            // ── Layer 2b (per 2s): coarse warm-up prefetch ──────────────────
+            // Pre-fills the bucket cache ahead of the scrub head so Layer 1
+            // gets more hits when scrubbing into new territory.
+            let coarse_key = (clip.media_id, coarse_bucket);
+            if self.context.scrub_coarse_req != Some(coarse_key)
+                && !self.context.frame_bucket_cache.contains_key(&fine_key)
+            {
+                self.context.scrub_coarse_req = Some(coarse_key);
+                if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
+                    let aspect = self.state.active_video_ratio();
+                    let ts     = coarse_bucket as f64 * 2.0;
+                    self.context.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+                }
             }
-        }
-    }
-
-    fn tick_audio(&mut self) {
-        let Some(stream) = &self.audio_stream else { return };
-
-        if !self.state.is_playing {
-            self.audio_sinks.clear();
-            return;
-        }
-
-        let t = self.state.current_time;
-
-        if let Some(clip) = self.state.timeline.iter().find(|c| {
-            c.track_row == 0 && c.start_time <= t && t < c.start_time + c.duration
-        }) {
-            if let Some(lib) = self.state.library.iter().find(|l| l.id == clip.media_id) {
-                if let Some(apath) = &lib.audio_path {
-                    let seek_t = t - clip.start_time + clip.source_offset;
-
-                    if !self.audio_sinks.contains_key(&clip.id) {
-                        self.audio_sinks.clear();
-                        if let Ok(file) = File::open(apath) {
-                            if let Ok(decoder) = Decoder::new(file) {
-                                let sink = Sink::connect_new(&stream.mixer());
-                                sink.append(decoder);
-                                let _ = sink.try_seek(std::time::Duration::from_secs_f64(seek_t.max(0.0)));
-                                sink.set_volume(if self.state.muted { 0.0 } else { self.state.volume });
-                                sink.play();
-                                self.audio_sinks.insert(clip.id, sink);
-                            }
-                        }
-                    }
+        } else {
+            // ── Layer 3 (150ms idle): precise frame after scrub stops ────────
+            if self.context.frame_cache.contains_key(&clip.media_id) {
+                let idle = self.context.scrub_last_moved
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                    .unwrap_or(false);
+                if !idle { return; }
+                if self.context.frame_bucket_cache.contains_key(&fine_key) { return; }
+                if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
+                    let aspect = self.state.active_video_ratio();
+                    let ts     = fine_bucket as f64 / 4.0;
+                    self.context.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
                 }
             }
         }
@@ -741,17 +797,21 @@ fn run_download(progress: Arc<Mutex<DownloadProgress>>, ctx: egui::Context) {
 
 impl eframe::App for VeloCutApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &AppStorage {
-            project: ProjectState::default(),
-        });
+        // audio_path points to temp WAVs that are deleted on exit — clear them
+        // before serializing so they don't resurrect as dead paths on next launch.
+        let mut project = self.state.clone();
+        for clip in &mut project.library {
+            clip.audio_path = None;
+        }
+        eframe::set_value(storage, eframe::APP_KEY, &AppStorage { project });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.media_worker.shutdown();
-        self.audio_sinks.clear();
+        self.context.media_worker.shutdown();
+        self.context.audio_sinks.clear();
         for clip in &self.state.library {
             if let Some(apath) = &clip.audio_path {
-                MediaWorker::cleanup_audio_temp(apath);
+                cleanup_audio_temp(apath);
             }
         }
     }
@@ -763,7 +823,6 @@ impl eframe::App for VeloCutApp {
         if self.show_download_overlay(ctx) { return; }
 
         self.tick_preview_frame();
-        self.tick_audio();
 
         egui::TopBottomPanel::top("top_panel")
             .exact_height(36.0)
@@ -784,7 +843,7 @@ impl eframe::App for VeloCutApp {
             .default_height(220.0)
             .show(ctx, |ui| {
                 if let Some(m) = self.modules.iter_mut().find(|m| m.name() == "Timeline") {
-                    m.ui(ui, &mut self.state, &mut self.thumbnail_cache);
+                    m.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
                 }
             });
 
@@ -794,7 +853,7 @@ impl eframe::App for VeloCutApp {
             .min_width(160.0)
             .show(ctx, |ui| {
                 if let Some(m) = self.modules.iter_mut().find(|m| m.name() == "Media Library") {
-                    m.ui(ui, &mut self.state, &mut self.thumbnail_cache);
+                    m.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
                 }
             });
 
@@ -804,21 +863,57 @@ impl eframe::App for VeloCutApp {
             .min_width(160.0)
             .show(ctx, |ui| {
                 if let Some(m) = self.modules.iter_mut().find(|m| m.name() == "Export") {
-                    m.ui(ui, &mut self.state, &mut self.thumbnail_cache);
+                    m.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
                 }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Build a merged view without cloning the whole map —
-            // frame_cache entries (playback/scrub frames) shadow thumbnail_cache.
-            let mut merged: ThumbnailCache = HashMap::with_capacity(
-                self.thumbnail_cache.len() + self.frame_cache.len());
-            for (k, v) in &self.thumbnail_cache { merged.insert(*k, v.clone()); }
-            for (k, v) in &self.frame_cache     { merged.insert(*k, v.clone()); }
+            // Preview only needs the current playback/scrub frame — find the active
+            // clip id and insert just that one entry rather than cloning every texture.
+            let active_id = self.state.timeline.iter().find(|c| {
+                self.state.current_time >= c.start_time
+                    && self.state.current_time < c.start_time + c.duration
+            }).map(|c| c.media_id);
+
+            // If we have a live frame for the active clip, temporarily swap it in
+            // over the thumbnail so preview shows the decoded frame. We save the
+            // displaced thumbnail and restore it afterward so the library card
+            // doesn't lose its image.
+            let swapped = if let Some(id) = active_id {
+                if let Some(frame_tex) = self.context.frame_cache.get(&id) {
+                    let displaced = self.context.thumbnail_cache
+                        .insert(id, frame_tex.clone());
+                    Some((id, displaced))
+                } else { None }
+            } else { None };
+
             if let Some(m) = self.modules.iter_mut().find(|m| m.name() == "Preview") {
-                m.ui(ui, &mut self.state, &mut merged);
+                m.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
+            }
+
+            // Restore cache to its pre-frame state.
+            if let Some((id, Some(thumb))) = swapped {
+                // Thumbnail existed before — put it back.
+                self.context.thumbnail_cache.insert(id, thumb);
+            } else if let Some((id, None)) = swapped {
+                // No thumbnail existed — remove the frame entry we injected.
+                self.context.thumbnail_cache.remove(&id);
             }
         });
+
+        // ── Process commands emitted by modules this frame ────────────────────
+        let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
+        for cmd in cmds {
+            self.process_command(cmd);
+        }
+
+        // ── Tick non-UI modules (sees final state after commands) ─────────────
+        // Split borrow: pull the module out, tick it, put it back.
+        if let Some(pos) = self.modules.iter().position(|m| m.name() == "Audio") {
+            let mut m = self.modules.swap_remove(pos);
+            m.tick(&self.state, &mut self.context);
+            self.modules.push(m);
+        }
 
         if self.state.is_playing {
             let dt = ctx.input(|i| i.stable_dt as f64);

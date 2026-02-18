@@ -38,6 +38,7 @@ pub enum EditorCommand {
     // ── View / UI ────────────────────────────────────────────────────────────
     SetAspectRatio(AspectRatio),
     SetTimelineZoom(f32),
+    ClearSaveStatus,
     SaveFrameToDisk { path: PathBuf, timestamp: f64 },
     RequestSaveFramePicker { path: PathBuf, timestamp: f64 },
 }

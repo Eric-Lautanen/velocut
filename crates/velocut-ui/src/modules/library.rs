@@ -1,6 +1,7 @@
-// src/modules/library.rs
+// crates/velocut-ui/src/modules/library.rs
 use super::EditorModule;
 use velocut_core::state::{ProjectState, ClipType};
+use velocut_core::commands::EditorCommand;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BG_4, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, RichText, Layout, Align, Id, Sense, Color32, Stroke, Order, LayerId};
@@ -11,11 +12,11 @@ pub struct LibraryModule;
 impl EditorModule for LibraryModule {
     fn name(&self) -> &str { "Media Library" }
 
-    fn ui(&mut self, ui: &mut Ui, state: &mut ProjectState, thumb_cache: &mut ThumbnailCache) {
-        // ── Hotkeys (Del = delete selected library clip) ──────────────────────
+    fn ui(&mut self, ui: &mut Ui, state: &ProjectState, thumb_cache: &mut ThumbnailCache, cmd: &mut Vec<EditorCommand>) {
+        // ── Hotkeys ──────────────────────────────────────────────────────────
         if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-            if state.selected_library_clip.is_some() {
-                state.delete_selected_library();
+            if let Some(id) = state.selected_library_clip {
+                cmd.push(EditorCommand::DeleteLibraryClip(id));
             }
         }
 
@@ -33,7 +34,7 @@ impl EditorModule for LibraryModule {
                                     .add_filter("Media", &["mp4","mov","mkv","avi","mp3","wav","webm","m4v"])
                                     .pick_file()
                                 {
-                                    state.add_to_library(path);
+                                    cmd.push(EditorCommand::ImportFile(path));
                                 }
                             }
                         });
@@ -60,15 +61,14 @@ impl EditorModule for LibraryModule {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
 
-                // Click on empty scroll area = deselect
                 let scroll_resp = ui.interact(
                     ui.available_rect_before_wrap(),
                     egui::Id::new("library_bg"),
                     egui::Sense::click(),
                 );
                 if scroll_resp.clicked() {
-                    state.selected_library_clip  = None;
-                    state.selected_timeline_clip = None;
+                    cmd.push(EditorCommand::SelectLibraryClip(None));
+                    cmd.push(EditorCommand::SelectTimelineClip(None));
                 }
 
                 if state.library.is_empty() {
@@ -92,15 +92,15 @@ impl EditorModule for LibraryModule {
                     let mut to_delete: Option<uuid::Uuid> = None;
 
                     for (id, name, clip_type, duration, probed) in clips {
-                        let item_id    = Id::new("lib_clip").with(id);
-                        let is_selected     = state.selected_library_clip == Some(id);
+                        let item_id          = Id::new("lib_clip").with(id);
+                        let is_selected      = state.selected_library_clip == Some(id);
                         let is_being_dragged = ui.ctx().is_being_dragged(item_id);
 
                         // ── Drag ghost ───────────────────────────────────────
                         if is_being_dragged {
                             if let Some(ptr) = ui.ctx().pointer_interact_pos() {
-                                let ghost_size = egui::vec2(96.0, 54.0);
-                                let ghost_rect = egui::Rect::from_center_size(ptr, ghost_size);
+                                let ghost_size  = egui::vec2(96.0, 54.0);
+                                let ghost_rect  = egui::Rect::from_center_size(ptr, ghost_size);
                                 let ghost_layer = LayerId::new(Order::Tooltip, Id::new("drag_ghost"));
                                 let gp = ui.ctx().layer_painter(ghost_layer);
                                 gp.rect_filled(ghost_rect, egui::CornerRadius::same(4),
@@ -126,20 +126,8 @@ impl EditorModule for LibraryModule {
                         }
 
                         // ── Card ─────────────────────────────────────────────
-                        let border_color = if is_selected {
-                            ACCENT
-                        } else if is_being_dragged {
-                            ACCENT
-                        } else {
-                            DARK_BORDER
-                        };
-                        let card_fill = if is_selected {
-                            DARK_BG_4
-                        } else if is_being_dragged {
-                            DARK_BG_4
-                        } else {
-                            DARK_BG_3
-                        };
+                        let border_color = if is_selected || is_being_dragged { ACCENT } else { DARK_BORDER };
+                        let card_fill    = if is_selected || is_being_dragged { DARK_BG_4 } else { DARK_BG_3 };
 
                         let card_resp = egui::Frame::new()
                             .fill(card_fill)
@@ -172,16 +160,15 @@ impl EditorModule for LibraryModule {
                                 });
                             }).response;
 
-                        // ── Interact: click to select, drag ──────────────────
+                        // ── Interact ─────────────────────────────────────────
                         let interact = ui.interact(card_resp.rect, item_id, Sense::click_and_drag());
 
                         if interact.clicked() {
-                            state.selected_library_clip = Some(id);
-                            state.selected_timeline_clip = None;
+                            cmd.push(EditorCommand::SelectLibraryClip(Some(id)));
+                            cmd.push(EditorCommand::SelectTimelineClip(None));
                         }
-
                         if interact.drag_started() {
-                            state.selected_library_clip = Some(id);
+                            cmd.push(EditorCommand::SelectLibraryClip(Some(id)));
                             ui.memory_mut(|mem| mem.data.insert_temp(Id::new("DND_PAYLOAD"), id));
                         }
                         if interact.dragged() {
@@ -205,17 +192,8 @@ impl EditorModule for LibraryModule {
                         });
                     }
 
-                    // Apply deferred delete
                     if let Some(del_id) = to_delete {
-                        state.selected_library_clip = None;
-                        if let Some(apath) = state.library.iter()
-                            .find(|c| c.id == del_id)
-                            .and_then(|c| c.audio_path.clone())
-                        {
-                            state.pending_audio_cleanup.push(apath);
-                        }
-                        state.library.retain(|c| c.id != del_id);
-                        state.timeline.retain(|c| c.media_id != del_id);
+                        cmd.push(EditorCommand::DeleteLibraryClip(del_id));
                     }
                 });
                 ui.add_space(8.0);
@@ -226,7 +204,6 @@ impl EditorModule for LibraryModule {
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max { return s; }
-    // Find a safe char boundary at or before `max` bytes
     let end = s.char_indices()
         .map(|(i, _)| i)
         .take_while(|&i| i <= max)

@@ -1,6 +1,7 @@
-// src/modules/preview.rs
+// crates/velocut-ui/src/modules/preview.rs
 use super::EditorModule;
 use velocut_core::state::{ProjectState, AspectRatio};
+use velocut_core::commands::EditorCommand;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER};
 use egui::{Ui, Color32, Sense, Rect, Pos2, Stroke, RichText};
@@ -10,7 +11,7 @@ pub struct PreviewModule;
 impl EditorModule for PreviewModule {
     fn name(&self) -> &str { "Preview" }
 
-    fn ui(&mut self, ui: &mut Ui, state: &mut ProjectState, thumb_cache: &mut ThumbnailCache) {
+    fn ui(&mut self, ui: &mut Ui, state: &ProjectState, thumb_cache: &mut ThumbnailCache, cmd: &mut Vec<EditorCommand>) {
         ui.vertical(|ui| {
             // ── Header ───────────────────────────────────────────────────────
             egui::Frame::new()
@@ -44,7 +45,9 @@ impl EditorModule for PreviewModule {
                                     ui.selectable_value(&mut ar, AspectRatio::TwentyOneNine, "21:9 — Ultrawide");
                                     ui.selectable_value(&mut ar, AspectRatio::Anamorphic,    "2.39:1 — Anamorphic");
                                 });
-                            state.aspect_ratio = ar;
+                            if ar != state.aspect_ratio {
+                                cmd.push(EditorCommand::SetAspectRatio(ar));
+                            }
                         });
                     });
                 });
@@ -175,8 +178,7 @@ impl EditorModule for PreviewModule {
                     ui.set_width(bar_w - 16.0);
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("⏮").size(14.0)).clicked() {
-                            state.is_playing   = false;
-                            state.current_time = 0.0;
+                            cmd.push(EditorCommand::Stop);
                         }
                         let play_lbl = if state.is_playing {
                             RichText::new("⏸").size(18.0).color(ACCENT)
@@ -184,17 +186,11 @@ impl EditorModule for PreviewModule {
                             RichText::new("▶").size(18.0).color(ACCENT)
                         };
                         if ui.button(play_lbl).clicked() {
-                            let total = state.total_duration();
-                            if !state.is_playing && total > 0.0
-                                && state.current_time >= total - 0.1
-                            {
-                                state.current_time = 0.0;
-                            }
-                            state.is_playing = !state.is_playing;
+                            if state.is_playing { cmd.push(EditorCommand::Pause); }
+                            else               { cmd.push(EditorCommand::Play);  }
                         }
                         if ui.button(RichText::new("⏹").size(14.0)).clicked() {
-                            state.is_playing   = false;
-                            state.current_time = 0.0;
+                            cmd.push(EditorCommand::Stop);
                         }
 
                         ui.add_space(24.0);
@@ -227,16 +223,20 @@ impl EditorModule for PreviewModule {
                                 .color(if state.muted { DARK_BORDER } else { ACCENT })
                         ).frame(false);
                         if ui.add(mute_btn).on_hover_text("Toggle mute").clicked() {
-                            state.muted = !state.muted;
+                            cmd.push(EditorCommand::ToggleMute);
                         }
 
+                        // Volume slider — needs local mut copy; emit command on change
+                        let mut vol = state.volume;
                         ui.add_enabled_ui(!state.muted, |ui| {
-                            ui.add_sized(
+                            let changed = ui.add_sized(
                                 [90.0, 16.0],
-                                egui::Slider::new(&mut state.volume, 0.0..=1.0)
+                                egui::Slider::new(&mut vol, 0.0..=1.0)
                                     .show_value(false)
                                     .trailing_fill(true),
-                            ).on_hover_text(format!("Volume: {}%", (state.volume * 100.0) as u32));
+                            ).on_hover_text(format!("Volume: {}%", (state.volume * 100.0) as u32))
+                            .changed();
+                            if changed { cmd.push(EditorCommand::SetVolume(vol)); }
                         });
                     });
                 });

@@ -1,37 +1,30 @@
-// src/modules/export.rs
+// crates/velocut-ui/src/modules/export.rs
 use super::EditorModule;
 use velocut_core::state::ProjectState;
+use velocut_core::commands::EditorCommand;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, RichText, Stroke};
 
 pub struct ExportModule {
-    filename: String,
+    filename:   String,
     resolution: ResolutionPreset,
-    fps: u32,
+    fps:        u32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum ResolutionPreset {
-    HD,
-    FHD,
-    UHD,
-}
+enum ResolutionPreset { HD, FHD, UHD }
 
 impl Default for ExportModule {
     fn default() -> Self {
-        Self {
-            filename: "sequence_01".into(),
-            resolution: ResolutionPreset::FHD,
-            fps: 30,
-        }
+        Self { filename: "sequence_01".into(), resolution: ResolutionPreset::FHD, fps: 30 }
     }
 }
 
 impl EditorModule for ExportModule {
     fn name(&self) -> &str { "Export" }
 
-    fn ui(&mut self, ui: &mut Ui, state: &mut ProjectState, _thumb_cache: &mut ThumbnailCache) {
+    fn ui(&mut self, ui: &mut Ui, state: &ProjectState, _thumb_cache: &mut ThumbnailCache, cmd: &mut Vec<EditorCommand>) {
         ui.vertical(|ui| {
             // Header
             egui::Frame::new()
@@ -125,15 +118,17 @@ impl EditorModule for ExportModule {
                 .min_size(egui::vec2(ui.available_width(), 34.0));
 
                 if ui.add(render_btn).clicked() {
-                    println!("Rendering {} at {} fps → {}.mp4",
-                        match self.resolution {
-                            ResolutionPreset::HD  => "720p",
-                            ResolutionPreset::FHD => "1080p",
-                            ResolutionPreset::UHD => "4K",
-                        },
-                        self.fps,
-                        self.filename
-                    );
+                    let (width, height) = match self.resolution {
+                        ResolutionPreset::HD  => (1280, 720),
+                        ResolutionPreset::FHD => (1920, 1080),
+                        ResolutionPreset::UHD => (3840, 2160),
+                    };
+                    cmd.push(EditorCommand::RenderMP4 {
+                        filename: self.filename.clone(),
+                        width,
+                        height,
+                        fps: self.fps,
+                    });
                 }
             });
         });
