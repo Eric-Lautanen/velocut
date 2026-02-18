@@ -1,28 +1,28 @@
-// src/media.rs
+// crates/velocut-media/src/lib.rs
+//
+// MediaWorker and all decode/probe/waveform logic.
+// No egui dependency — communicates with velocut-ui via channels only.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use uuid::Uuid;
+
+// Re-export core types so velocut-ui can import them from here
+pub use velocut_core::media_types::{MediaResult, PlaybackFrame};
+
+/// Commands sent to the playback decode thread.
+enum PlaybackCmd {
+    Start { id: Uuid, path: PathBuf, ts: f64, aspect: f32 },
+    Stop,
+}
 
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
-
-// ── Result types ─────────────────────────────────────────────────────────────
-
-pub enum MediaResult {
-    Duration   { id: Uuid, seconds: f64 },
-    Thumbnail  { id: Uuid, width: u32, height: u32, data: Vec<u8> },
-    Waveform   { id: Uuid, peaks: Vec<f32> },
-    VideoFrame { id: Uuid, width: u32, height: u32, data: Vec<u8> },
-    VideoSize  { id: Uuid, width: u32, height: u32 },
-    FrameSaved { path: PathBuf },
-    AudioPath  { id: Uuid, path: PathBuf },
-    Error      { id: Uuid, msg: String },
-}
 
 // ── Frame request (latest-wins) ───────────────────────────────────────────────
 
@@ -96,6 +96,38 @@ impl LiveDecoder {
         (t * self.tb_den as f64 / self.tb_num as f64) as i64
     }
 
+    fn pts_to_secs(&self, pts: i64) -> f64 {
+        pts as f64 * self.tb_num as f64 / self.tb_den as f64
+    }
+
+    /// Decode and return the very next frame sequentially (no seek, no skip).
+    /// Returns `(pixels, w, h, timestamp_secs)` or `None` at EOF.
+    fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
+        for (stream, packet) in self.ictx.packets().flatten() {
+            if stream.index() != self.video_idx { continue; }
+            if self.decoder.send_packet(&packet).is_err() { continue; }
+            let mut decoded = ffmpeg::util::frame::video::Video::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+                self.last_pts = pts;
+                let ts_secs = self.pts_to_secs(pts);
+                let mut out = ffmpeg::util::frame::video::Video::empty();
+                if self.scaler.run(&decoded, &mut out).is_err() { return None; }
+                let stride = out.stride(0);
+                let raw    = out.data(0);
+                let data: Vec<u8> = (0..self.out_h as usize)
+                    .flat_map(|row| {
+                        let s = row * stride;
+                        &raw[s..s + self.out_w as usize * 4]
+                    })
+                    .copied()
+                    .collect();
+                return Some((data, self.out_w, self.out_h, ts_secs));
+            }
+        }
+        None
+    }
+
     /// Read forward until we find a frame at or past `target_pts`. Returns RGBA pixels.
     fn advance_to(&mut self, target_pts: i64) -> Option<(Vec<u8>, u32, u32)> {
         let mut last_good: Option<Vec<u8>> = None;
@@ -131,9 +163,14 @@ impl LiveDecoder {
 pub struct MediaWorker {
     pub rx:    Receiver<MediaResult>,
     tx:        Sender<MediaResult>,
-    /// Latest-wins slot: sender always overwrites, decoder always takes newest.
+    /// Latest-wins slot for on-demand scrub frames.
     frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)>,
+    /// Dedicated playback pipeline.
+    pb_tx:     Sender<PlaybackCmd>,
+    pub pb_rx: Receiver<PlaybackFrame>,
     shutdown:  Arc<AtomicBool>,
+    /// Limits concurrent probe threads: (active_count, Condvar). Max = PROBE_CONCURRENCY.
+    probe_sem: Arc<(Mutex<u32>, Condvar)>,
 }
 
 impl MediaWorker {
@@ -187,7 +224,55 @@ impl MediaWorker {
             }
         });
 
-        Self { rx, tx, frame_req, shutdown: Arc::new(AtomicBool::new(false)) }
+        // ── Dedicated playback decode thread ──────────────────────────────────
+        // Runs continuously ahead of the UI filling a bounded channel (backpressure).
+        // Channel capacity = 6 frames (~240ms lookahead at 25fps).
+        let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(4);
+        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(6);
+
+        thread::spawn(move || {
+            let mut decoder: Option<(Uuid, LiveDecoder)> = None;
+            loop {
+                if let Some((id, ref mut d)) = decoder {
+                    // Check for new commands without blocking.
+                    match pb_cmd_rx.try_recv() {
+                        Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
+                            match LiveDecoder::open(&path, ts, aspect) {
+                                Ok(nd) => { decoder = Some((new_id, nd)); }
+                                Err(e) => { eprintln!("[pb] open: {e}"); decoder = None; }
+                            }
+                            continue;
+                        }
+                        Ok(PlaybackCmd::Stop) => { decoder = None; continue; }
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    // Decode next frame. send() blocks when channel is full — that
+                    // IS the rate-limiter, no sleep needed.
+                    match d.next_frame() {
+                        Some((data, w, h, ts_secs)) => {
+                            let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data };
+                            if pb_frame_tx.send(f).is_err() { return; }
+                        }
+                        None => { decoder = None; } // EOF
+                    }
+                } else {
+                    // Nothing to decode — block waiting for a Start.
+                    match pb_cmd_rx.recv() {
+                        Ok(PlaybackCmd::Start { id, path, ts, aspect }) => {
+                            match LiveDecoder::open(&path, ts, aspect) {
+                                Ok(d) => { decoder = Some((id, d)); }
+                                Err(e) => eprintln!("[pb] open: {e}"),
+                            }
+                        }
+                        Ok(PlaybackCmd::Stop) => {}
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
+
+        Self { rx, tx, frame_req, pb_tx, pb_rx, shutdown: Arc::new(AtomicBool::new(false)), probe_sem: Arc::new((Mutex::new(0), Condvar::new())) }
     }
 
     pub fn shutdown(&self) {
@@ -195,9 +280,31 @@ impl MediaWorker {
     }
 
     pub fn probe_clip(&self, id: Uuid, path: PathBuf) {
-        let tx = self.tx.clone();
-        let sd = self.shutdown.clone();
+        let tx  = self.tx.clone();
+        let sd  = self.shutdown.clone();
+        let sem = self.probe_sem.clone();
         thread::spawn(move || {
+            // Acquire: block if PROBE_CONCURRENCY probes are already running
+            const PROBE_CONCURRENCY: u32 = 4;
+            {
+                let (lock, cvar) = &*sem;
+                let mut count = lock.lock().unwrap();
+                while *count >= PROBE_CONCURRENCY {
+                    count = cvar.wait(count).unwrap();
+                }
+                *count += 1;
+            }
+            // RAII release guard
+            struct SemGuard(Arc<(Mutex<u32>, Condvar)>);
+            impl Drop for SemGuard {
+                fn drop(&mut self) {
+                    let (lock, cvar) = &*self.0;
+                    *lock.lock().unwrap() -= 1;
+                    cvar.notify_one();
+                }
+            }
+            let _guard = SemGuard(sem);
+
             if sd.load(Ordering::Relaxed) { return; }
             let dur = probe_duration(&path, id, &tx);
             if sd.load(Ordering::Relaxed) { return; }
@@ -225,28 +332,32 @@ impl MediaWorker {
         cvar.notify_one();
     }
 
-    pub fn save_frame_with_dialog(&self, path: PathBuf, timestamp: f64) {
-        let tx = self.tx.clone();
-        let sd = self.shutdown.clone();
-        thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) { return; }
-            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let ts_label = format!("{timestamp:.3}").replace('.', "_");
-            let default_name = format!("{stem}_t{ts_label}.png");
-            let dest = match rfd::FileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter("PNG", &["png"])
-                .save_file()
-            {
-                Some(p) => p,
-                None    => return,
-            };
-            if let Err(e) = decode_frame(
-                &path, Uuid::nil(), timestamp, 0.0, true, Some(dest), &tx,
-            ) {
-                eprintln!("[media] save_frame_with_dialog: {e}");
+    /// Start the dedicated playback pipeline at `ts` seconds into `path`.
+    pub fn start_playback(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32) {
+        // Flush stale frames from previous playback session.
+        while self.pb_rx.try_recv().is_ok() {}
+        let _ = self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect });
+    }
+
+    /// Stop the dedicated playback pipeline.
+    pub fn stop_playback(&self) {
+        let _ = self.pb_tx.try_send(PlaybackCmd::Stop);
+    }
+
+    /// Delete a temp WAV that was extracted for a clip.
+    pub fn cleanup_audio_temp(path: &std::path::Path) {
+        // Only delete files we created (pattern: velocut_audio_<uuid>.wav in temp dir)
+        let in_temp = path.parent()
+            .map(|p| p == std::env::temp_dir())
+            .unwrap_or(false);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if in_temp && name.starts_with("velocut_audio_") && name.ends_with(".wav") {
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!("[media] cleanup_audio_temp: {e}");
+            } else {
+                eprintln!("[media] cleaned up temp WAV: {}", path.display());
             }
-        });
+        }
     }
 
     pub fn extract_frame_hq(&self, _id: Uuid, path: PathBuf, timestamp: f64, dest: PathBuf) {
@@ -368,7 +479,14 @@ fn probe_video_size_and_thumbnail(
         while decoder.receive_frame(&mut decoded).is_ok() {
             let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
             if scaler.run(&decoded, &mut rgb_frame).is_err() { continue; }
-            let data = rgb_frame.data(0).to_vec();
+            // Destripe: copy only the visible pixels, not the stride padding
+            let stride = rgb_frame.stride(0);
+            let raw    = rgb_frame.data(0);
+            let row_bytes = thumb_w as usize * 4;
+            let data: Vec<u8> = (0..thumb_h as usize)
+                .flat_map(|row| &raw[row * stride..row * stride + row_bytes])
+                .copied()
+                .collect();
             eprintln!("[media] thumbnail {}x{} ← {}", thumb_w, thumb_h, path.display());
             let _ = tx.send(MediaResult::Thumbnail { id, width: thumb_w, height: thumb_h, data });
             found = true;

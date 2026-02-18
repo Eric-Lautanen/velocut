@@ -1,0 +1,13 @@
+[package]
+name    = "velocut-media"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+velocut-core      = { path = "../velocut-core" }
+ffmpeg-the-third  = { workspace = true }
+crossbeam-channel = { workspace = true }
+anyhow            = { workspace = true }
+png               = { workspace = true }
+uuid              = { workspace = true }
+tempfile          = { workspace = true }

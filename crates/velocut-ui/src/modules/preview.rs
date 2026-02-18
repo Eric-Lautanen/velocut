@@ -1,6 +1,6 @@
 // src/modules/preview.rs
 use super::EditorModule;
-use crate::state::{ProjectState, AspectRatio};
+use velocut_core::state::{ProjectState, AspectRatio};
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER};
 use egui::{Ui, Color32, Sense, Rect, Pos2, Stroke, RichText};

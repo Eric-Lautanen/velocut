@@ -1,6 +1,6 @@
 // src/modules/library.rs
 use super::EditorModule;
-use crate::state::{ProjectState, ClipType};
+use velocut_core::state::{ProjectState, ClipType};
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BG_4, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, RichText, Layout, Align, Id, Sense, Color32, Stroke, Order, LayerId};
@@ -85,7 +85,7 @@ impl EditorModule for LibraryModule {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-                    let clips: Vec<_> = state.library.iter()
+                    let clips: Vec<(uuid::Uuid, String, velocut_core::state::ClipType, f64, bool)> = state.library.iter()
                         .map(|c| (c.id, c.name.clone(), c.clip_type, c.duration, c.duration_probed))
                         .collect();
 
@@ -208,6 +208,12 @@ impl EditorModule for LibraryModule {
                     // Apply deferred delete
                     if let Some(del_id) = to_delete {
                         state.selected_library_clip = None;
+                        if let Some(apath) = state.library.iter()
+                            .find(|c| c.id == del_id)
+                            .and_then(|c| c.audio_path.clone())
+                        {
+                            state.pending_audio_cleanup.push(apath);
+                        }
                         state.library.retain(|c| c.id != del_id);
                         state.timeline.retain(|c| c.media_id != del_id);
                     }

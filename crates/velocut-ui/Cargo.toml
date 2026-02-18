@@ -1,0 +1,30 @@
+[package]
+name    = "velocut-ui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "velocut"
+path = "src/main.rs"
+
+[dependencies]
+velocut-core  = { path = "../velocut-core" }
+velocut-media = { path = "../velocut-media" }
+
+egui              = { workspace = true }
+eframe            = { workspace = true }
+egui_extras       = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+uuid              = { workspace = true }
+rfd               = { workspace = true }
+tempfile          = { workspace = true }
+ffmpeg-sidecar    = { workspace = true }
+ffmpeg-the-third  = { workspace = true }
+anyhow            = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot       = { workspace = true }
+ureq              = { workspace = true }
+rodio             = { workspace = true }
+png               = { workspace = true }
+cpal              = { workspace = true }

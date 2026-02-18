@@ -1,6 +1,6 @@
 // src/modules/timeline.rs
 use super::EditorModule;
-use crate::state::{ProjectState, ClipType};
+use velocut_core::state::{ProjectState, ClipType};
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BORDER, DARK_BG_2};
 use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};

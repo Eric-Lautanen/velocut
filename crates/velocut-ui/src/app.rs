@@ -1,7 +1,9 @@
-// src/app.rs (full updated)
-use crate::state::ProjectState;
+// src/app.rs (velocut-ui)
+use velocut_core::state::ProjectState;
+use velocut_core::commands::EditorCommand;
+use velocut_core::media_types::PlaybackFrame;
+use velocut_media::{MediaWorker, MediaResult};
 use crate::theme::{configure_style, ACCENT, DARK_BG_2, DARK_BORDER};
-use crate::media::{MediaWorker, MediaResult};
 use crate::modules::{
     EditorModule,
     timeline::TimelineModule,
@@ -67,8 +69,13 @@ pub struct VeloCutApp {
     frame_cache:     HashMap<Uuid, egui::TextureHandle>,
     frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
     media_worker:    MediaWorker,
-    last_frame_req:  Option<(Uuid, u32)>,
-    prev_playing:    bool,
+    last_frame_req:     Option<(Uuid, u32)>,
+    prev_playing:       bool,
+    playback_media_id:  Option<Uuid>,  // tracks which clip the playback thread is decoding
+    /// Wall-clock instant the scrub head last moved (for debounce)
+    scrub_last_moved:   Option<std::time::Instant>,
+    /// The coarse bucket (2 s grid) last requested for background prefetch
+    scrub_coarse_req:   Option<(Uuid, u32)>,
     ffmpeg_ready:    bool,
     dl_progress:     Option<Arc<Mutex<DownloadProgress>>>,
     // Audio (rodio 0.21)
@@ -134,8 +141,11 @@ impl VeloCutApp {
             frame_cache:     HashMap::new(),
             frame_bucket_cache: HashMap::new(),
             media_worker,
-            last_frame_req:  None,
-            prev_playing:    false,
+            last_frame_req:     None,
+            prev_playing:       false,
+            playback_media_id:  None,
+            scrub_last_moved:   None,
+            scrub_coarse_req:   None,
             ffmpeg_ready,
             dl_progress,
             audio_stream,
@@ -144,6 +154,11 @@ impl VeloCutApp {
     }
 
     fn poll_media(&mut self, ctx: &egui::Context) {
+        // Clean up temp WAVs for deleted clips
+        for path in self.state.pending_audio_cleanup.drain(..) {
+            MediaWorker::cleanup_audio_temp(&path);
+        }
+
         let pending: Vec<_> = self.state.pending_probes.drain(..).collect();
         for (id, path) in pending {
             self.media_worker.probe_clip(id, path);
@@ -168,6 +183,26 @@ impl VeloCutApp {
                 self.media_worker.extract_frame_hq(Uuid::nil(), path, ts, dest);
             }
         }
+        // ── Drain playback frame buffer ───────────────────────────────────────
+        // Collect all available frames; upload only the last one (avoids
+        // uploading stale frames that arrive in a burst). Using the same texture
+        // name per media id means egui reuses the GPU allocation each frame.
+        {
+            let mut last: Option<PlaybackFrame> = None;
+            while let Ok(f) = self.media_worker.pb_rx.try_recv() { last = Some(f); }
+            if let Some(f) = last {
+                let tex = ctx.load_texture(
+                    format!("pb-{}", f.id),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [f.width as usize, f.height as usize], &f.data,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.frame_cache.insert(f.id, tex);
+                ctx.request_repaint();
+            }
+        }
+
         while let Ok(result) = self.media_worker.rx.try_recv() {
             match result {
                 MediaResult::AudioPath { id, path } => {
@@ -202,7 +237,7 @@ impl VeloCutApp {
                     let is_first = self.state.library.iter()
                         .filter(|c| c.video_size.is_some()).count() == 1;
                     if is_first && width > 0 && height > 0 {
-                        use crate::state::AspectRatio;
+                        use velocut_core::state::AspectRatio;
                         let r = width as f32 / height as f32;
                         self.state.aspect_ratio =
                             if      (r - 16.0/9.0 ).abs() < 0.05 { AspectRatio::SixteenNine   }
@@ -236,36 +271,33 @@ impl VeloCutApp {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    // Cache by bucket so scrub revisits are instant
-                    if let Some((req_id, bucket)) = self.last_frame_req {
-                        if req_id == id {
-                            // Prune oldest entries beyond 300 frames (~10s at 30fps)
-                            if self.frame_bucket_cache.len() >= 300 {
-                                self.frame_bucket_cache.clear();
-                            }
-                            self.frame_bucket_cache.insert((id, bucket), tex.clone());
-                        }
+                    // Always store in bucket cache keyed by the fine bucket (1/4 s grid)
+                    // so that both coarse prefetch and fine decode populate the same lookup.
+                    // The timestamp we used to request is reconstructed from last_frame_req;
+                    // for coarse results we use scrub_coarse_req bucket scaled back up.
+                    let bucket = self.last_frame_req
+                        .filter(|(rid, _)| *rid == id)
+                        .map(|(_, b)| b)
+                        .or_else(|| self.scrub_coarse_req
+                            .filter(|(rid, _)| *rid == id)
+                            .map(|(_, cb)| cb * 8)) // coarse bucket (2 s) → fine bucket (¼ s)
+                        .unwrap_or_else(|| {
+                            // Fallback: derive from current playhead position
+                            self.state.timeline.iter()
+                                .find(|c| c.media_id == id)
+                                .map(|c| {
+                                    let lt = (self.state.current_time - c.start_time).max(0.0);
+                                    (lt * 4.0) as u32
+                                })
+                                .unwrap_or(0)
+                        });
+                    if self.frame_bucket_cache.len() >= 128 {
+                        let to_remove: Vec<_> = self.frame_bucket_cache.keys()
+                            .take(32).copied().collect();
+                        for k in to_remove { self.frame_bucket_cache.remove(&k); }
                     }
+                    self.frame_bucket_cache.insert((id, bucket), tex.clone());
                     self.frame_cache.insert(id, tex);
-
-                    // Pipeline: immediately pre-request the next frame so the decode
-                    // thread never idles waiting for the next UI tick.
-                    if self.state.is_playing {
-                        if let Some((req_id, bucket)) = self.last_frame_req {
-                            if req_id == id {
-                                let next_bucket = bucket + 1;
-                                let next_ts     = next_bucket as f64 / 30.0;
-                                if let Some(lib) = self.state.library.iter().find(|l| l.id == id) {
-                                    let aspect = self.state.active_video_ratio();
-                                    self.last_frame_req = Some((id, next_bucket));
-                                    self.media_worker.request_frame(
-                                        lib.id, lib.path.clone(), next_ts, aspect,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
                     ctx.request_repaint();
                 }
                 MediaResult::Error { id, msg } => {
@@ -276,38 +308,109 @@ impl VeloCutApp {
     }
 
     fn tick_preview_frame(&mut self) {
-        // Reset dedup when playback starts so first frame fires immediately.
         let just_started = self.state.is_playing && !self.prev_playing;
+        let just_stopped  = !self.state.is_playing && self.prev_playing;
         self.prev_playing = self.state.is_playing;
-        if just_started { self.last_frame_req = None; }
 
-        let current = self.state.timeline.iter().find(|c| {
+        // Find the clip currently under the playhead.
+        let current_clip = self.state.timeline.iter().find(|c| {
             self.state.current_time >= c.start_time
                 && self.state.current_time < c.start_time + c.duration
         }).cloned();
 
-        if let Some(clip) = current {
-            let local_t = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
-            let bucket  = (local_t * 30.0) as u32;  // ~30fps granularity
-            let key     = (clip.media_id, bucket);
-
-            if self.last_frame_req == Some(key) { return; }
-            self.last_frame_req = Some(key);
-
-            if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
-                let aspect = self.state.active_video_ratio();
-                let ts     = bucket as f64 / 30.0;
-
-                // Serve from cache instantly — avoids re-decode on scrub revisit
-                if let Some(cached) = self.frame_bucket_cache.get(&key) {
-                    self.frame_cache.insert(lib.id, cached.clone());
-                    return;
+        if self.state.is_playing {
+            // ── Playback mode ────────────────────────────────────────────────
+            if let Some(clip) = &current_clip {
+                let clip_changed = Some(clip.media_id) != self.playback_media_id;
+                if just_started || clip_changed {
+                    self.playback_media_id = Some(clip.media_id);
+                    if let Some(lib) = self.state.library.iter().find(|l| l.id == clip.media_id) {
+                        let local_ts = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
+                        let aspect   = self.state.active_video_ratio();
+                        self.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
+                    }
                 }
+            }
+            return;
+        }
 
-                self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+        // ── Scrub / pause mode ───────────────────────────────────────────────
+        if just_stopped {
+            self.media_worker.stop_playback();
+            self.playback_media_id = None;
+            self.last_frame_req    = None;
+            self.scrub_last_moved  = None;
+            self.scrub_coarse_req  = None;
+        }
+
+        let Some(clip) = current_clip else {
+            self.last_frame_req   = None;
+            self.scrub_last_moved = None;
+            self.scrub_coarse_req = None;
+            return;
+        };
+
+        let local_t  = (self.state.current_time - clip.start_time + clip.source_offset).max(0.0);
+        // Fine bucket: 1/4 s grid — coarse enough to hit cache often, fine enough for editing
+        let fine_bucket  = (local_t * 4.0) as u32;
+        // Coarse bucket: 2 s grid — for background prefetch of nearby frames
+        let coarse_bucket = (local_t / 2.0) as u32;
+        let fine_key   = (clip.media_id, fine_bucket);
+
+        // ── Detect scrub movement ────────────────────────────────────────────
+        let scrub_moved = self.last_frame_req.map(|k| k != fine_key).unwrap_or(true);
+        if scrub_moved {
+            self.scrub_last_moved = Some(std::time::Instant::now());
+
+            // Evict stale clip frame when crossing to a different clip
+            if let Some((prev_id, _)) = self.last_frame_req {
+                if prev_id != clip.media_id {
+                    self.frame_cache.remove(&prev_id);
+                    self.scrub_coarse_req = None;
+                }
+            }
+            self.last_frame_req = Some(fine_key);
+
+            // ── Layer 1: instant — show nearest already-decoded frame ────────
+            // Walk backwards through fine buckets (up to 2 s) to find a cached frame.
+            let found_nearby = (0..=8u32).find_map(|delta| {
+                let b = fine_bucket.saturating_sub(delta);
+                self.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
+            });
+            if let Some(cached) = found_nearby {
+                self.frame_cache.insert(clip.media_id, cached);
+                // Don't return — still kick off a background decode below
             }
         } else {
-            self.last_frame_req = None;
+            // Scrub hasn't moved — if we already have a frame, nothing to do
+            if self.frame_cache.contains_key(&clip.media_id) {
+                // ── Layer 3 (fine decode): fire only after 150 ms of idle ────
+                let idle_long_enough = self.scrub_last_moved
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                    .unwrap_or(false);
+                if !idle_long_enough { return; }
+                // Already have exact frame for this bucket? Done.
+                if self.frame_bucket_cache.contains_key(&fine_key) { return; }
+                // Request precise frame now that the user has stopped scrubbing
+                if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
+                    let aspect = self.state.active_video_ratio();
+                    let ts     = fine_bucket as f64 / 4.0;
+                    self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+                }
+                return;
+            }
+        }
+
+        // ── Layer 2: coarse prefetch — kick off a background decode on 2 s grid
+        // This fills the cache for nearby positions so scrubbing hits Layer 1 immediately.
+        let coarse_key = (clip.media_id, coarse_bucket);
+        if self.scrub_coarse_req != Some(coarse_key) {
+            self.scrub_coarse_req = Some(coarse_key);
+            if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
+                let aspect = self.state.active_video_ratio();
+                let ts     = coarse_bucket as f64 * 2.0;
+                self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
+            }
         }
     }
 
@@ -646,6 +749,11 @@ impl eframe::App for VeloCutApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.media_worker.shutdown();
         self.audio_sinks.clear();
+        for clip in &self.state.library {
+            if let Some(apath) = &clip.audio_path {
+                MediaWorker::cleanup_audio_temp(apath);
+            }
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -701,8 +809,12 @@ impl eframe::App for VeloCutApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut merged: ThumbnailCache = self.thumbnail_cache.clone();
-            merged.extend(self.frame_cache.iter().map(|(k, v)| (*k, v.clone())));
+            // Build a merged view without cloning the whole map —
+            // frame_cache entries (playback/scrub frames) shadow thumbnail_cache.
+            let mut merged: ThumbnailCache = HashMap::with_capacity(
+                self.thumbnail_cache.len() + self.frame_cache.len());
+            for (k, v) in &self.thumbnail_cache { merged.insert(*k, v.clone()); }
+            for (k, v) in &self.frame_cache     { merged.insert(*k, v.clone()); }
             if let Some(m) = self.modules.iter_mut().find(|m| m.name() == "Preview") {
                 m.ui(ui, &mut self.state, &mut merged);
             }

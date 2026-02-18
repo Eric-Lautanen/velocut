@@ -1,23 +1,33 @@
-[package]
-name = "velocut"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "crates/velocut-core",
+    "crates/velocut-media",
+    "crates/velocut-ui",
+]
+resolver = "2"
 
-[dependencies]
-egui          = "0.33"
-eframe        = { version = "0.33", features = ["persistence"] }
-egui_extras   = { version = "0.33", features = ["all_loaders"] }
-serde         = { version = "1.0",  features = ["derive"] }
-serde_json    = "1.0"
-uuid          = { version = "1.10", features = ["v4", "serde"] }
-rfd           = "0.14"
-tempfile      = "3.10"
-ffmpeg-sidecar = "2.0"
-cpal          = "0.15"
-anyhow        = "1.0"
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+
+# Shared dependency versions across all crates
+[workspace.dependencies]
+egui              = "0.33"
+eframe            = { version = "0.33", features = ["persistence"] }
+egui_extras       = { version = "0.33", features = ["all_loaders"] }
+serde             = { version = "1.0",  features = ["derive"] }
+serde_json        = "1.0"
+uuid              = { version = "1.10", features = ["v4", "serde"] }
+rfd               = "0.14"
+tempfile          = "3.10"
+ffmpeg-sidecar    = "2.0"
+ffmpeg-the-third  = "4"
+anyhow            = "1.0"
 crossbeam-channel = "0.5"
-parking_lot   = "0.12"
-ureq = "3"
-rodio = "0.21"
-ffmpeg-the-third = "4"
-png = "0.18.1"
+parking_lot       = "0.12"
+ureq              = "3"
+rodio             = "0.21"
+png               = "0.18.1"
+cpal              = "0.15"

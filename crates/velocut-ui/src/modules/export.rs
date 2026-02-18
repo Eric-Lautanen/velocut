@@ -1,6 +1,6 @@
 // src/modules/export.rs
 use super::EditorModule;
-use crate::state::ProjectState;
+use velocut_core::state::ProjectState;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, RichText, Stroke};

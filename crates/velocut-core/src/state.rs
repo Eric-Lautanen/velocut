@@ -1,4 +1,6 @@
-// src/state.rs
+// crates/velocut-core/src/state.rs
+// Pure project data — no egui, no ffmpeg, no runtime handles.
+// Serializable via serde. Used by both velocut-ui and velocut-core consumers.
 use std::path::PathBuf;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,9 @@ pub struct ProjectState {
     /// (clip_id, source_path, timestamp, dest_path)
     #[serde(skip)]
     pub pending_extracts:       Vec<(Uuid, PathBuf, f64, PathBuf)>,
+    /// Temp WAV paths queued for deletion (populated when a library clip is removed)
+    #[serde(skip)]
+    pub pending_audio_cleanup: Vec<std::path::PathBuf>,
     /// Queued frame-save: source_path + timestamp, waiting for file dialog result
     #[serde(skip)]
     pub pending_save_pick:      Option<(PathBuf, f64)>,
@@ -96,6 +101,7 @@ impl Default for ProjectState {
             muted:                  false,
             pending_probes:         Vec::new(),
             pending_extracts:       Vec::new(),
+            pending_audio_cleanup:  Vec::new(),
             pending_save_pick:      None,
             save_status:            None,
         }
@@ -209,12 +215,18 @@ impl ProjectState {
         }
     }
 
-    pub fn delete_selected_library(&mut self) {
+    pub fn delete_selected_library(&mut self) -> Option<std::path::PathBuf> {
         if let Some(id) = self.selected_library_clip.take() {
+            if let Some(apath) = self.library.iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.audio_path.clone())
+            {
+                self.pending_audio_cleanup.push(apath.clone());
+            }
             self.library.retain(|c| c.id != id);
-            // Also remove any timeline clips referencing this media
             self.timeline.retain(|c| c.media_id != id);
         }
+        None
     }
 
     pub fn total_duration(&self) -> f64 {
