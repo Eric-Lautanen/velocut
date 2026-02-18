@@ -78,5 +78,3 @@ Contributions welcome! Fork the repo, create a branch, and submit a PR. Focus on
 
 MIT License. See [LICENSE](LICENSE) for details.
 
----
-Built by [Your Name] with ❤️ using Rust.

@@ -429,6 +429,10 @@ fn decode_frame(
         decoder.send_packet(&packet)?;
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            // Skip frames that landed before our target due to keyframe-aligned seek.
+            if let Some(pts) = decoded.pts() {
+                if pts + 2 < seek_ts { continue; }
+            }
             let mut out_frame = ffmpeg::util::frame::video::Video::empty();
             scaler.run(&decoded, &mut out_frame)?;
 
