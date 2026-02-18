@@ -65,6 +65,7 @@ pub struct VeloCutApp {
     modules:         Vec<Box<dyn EditorModule>>,
     thumbnail_cache: ThumbnailCache,
     frame_cache:     HashMap<Uuid, egui::TextureHandle>,
+    frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
     media_worker:    MediaWorker,
     last_frame_req:  Option<(Uuid, u32)>,
     prev_playing:    bool,
@@ -78,8 +79,11 @@ pub struct VeloCutApp {
 impl VeloCutApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         configure_style(&cc.egui_ctx);
+        // Pin to dark mode — prevents egui overwriting our theme on OS light/dark changes.
+        cc.egui_ctx.options_mut(|o| {
+            o.theme_preference = egui::ThemePreference::Dark;
+        });
 
         let state = cc.storage
             .and_then(|s| eframe::get_value::<AppStorage>(s, eframe::APP_KEY))
@@ -128,6 +132,7 @@ impl VeloCutApp {
             ],
             thumbnail_cache: HashMap::new(),
             frame_cache:     HashMap::new(),
+            frame_bucket_cache: HashMap::new(),
             media_worker,
             last_frame_req:  None,
             prev_playing:    false,
@@ -224,7 +229,6 @@ impl VeloCutApp {
                     ctx.request_repaint();
                 }
                 MediaResult::VideoFrame { id, width, height, data } => {
-                    eprintln!("[preview] VideoFrame arrived id={id} {width}x{height}");
                     let tex = ctx.load_texture(
                         format!("frame-{id}"),
                         egui::ColorImage::from_rgba_unmultiplied(
@@ -232,7 +236,36 @@ impl VeloCutApp {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
+                    // Cache by bucket so scrub revisits are instant
+                    if let Some((req_id, bucket)) = self.last_frame_req {
+                        if req_id == id {
+                            // Prune oldest entries beyond 300 frames (~10s at 30fps)
+                            if self.frame_bucket_cache.len() >= 300 {
+                                self.frame_bucket_cache.clear();
+                            }
+                            self.frame_bucket_cache.insert((id, bucket), tex.clone());
+                        }
+                    }
                     self.frame_cache.insert(id, tex);
+
+                    // Pipeline: immediately pre-request the next frame so the decode
+                    // thread never idles waiting for the next UI tick.
+                    if self.state.is_playing {
+                        if let Some((req_id, bucket)) = self.last_frame_req {
+                            if req_id == id {
+                                let next_bucket = bucket + 1;
+                                let next_ts     = next_bucket as f64 / 30.0;
+                                if let Some(lib) = self.state.library.iter().find(|l| l.id == id) {
+                                    let aspect = self.state.active_video_ratio();
+                                    self.last_frame_req = Some((id, next_bucket));
+                                    self.media_worker.request_frame(
+                                        lib.id, lib.path.clone(), next_ts, aspect,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     ctx.request_repaint();
                 }
                 MediaResult::Error { id, msg } => {
@@ -264,7 +297,13 @@ impl VeloCutApp {
             if let Some(lib) = self.state.library.iter().find(|m| m.id == clip.media_id) {
                 let aspect = self.state.active_video_ratio();
                 let ts     = bucket as f64 / 30.0;
-                eprintln!("[preview] req frame t={ts:.3} bucket={bucket}");
+
+                // Serve from cache instantly — avoids re-decode on scrub revisit
+                if let Some(cached) = self.frame_bucket_cache.get(&key) {
+                    self.frame_cache.insert(lib.id, cached.clone());
+                    return;
+                }
+
                 self.media_worker.request_frame(lib.id, lib.path.clone(), ts, aspect);
             }
         } else {
@@ -610,7 +649,6 @@ impl eframe::App for VeloCutApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        configure_style(ctx);
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
 

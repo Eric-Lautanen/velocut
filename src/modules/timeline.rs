@@ -80,24 +80,38 @@ impl EditorModule for TimelineModule {
                                 state.delete_selected();
                             }
                         });
-                        ui.group(|ui| {
-                            // Enabled whenever the playhead sits over a video clip
-                            let active_clip = state.timeline.iter().find(|c| {
-                                state.current_time >= c.start_time
-                                    && state.current_time < c.start_time + c.duration
-                            }).and_then(|tc| {
-                                state.library.iter().find(|l| l.id == tc.media_id)
-                                    .map(|lib| (lib.path.clone(), state.current_time - tc.start_time + tc.source_offset))
-                            });
-                            if ui.add_enabled(
-                                active_clip.is_some(),
-                                egui::Button::new("📷 Save Frame"),
-                            ).on_hover_text("Save current frame as PNG").clicked() {
-                                if let Some((path, ts)) = active_clip {
-                                    state.pending_save_pick = Some((path, ts));
+                        if state.selected_timeline_clip.is_some() {
+                            ui.group(|ui| {
+                                let extract_enabled = state.selected_timeline_clip
+                                    .and_then(|id| state.timeline.iter().find(|c| c.id == id))
+                                    .and_then(|tc| state.library.iter().find(|l| l.id == tc.media_id))
+                                    .is_some();
+                                if ui.add_enabled(extract_enabled,
+                                    egui::Button::new("⬛ First Frame")
+                                ).on_hover_text("Extract first frame as PNG").clicked() {
+                                    if let Some(tc) = state.selected_timeline_clip
+                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
+                                    {
+                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
+                                            // Queue: open file dialog in app.rs next frame (avoids blocking egui)
+                                            state.pending_save_pick = Some((lib.path.clone(), tc.source_offset));
+                                        }
+                                    }
                                 }
-                            }
-                        });
+                                if ui.add_enabled(extract_enabled,
+                                    egui::Button::new("⬛ Last Frame")
+                                ).on_hover_text("Extract last frame as PNG").clicked() {
+                                    if let Some(tc) = state.selected_timeline_clip
+                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
+                                    {
+                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
+                                            let ts = (tc.source_offset + tc.duration - 1.0/30.0).max(0.0);
+                                            state.pending_save_pick = Some((lib.path.clone(), ts));
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("🔍+").clicked() {
                                 state.timeline_zoom = (state.timeline_zoom * 1.25).min(500.0);
@@ -137,7 +151,7 @@ impl EditorModule for TimelineModule {
                     let total_h  = header_height + (track_height + track_gap) * num_tracks as f32;
 
                     let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(total_w, total_h), Sense::click_and_drag());
+                        egui::vec2(total_w, total_h), Sense::click());
                     let painter = ui.painter();
 
                     painter.rect_filled(rect, 0.0, DARK_BG_0);
@@ -176,6 +190,20 @@ impl EditorModule for TimelineModule {
                                 Color32::from_gray(140));
                         }
                         s += step;
+                    }
+
+                    // Ruler click/drag → seek (this is the only scrub zone)
+                    let ruler_rect = Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
+                    let ruler_resp = ui.interact(ruler_rect, Id::new("timeline_ruler"), Sense::click_and_drag());
+                    if ruler_resp.clicked() || ruler_resp.dragged() {
+                        if let Some(ptr) = ruler_resp.interact_pointer_pos() {
+                            let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            state.current_time = t.min(state.total_duration().max(0.0));
+                            state.is_playing   = false;
+                        }
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    } else if ruler_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
 
                     // DnD drop zone
@@ -388,16 +416,29 @@ impl EditorModule for TimelineModule {
                              Pos2::new(ph_x, rect.min.y + 12.0)],
                         ACCENT, Stroke::NONE));
 
-                    // Scrub on drag over empty area (not while dragging a clip)
-                    let dragging_clip = state.selected_timeline_clip
-                        .map(|id| ui.ctx().is_being_dragged(Id::new(id)))
-                        .unwrap_or(false);
-                    if response.dragged() && !dragging_clip {
-                        if let Some(ptr) = response.interact_pointer_pos() {
+                    // Playhead triangle handle — only this small area drags the playhead
+                    let handle_rect = Rect::from_center_size(
+                        Pos2::new(ph_x, rect.min.y + 6.0),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    let handle_resp = ui.interact(
+                        handle_rect, Id::new("playhead_handle"), Sense::click_and_drag(),
+                    );
+                    if handle_resp.dragged() {
+                        if let Some(ptr) = handle_resp.interact_pointer_pos() {
                             let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
-                            state.current_time = t;
+                            state.current_time = t.min(state.total_duration().max(0.0));
                             state.is_playing   = false;
                         }
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    } else if handle_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+
+                    // Background click = deselect
+                    if response.clicked() {
+                        state.selected_timeline_clip = None;
+                        state.selected_library_clip  = None;
                     }
                 });
         });
