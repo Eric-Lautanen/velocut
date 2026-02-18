@@ -45,13 +45,37 @@ impl VideoModule {
         ctx:   &mut AppContext,
         egui_ctx: &egui::Context,
     ) {
-        // Clip-local expected timestamp right now (source-offset adjusted).
-        let pb_local_t: Option<f64> = state.timeline.iter()
-            .find(|c| {
-                state.current_time >= c.start_time
-                    && state.current_time < c.start_time + c.duration
-            })
+        // Find clip under playhead — we need both pb_local_t and media_id.
+        let current_clip = state.timeline.iter().find(|c| {
+            state.current_time >= c.start_time
+                && state.current_time < c.start_time + c.duration
+        });
+        let current_media_id = current_clip.map(|c| c.media_id);
+        let pb_local_t: Option<f64> = current_clip
             .map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
+
+        // ── Discard stale pending frame ───────────────────────────────────────
+        // Two cases that permanently block the slot if not handled:
+        //
+        // a) Wrong clip: tick() detects clip_changed AFTER poll_playback runs, so
+        //    the transition frame always picks up a clip-1 frame with a large
+        //    timestamp (e.g. 28s) while local_t is 0s. Upper-bound check fails.
+        //    The slot is stuck until tick() clears it next frame — fine. But if
+        //    the same media_id appears on both clips (reused asset), tick() never
+        //    clears it. This guard covers both cases.
+        //
+        // b) Too old: burn_to_pts runs synchronously so current_time advances
+        //    during the burn. The first correct frame has timestamp T but local_t
+        //    is T + burn_time. If burn_time > lower_bound the frame is rejected
+        //    but never discarded — permanent freeze. The too_old guard here
+        //    discards it immediately so the slot opens for the next frame.
+        if let Some(pending) = &ctx.pending_pb_frame {
+            let wrong_clip = current_media_id.map(|id| id != pending.id).unwrap_or(true);
+            let too_old    = pb_local_t.map(|lt| pending.timestamp < lt - 3.0).unwrap_or(false);
+            if wrong_clip || too_old {
+                ctx.pending_pb_frame = None;
+            }
+        }
 
         // Step 1: fill pending slot if empty.
         if ctx.pending_pb_frame.is_none() {
@@ -60,7 +84,9 @@ impl VideoModule {
             }
         }
 
-        // Step 2: fast-forward past overdue frames (UI lagged behind decode).
+        // Step 2: fast-forward past overdue frames.
+        // With the 32-frame channel and burn_to_pts completing before first send,
+        // this drains the early keyframe frames in a single tick after seek.
         if let Some(local_t) = pb_local_t {
             while ctx.pending_pb_frame
                 .as_ref()
@@ -74,22 +100,17 @@ impl VideoModule {
             }
         }
 
-        // Step 3: display pending frame when its PTS is due.
-        // Upper bound: frame timestamp <= current_time + 1 frame (not too early).
-        // Lower bound: frame timestamp >= current_time - 150ms (not too old).
-        // Without the lower bound, a keyframe-aligned frame that's 300ms behind
-        // current_time passes the due check on play start and causes a visible
-        // jump backward while the decoder catches up.
+        // Step 3: promote pending frame when its PTS is due.
+        //
         // Upper bound: don't show a frame more than 1 tick early.
-        // Lower bound: 0.5 s. skip_until_pts in next_frame() means the first frame
-        // from the playback thread after a seek should arrive at the correct position,
-        // so we don't need the 2 s window we used when advance_to() was blocking.
-        // 0.5 s is generous enough to absorb jitter while still rejecting a
-        // genuinely stale frame from a previous clip or scrub session leaking through.
+        // Lower bound: 3.0 s — must cover the worst-case burn_to_pts duration.
+        // At 60 fps H.264 with a 5 s GOP, burn is ~300 frames × ~2 ms = ~600 ms.
+        // 3 s is ample headroom. Genuine staleness (different clip, scrub bleed)
+        // is caught by the wrong_clip / too_old guards above.
         let frame_due = ctx.pending_pb_frame.as_ref().map(|f: &PlaybackFrame| {
             pb_local_t.map(|lt| {
                 f.timestamp <= lt + (1.0 / 60.0)
-                    && f.timestamp >= lt - 0.5
+                    && f.timestamp >= lt - 3.0
             }).unwrap_or(true)
         }).unwrap_or(false);
 

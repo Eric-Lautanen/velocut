@@ -120,7 +120,7 @@ impl MediaWorker {
         // Runs continuously ahead of the UI filling a bounded channel (backpressure).
         // Channel capacity = 6 frames (~240ms lookahead at 25fps).
         let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(4);
-        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(6);
+        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(32); // 32 frames = ~1s lookahead headroom for seek burn
 
         thread::spawn(move || {
             let mut decoder: Option<(Uuid, LiveDecoder)> = None;
@@ -130,14 +130,17 @@ impl MediaWorker {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
                             match LiveDecoder::open(&path, ts, aspect) {
                                 Ok(mut nd) => {
-                                    // Use skip_until_pts instead of advance_to().
-                                    // advance_to() blocks this thread for the entire GOP
-                                    // burn-through (200-600ms at 5s GOP), starving the
-                                    // frame channel and causing visible freeze on resume.
-                                    // skip_until_pts lets next_frame() handle the burn
-                                    // decode-only (no scale), so the first scaled frame
-                                    // sent to the channel is at the right position.
-                                    nd.skip_until_pts = nd.ts_to_pts(ts);
+                                    // burn_to_pts runs synchronously (decode-only, no scale)
+                                    // before we enter the send loop. The channel is empty at
+                                    // this point so we're not blocking anything useful.
+                                    // The first frame we send will be at the correct position.
+                                    //
+                                    // Using skip_until_pts (lazy, inside next_frame) was wrong:
+                                    // current_time advances during the lazy burn, so the first
+                                    // correct frame fails poll_playback's lower-bound check and
+                                    // gets stuck in pending_pb_frame forever → hard freeze.
+                                    let tpts = nd.ts_to_pts(ts);
+                                    nd.burn_to_pts(tpts);
                                     decoder = Some((new_id, nd));
                                 }
                                 Err(e) => { eprintln!("[pb] open: {e}"); decoder = None; }
@@ -162,7 +165,8 @@ impl MediaWorker {
                         Ok(PlaybackCmd::Start { id, path, ts, aspect }) => {
                             match LiveDecoder::open(&path, ts, aspect) {
                                 Ok(mut d) => {
-                                    d.skip_until_pts = d.ts_to_pts(ts);
+                                    let tpts = d.ts_to_pts(ts);
+                                    d.burn_to_pts(tpts);
                                     decoder = Some((id, d));
                                 }
                                 Err(e) => eprintln!("[pb] open: {e}"),

@@ -161,6 +161,29 @@ impl LiveDecoder {
         }
         last_good.map(|d| (d, self.out_w, self.out_h))
     }
+
+    /// Decode and discard frames without scaling until `last_pts >= target_pts`.
+    ///
+    /// This is the fast seek used by the playback thread after a keyframe-aligned
+    /// open().  Skipping the scaler+alloc makes it ~4-8x faster than advance_to().
+    ///
+    /// Runs synchronously — call this in the Start handler BEFORE entering the
+    /// frame-send loop so the first frame the thread sends is at the correct
+    /// position.  The caller is blocked for the duration but the channel is empty
+    /// at this point, so the UI simply shows held_frame until playback begins.
+    pub fn burn_to_pts(&mut self, target_pts: i64) {
+        if target_pts <= 0 || target_pts <= self.last_pts { return; }
+        'outer: for (stream, packet) in self.ictx.packets().flatten() {
+            if stream.index() != self.video_idx { continue; }
+            if self.decoder.send_packet(&packet).is_err() { continue; }
+            let mut decoded = ffmpeg::util::frame::video::Video::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+                self.last_pts = pts;
+                if pts >= target_pts { break 'outer; }
+            }
+        }
+    }
 }
 
 // ── One-shot frame decode (preview + PNG save) ────────────────────────────────
