@@ -54,6 +54,30 @@ impl VideoModule {
         let pb_local_t: Option<f64> = current_clip
             .map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
 
+        // ── Clip-transition eviction (must run before the UI renders) ────────────
+        // tick() also calls frame_cache.remove on clip change, but tick() runs
+        // AFTER app.rs has already read frame_cache into preview.current_frame.
+        // That one-frame window is enough to flash a stale scrub frame from the
+        // incoming clip. Clearing it here — inside poll_playback, which is called
+        // from poll_media() before update() — closes the window entirely.
+        //
+        // We detect the transition by comparing current_media_id to
+        // ctx.playback_media_id (the id that was active last tick).  We only read
+        // playback_media_id here; tick() remains responsible for writing it.
+        if state.is_playing {
+            let clip_changed = match (current_media_id, ctx.playback_media_id) {
+                (Some(cur), Some(prev)) => cur != prev,
+                (Some(_), None)         => true,  // playback just started
+                _                       => false,
+            };
+            if clip_changed {
+                if let Some(id) = current_media_id {
+                    ctx.frame_cache.remove(&id);
+                }
+                ctx.pending_pb_frame = None;
+            }
+        }
+
         // ── Discard stale pending frame ───────────────────────────────────────
         // Two cases that permanently block the slot if not handled:
         //

@@ -65,11 +65,12 @@ impl VeloCutApp {
         }
 
         let context = AppContext::new(media_worker);
+        let library = LibraryModule::new();
 
         Self {
             state,
             context,
-            library:      LibraryModule,
+            library,
             preview:      PreviewModule::new(),
             timeline:     TimelineModule,
             export:       ExportModule::default(),
