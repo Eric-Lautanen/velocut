@@ -85,13 +85,14 @@ impl EditorModule for LibraryModule {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-                    let clips: Vec<(uuid::Uuid, String, velocut_core::state::ClipType, f64, bool)> = state.library.iter()
-                        .map(|c| (c.id, c.name.clone(), c.clip_type, c.duration, c.duration_probed))
-                        .collect();
-
                     let mut to_delete: Option<uuid::Uuid> = None;
 
-                    for (id, name, clip_type, duration, probed) in clips {
+                    for clip in &state.library {
+                        let id         = clip.id;
+                        let name       = &clip.name;
+                        let clip_type  = clip.clip_type;
+                        let duration   = clip.duration;
+                        let probed     = clip.duration_probed;
                         let item_id          = Id::new("lib_clip").with(id);
                         let is_selected      = state.selected_library_clip == Some(id);
                         let is_being_dragged = ui.ctx().is_being_dragged(item_id);
@@ -118,7 +119,7 @@ impl EditorModule for LibraryModule {
                                 }
                                 gp.text(ghost_rect.center_bottom() + egui::vec2(0.0, 4.0),
                                     egui::Align2::CENTER_TOP,
-                                    format!("  {}  ", truncate(&name, 16)),
+                                    format!("  {}  ", truncate(name, 16)),
                                     egui::FontId::proportional(10.0),
                                     Color32::from_rgba_unmultiplied(220,220,230,200));
                                 ui.memory_mut(|mem| mem.data.insert_temp(Id::new("DND_PAYLOAD"), id));
@@ -153,7 +154,7 @@ impl EditorModule for LibraryModule {
                                     }
                                     ui.add_space(3.0);
                                     ui.add(egui::Label::new(
-                                        RichText::new(&name).size(10.0).color(DARK_TEXT_DIM)
+                                        RichText::new(name.as_str()).size(10.0).color(DARK_TEXT_DIM)
                                     ).truncate());
                                     let dur_text = if probed { format!("{:.1}s", duration) } else { "…".into() };
                                     ui.label(RichText::new(dur_text).size(9.0).color(ACCENT).monospace());
@@ -185,7 +186,7 @@ impl EditorModule for LibraryModule {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.label(RichText::new(truncate(&name, 24)).size(10.0).color(DARK_TEXT_DIM));
+                            ui.label(RichText::new(truncate(name, 24)).size(10.0).color(DARK_TEXT_DIM));
                             if probed {
                                 ui.label(RichText::new(format!("Duration: {duration:.2}s")).size(10.0).color(DARK_TEXT_DIM));
                             }

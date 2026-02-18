@@ -3,7 +3,6 @@
 mod app;
 mod context;
 mod modules;
-mod paths;
 mod theme;
 
 fn main() -> eframe::Result {

@@ -15,7 +15,7 @@ use velocut_core::media_types::{MediaResult, PlaybackFrame};
 use crate::decode::{LiveDecoder, decode_frame};
 use crate::probe::{probe_duration, probe_video_size_and_thumbnail};
 use crate::waveform::extract_waveform;
-use crate::audio::{extract_audio, cleanup_audio_temp};
+use crate::audio::extract_audio;
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
@@ -56,7 +56,6 @@ impl MediaWorker {
         // Blocks on the latest-wins slot; reuses the LiveDecoder when possible.
         let result_tx = tx.clone();
         let slot      = Arc::clone(&frame_req);
-        let sd_scrub  = Arc::new(AtomicBool::new(false));
         thread::spawn(move || {
             let mut live: Option<LiveDecoder> = None;
             loop {
@@ -72,17 +71,32 @@ impl MediaWorker {
                 // Poison-pill: a request with a nil id signals shutdown.
                 if req.id == Uuid::nil() { return; }
 
-                // Reuse decoder if same file and timestamp is ahead; otherwise re-open + seek.
+                // Reset (re-open + seek to keyframe) when:
+                //   a) different file
+                //   b) any backward movement — advance_to() can only go forward
+                //   c) forward jump > 2 s — advance_to() would decode 60+ frames
+                //      (~300-800 ms), blocking the thread. Re-open is instant and
+                //      Layer 3 (150 ms debounce) fires the exact frame once idle.
                 let needs_reset = live.as_ref().map(|d| {
+                    let tpts     = d.ts_to_pts(req.timestamp);
+                    let two_secs = d.ts_to_pts(2.0);
                     d.path != req.path
-                        || d.ts_to_pts(req.timestamp) < d.last_pts - d.tb_den as i64
+                        || tpts <= d.last_pts               // any backward seek
+                        || tpts > d.last_pts + two_secs     // large forward jump
                 }).unwrap_or(true);
 
                 if needs_reset {
                     match LiveDecoder::open(&req.path, req.timestamp, req.aspect) {
                         Ok(mut d) => {
-                            let tpts = d.ts_to_pts(req.timestamp);
-                            if let Some((data, w, h)) = d.advance_to(tpts) {
+                            // Set skip_until_pts so next_frame() burns through the GOP
+                            // (decode-only, no scale/alloc) and returns the frame at
+                            // exactly req.timestamp rather than the keyframe.
+                            // This replaces the old "show keyframe immediately" approach
+                            // which showed a frame that could be seconds off-position.
+                            // The skip loop is ~4x faster than advance_to() since it
+                            // avoids scaling every intermediate frame.
+                            d.skip_until_pts = d.ts_to_pts(req.timestamp);
+                            if let Some((data, w, h, _)) = d.next_frame() {
                                 let _ = result_tx.send(MediaResult::VideoFrame {
                                     id: req.id, width: w, height: h, data,
                                 });
@@ -115,7 +129,17 @@ impl MediaWorker {
                     match pb_cmd_rx.try_recv() {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
                             match LiveDecoder::open(&path, ts, aspect) {
-                                Ok(nd) => { decoder = Some((new_id, nd)); }
+                                Ok(mut nd) => {
+                                    // Use skip_until_pts instead of advance_to().
+                                    // advance_to() blocks this thread for the entire GOP
+                                    // burn-through (200-600ms at 5s GOP), starving the
+                                    // frame channel and causing visible freeze on resume.
+                                    // skip_until_pts lets next_frame() handle the burn
+                                    // decode-only (no scale), so the first scaled frame
+                                    // sent to the channel is at the right position.
+                                    nd.skip_until_pts = nd.ts_to_pts(ts);
+                                    decoder = Some((new_id, nd));
+                                }
                                 Err(e) => { eprintln!("[pb] open: {e}"); decoder = None; }
                             }
                             continue;
@@ -137,7 +161,10 @@ impl MediaWorker {
                     match pb_cmd_rx.recv() {
                         Ok(PlaybackCmd::Start { id, path, ts, aspect }) => {
                             match LiveDecoder::open(&path, ts, aspect) {
-                                Ok(d) => { decoder = Some((id, d)); }
+                                Ok(mut d) => {
+                                    d.skip_until_pts = d.ts_to_pts(ts);
+                                    decoder = Some((id, d));
+                                }
                                 Err(e) => eprintln!("[pb] open: {e}"),
                             }
                         }
@@ -203,6 +230,13 @@ impl MediaWorker {
             let dur = probe_duration(&path, id, &tx);
             if sd.load(Ordering::Relaxed) { return; }
             probe_video_size_and_thumbnail(&path, id, dur, &tx);
+
+            // Release the semaphore here — the in-process FFmpeg work (duration +
+            // thumbnail) is done. Waveform and audio use blocking CLI subprocesses
+            // that can run for seconds on long files. Holding the semaphore through
+            // them starves thumbnail/duration results for clips imported afterward.
+            drop(_guard);
+
             if sd.load(Ordering::Relaxed) { return; }
             extract_waveform(&path, id, &tx);
             if sd.load(Ordering::Relaxed) { return; }

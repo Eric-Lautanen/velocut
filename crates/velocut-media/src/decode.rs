@@ -18,16 +18,21 @@ use velocut_core::media_types::MediaResult;
 // ── Stateful per-clip decoder ─────────────────────────────────────────────────
 
 pub struct LiveDecoder {
-    pub path:      PathBuf,
-    pub ictx:      ffmpeg::format::context::Input,
-    pub decoder:   ffmpeg::decoder::video::Video,
-    pub video_idx: usize,
-    pub last_pts:  i64,
-    pub tb_num:    i32,
-    pub tb_den:    i32,
-    pub out_w:     u32,
-    pub out_h:     u32,
-    pub scaler:    SwsContext,
+    pub path:           PathBuf,
+    pub ictx:           ffmpeg::format::context::Input,
+    pub decoder:        ffmpeg::decoder::video::Video,
+    pub video_idx:      usize,
+    pub last_pts:       i64,
+    pub tb_num:         i32,
+    pub tb_den:         i32,
+    pub out_w:          u32,
+    pub out_h:          u32,
+    pub scaler:         SwsContext,
+    /// If non-zero, next_frame() skips (decode-only, no scale/alloc) all frames
+    /// whose PTS is below this threshold, then clears the field.
+    /// Used to burn through the GOP after a keyframe-aligned seek without blocking
+    /// the thread on advance_to() — which scales every skipped frame needlessly.
+    pub skip_until_pts: i64,
 }
 
 impl LiveDecoder {
@@ -70,7 +75,13 @@ impl LiveDecoder {
 
         Ok(Self {
             path: path.clone(), ictx, decoder, video_idx,
-            last_pts: seek_ts, tb_num, tb_den, out_w, out_h, scaler,
+            // seek_ts is where we ASKED to seek, not where FFmpeg actually landed.
+            // The actual landing position is the nearest keyframe, which can be seconds
+            // before seek_ts. Initialising last_pts to seek_ts - 1 ensures that
+            // advance_to() fires correctly when called with target == seek_ts, since
+            // the check is tpts > last_pts (strictly greater).
+            last_pts: seek_ts.saturating_sub(1), tb_num, tb_den, out_w, out_h, scaler,
+            skip_until_pts: 0,
         })
     }
 
@@ -83,6 +94,11 @@ impl LiveDecoder {
     }
 
     /// Decode the next frame sequentially (no seek). Returns `(pixels, w, h, ts_secs)` or None at EOF.
+    ///
+    /// If `skip_until_pts` is set (non-zero), frames before that PTS are decoded
+    /// but not scaled — decode-only is ~4x faster than decode+scale+alloc, so this
+    /// burns through a GOP in ~50 ms instead of ~200 ms.  Once the threshold is
+    /// reached the field is cleared and normal decode+scale resumes.
     pub fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
@@ -91,6 +107,12 @@ impl LiveDecoder {
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
+                // Burn-through: skip scaler for pre-target frames after a seek.
+                // Avoids decode+scale+alloc for every GOP frame we don't need.
+                if self.skip_until_pts > 0 && pts < self.skip_until_pts {
+                    continue;
+                }
+                self.skip_until_pts = 0; // reached target — disable skip
                 let ts_secs = self.pts_to_secs(pts);
                 let mut out = ffmpeg::util::frame::video::Video::empty();
                 if self.scaler.run(&decoded, &mut out).is_err() { return None; }
@@ -158,10 +180,11 @@ pub fn decode_frame(
         .ok_or_else(|| anyhow::anyhow!("no video stream"))?
         .index();
 
-    let seek_ts = {
+    let (seek_ts, tb_num, tb_den) = {
         let stream = ictx.stream(video_stream_idx).unwrap();
         let tb     = stream.time_base();
-        (timestamp * tb.denominator() as f64 / tb.numerator() as f64) as i64
+        let ts     = (timestamp * tb.denominator() as f64 / tb.numerator() as f64) as i64;
+        (ts, tb.numerator() as f64, tb.denominator() as f64)
     };
     ictx.seek(seek_ts, ..=seek_ts)?;
 
@@ -200,8 +223,11 @@ pub fn decode_frame(
             scaler.run(&decoded, &mut out_frame)?;
             last_good = Some(out_frame.clone());
             // Skip frames that landed before our target due to keyframe-aligned seek.
+            // Compare in seconds — pts+2 in raw units is timebase-dependent (22µs at
+            // 1/90000 but 80ms at 1/25), which would incorrectly skip real frames.
             if let Some(pts) = decoded.pts() {
-                if pts + 2 < seek_ts { continue; }
+                let pts_secs = pts as f64 * tb_num / tb_den;
+                if pts_secs < timestamp - (1.0 / 60.0) { continue; }
             }
             emit_frame(&out_frame, id, out_w, out_h, save_png, &dest, tx)?;
             return Ok(());

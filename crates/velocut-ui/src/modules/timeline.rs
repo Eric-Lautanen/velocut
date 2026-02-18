@@ -216,6 +216,13 @@ impl EditorModule for TimelineModule {
                     let content_rect = Rect::from_min_max(
                         Pos2::new(rect.min.x, rect.min.y + header_height), rect.max);
 
+                    // If a payload is live but the user released outside the drop zone,
+                    // no drop handler ever clears it. Clear it here so the next hover
+                    // doesn't show a ghost drop indicator from a completed/aborted drag.
+                    if payload.is_some() && !ui.input(|i| i.pointer.any_down()) {
+                        ui.memory_mut(|mem| mem.data.remove::<Uuid>(Id::new("DND_PAYLOAD")));
+                    }
+
                     if let Some(clip_id) = payload {
                         if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
                             if content_rect.contains(hover) {
@@ -251,10 +258,9 @@ impl EditorModule for TimelineModule {
                     }
 
                     // ── Timeline Clips ─────────────────────────────────────────
-                    let clips: Vec<_> = state.timeline.iter().cloned().collect();
                     let mut to_delete: Option<Uuid> = None;
 
-                    for clip in &clips {
+                    for clip in &state.timeline {
                         let lib       = state.library.iter().find(|l| l.id == clip.media_id);
                         let media_name = lib.map(|l| l.name.as_str()).unwrap_or("Unknown");
                         let clip_type  = lib.map(|l| l.clip_type).unwrap_or(ClipType::Video);

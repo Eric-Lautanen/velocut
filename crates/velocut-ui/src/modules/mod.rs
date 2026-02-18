@@ -6,10 +6,11 @@
 //   3. Add one line to the modules vec in app.rs
 
 pub mod timeline;
-pub mod preview;
+pub mod preview_module;
 pub mod library;
 pub mod export;
-pub mod audio;
+pub mod video_module;
+pub mod audio_module;
 
 use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
