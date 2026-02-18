@@ -98,6 +98,7 @@ impl LiveDecoder {
 
     /// Read forward until we find a frame at or past `target_pts`. Returns RGBA pixels.
     fn advance_to(&mut self, target_pts: i64) -> Option<(Vec<u8>, u32, u32)> {
+        let mut last_good: Option<Vec<u8>> = None;
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
             if self.decoder.send_packet(&packet).is_err() { continue; }
@@ -105,9 +106,8 @@ impl LiveDecoder {
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
-                if pts < target_pts { continue; }
                 let mut out = ffmpeg::util::frame::video::Video::empty();
-                if self.scaler.run(&decoded, &mut out).is_err() { return None; }
+                if self.scaler.run(&decoded, &mut out).is_err() { return last_good.map(|d| (d, self.out_w, self.out_h)); }
                 let stride = out.stride(0);
                 let raw    = out.data(0);
                 let data: Vec<u8> = (0..self.out_h as usize)
@@ -117,10 +117,12 @@ impl LiveDecoder {
                     })
                     .copied()
                     .collect();
+                last_good = Some(data.clone());
+                if pts < target_pts { continue; }
                 return Some((data, self.out_w, self.out_h));
             }
         }
-        None
+        last_good.map(|d| (d, self.out_w, self.out_h))
     }
 }
 
@@ -424,17 +426,22 @@ fn decode_frame(
         Flags::BILINEAR,
     )?;
 
+    // last_good holds the most-recently scaled frame in case we hit EOF before
+    // reaching seek_ts (e.g. requesting the final frame of a clip).
+    let mut last_good: Option<ffmpeg::util::frame::video::Video> = None;
+
     for (stream, packet) in ictx.packets().flatten() {
         if stream.index() != video_stream_idx { continue; }
         decoder.send_packet(&packet)?;
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            let mut out_frame = ffmpeg::util::frame::video::Video::empty();
+            scaler.run(&decoded, &mut out_frame)?;
+            last_good = Some(out_frame.clone());
             // Skip frames that landed before our target due to keyframe-aligned seek.
             if let Some(pts) = decoded.pts() {
                 if pts + 2 < seek_ts { continue; }
             }
-            let mut out_frame = ffmpeg::util::frame::video::Video::empty();
-            scaler.run(&decoded, &mut out_frame)?;
 
             if save_png {
                 use std::io::BufWriter;
@@ -471,6 +478,41 @@ fn decode_frame(
             }
             return Ok(());
         }
+    }
+    // EOF reached without hitting seek_ts — emit the last frame we saw (handles
+    // requests near the very end of the clip where no frame sits past seek_ts).
+    if let Some(out_frame) = last_good {
+        if save_png {
+            use std::io::BufWriter;
+            let dest_path = dest.ok_or_else(|| anyhow::anyhow!("no dest path for PNG save"))?;
+            let stride = out_frame.stride(0);
+            let raw    = out_frame.data(0);
+            let file   = std::fs::File::create(&dest_path)?;
+            let w      = &mut BufWriter::new(file);
+            let mut encoder = png::Encoder::new(w, out_w, out_h);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header()?;
+            let row_bytes = out_w as usize * 3;
+            let rows: Vec<&[u8]> = (0..out_h as usize)
+                .map(|row| &raw[row * stride..row * stride + row_bytes])
+                .collect();
+            writer.write_image_data(&rows.concat())?;
+            eprintln!("[media] PNG saved (last frame fallback) → {}", dest_path.display());
+            let _ = tx.send(MediaResult::FrameSaved { path: dest_path });
+        } else {
+            let stride = out_frame.stride(0);
+            let raw    = out_frame.data(0);
+            let data: Vec<u8> = (0..out_h as usize)
+                .flat_map(|row| {
+                    let start = row * stride;
+                    &raw[start..start + out_w as usize * 4]
+                })
+                .copied()
+                .collect();
+            let _ = tx.send(MediaResult::VideoFrame { id, width: out_w, height: out_h, data });
+        }
+        return Ok(());
     }
     Err(anyhow::anyhow!("no frame found at t={timestamp:.3}"))
 }

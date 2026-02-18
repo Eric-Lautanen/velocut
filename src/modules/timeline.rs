@@ -80,38 +80,24 @@ impl EditorModule for TimelineModule {
                                 state.delete_selected();
                             }
                         });
-                        if state.selected_timeline_clip.is_some() {
-                            ui.group(|ui| {
-                                let extract_enabled = state.selected_timeline_clip
-                                    .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    .and_then(|tc| state.library.iter().find(|l| l.id == tc.media_id))
-                                    .is_some();
-                                if ui.add_enabled(extract_enabled,
-                                    egui::Button::new("⬛ First Frame")
-                                ).on_hover_text("Extract first frame as PNG").clicked() {
-                                    if let Some(tc) = state.selected_timeline_clip
-                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    {
-                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
-                                            // Queue: open file dialog in app.rs next frame (avoids blocking egui)
-                                            state.pending_save_pick = Some((lib.path.clone(), tc.source_offset));
-                                        }
-                                    }
-                                }
-                                if ui.add_enabled(extract_enabled,
-                                    egui::Button::new("⬛ Last Frame")
-                                ).on_hover_text("Extract last frame as PNG").clicked() {
-                                    if let Some(tc) = state.selected_timeline_clip
-                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    {
-                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
-                                            let ts = (tc.source_offset + tc.duration - 1.0/30.0).max(0.0);
-                                            state.pending_save_pick = Some((lib.path.clone(), ts));
-                                        }
-                                    }
-                                }
+                        ui.group(|ui| {
+                            // Enabled whenever the playhead sits over a video clip
+                            let active_clip = state.timeline.iter().find(|c| {
+                                state.current_time >= c.start_time
+                                    && state.current_time < c.start_time + c.duration
+                            }).and_then(|tc| {
+                                state.library.iter().find(|l| l.id == tc.media_id)
+                                    .map(|lib| (lib.path.clone(), state.current_time - tc.start_time + tc.source_offset))
                             });
-                        }
+                            if ui.add_enabled(
+                                active_clip.is_some(),
+                                egui::Button::new("📷 Save Frame"),
+                            ).on_hover_text("Save current frame as PNG").clicked() {
+                                if let Some((path, ts)) = active_clip {
+                                    state.pending_save_pick = Some((path, ts));
+                                }
+                            }
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("🔍+").clicked() {
                                 state.timeline_zoom = (state.timeline_zoom * 1.25).min(500.0);
