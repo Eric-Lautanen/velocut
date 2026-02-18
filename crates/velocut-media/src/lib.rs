@@ -9,6 +9,7 @@
 
 pub mod audio;
 pub mod decode;
+pub mod encode;
 pub mod probe;
 pub mod waveform;
 pub mod worker;
@@ -16,3 +17,6 @@ pub mod worker;
 // Re-export the main public API so velocut-ui imports are simple.
 pub use worker::MediaWorker;
 pub use velocut_core::media_types::{MediaResult, PlaybackFrame};
+
+// Re-export encode types so app.rs can build EncodeSpec without a deep import path.
+pub use encode::{ClipSpec, EncodeSpec};

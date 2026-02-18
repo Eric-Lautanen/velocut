@@ -203,6 +203,42 @@ impl AppContext {
                 MediaResult::Error { id, msg } => {
                     eprintln!("[media] {id}: {msg}");
                 }
+
+                // ── Encode results ────────────────────────────────────────────
+                // All three arms guard on `state.encode_job == Some(job_id)` so a
+                // stale result from a previously cancelled job never clobbers a
+                // freshly started one.
+
+                MediaResult::EncodeProgress { job_id, frame, total_frames } => {
+                    if state.encode_job == Some(job_id) {
+                        state.encode_progress = Some((frame, total_frames));
+                        ctx.request_repaint();
+                    }
+                }
+
+                MediaResult::EncodeDone { job_id, path } => {
+                    if state.encode_job == Some(job_id) {
+                        // Snap progress to 100 % so the bar is full in the instant
+                        // before the done banner replaces it.
+                        if let Some((_, total)) = state.encode_progress {
+                            state.encode_progress = Some((total, total));
+                        }
+                        state.encode_done = Some(path);
+                        // encode_job is intentionally left set here. ExportModule
+                        // uses it to distinguish "idle" from "done-but-not-dismissed".
+                        // ClearEncodeStatus (emitted by the Dismiss button) clears it.
+                        ctx.request_repaint();
+                    }
+                }
+
+                MediaResult::EncodeError { job_id, msg } => {
+                    if state.encode_job == Some(job_id) {
+                        state.encode_error = Some(msg);
+                        // Same rationale as EncodeDone: leave encode_job set until
+                        // the user explicitly dismisses the error banner.
+                        ctx.request_repaint();
+                    }
+                }
             }
         }
     }

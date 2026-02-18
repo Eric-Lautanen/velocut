@@ -82,6 +82,23 @@ pub struct ProjectState {
     /// Brief status message shown in timeline toolbar after a frame save
     #[serde(skip)]
     pub save_status:            Option<String>,
+
+    // ── Encode status (runtime-only, not serialized) ──────────────────────────
+    /// UUID of the currently running encode job, or None when idle.
+    /// Set by app.rs::begin_render before calling media_worker.start_encode.
+    #[serde(skip)]
+    pub encode_job:      Option<Uuid>,
+    /// (frames_done, total_frames) — updated each EncodeProgress result.
+    /// Used by ExportModule to render the progress bar.
+    #[serde(skip)]
+    pub encode_progress: Option<(u64, u64)>,
+    /// Set to the output PathBuf on EncodeDone. ExportModule shows a ✓ banner.
+    #[serde(skip)]
+    pub encode_done:     Option<PathBuf>,
+    /// Set to the error/cancel message on EncodeError. ExportModule shows a ✕ banner.
+    /// The string "cancelled" is the sentinel for a user-initiated cancel.
+    #[serde(skip)]
+    pub encode_error:    Option<String>,
 }
 
 fn default_volume() -> f32 { 1.0 }
@@ -104,6 +121,10 @@ impl Default for ProjectState {
             pending_audio_cleanup:  Vec::new(),
             pending_save_pick:      None,
             save_status:            None,
+            encode_job:             None,
+            encode_progress:        None,
+            encode_done:            None,
+            encode_error:           None,
         }
     }
 }

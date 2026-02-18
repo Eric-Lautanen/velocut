@@ -1,12 +1,12 @@
 // src/app.rs (velocut-ui)
 use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
-use velocut_media::MediaWorker;
+use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
 use crate::context::AppContext;
 use crate::theme::configure_style;
 use crate::modules::{
-    EditorModule,
+    EditorModule,  // must be in scope for .ui() calls on concrete module types
     timeline::TimelineModule,
     preview_module::PreviewModule,
     library::LibraryModule,
@@ -163,8 +163,19 @@ impl VeloCutApp {
 
             // ── Export ───────────────────────────────────────────────────────
             EditorCommand::RenderMP4 { filename, width, height, fps } => {
-                eprintln!("[export] Render requested: {filename} {width}x{height} @ {fps}fps");
-                // TODO: kick off ffmpeg render pipeline
+                self.begin_render(filename, width, height, fps);
+            }
+            EditorCommand::CancelEncode(job_id) => {
+                self.context.media_worker.cancel_encode(job_id);
+                // Do NOT clear encode state here — wait for the EncodeError result
+                // ("cancelled") to arrive over the channel so the UI transition is
+                // driven by the same path as a real error (avoids race conditions).
+            }
+            EditorCommand::ClearEncodeStatus => {
+                self.state.encode_job      = None;
+                self.state.encode_progress = None;
+                self.state.encode_done     = None;
+                self.state.encode_error    = None;
             }
 
             // ── View / UI ────────────────────────────────────────────────────
@@ -187,6 +198,67 @@ impl VeloCutApp {
                 }
             }
         }
+    }
+
+    /// Open an rfd save dialog, build the EncodeSpec from the current timeline,
+    /// and hand it to the media worker. Called from process_command for RenderMP4.
+    ///
+    /// This mirrors the pattern used by pending_save_pick / RequestSaveFramePicker:
+    /// blocking OS dialogs are fine here because process_command runs after the UI
+    /// pass, not inside an egui callback.
+    fn begin_render(&mut self, filename: String, width: u32, height: u32, fps: u32) {
+        // Abort silently if an encode is already running.
+        // ExportModule disables the button while is_encoding, but guard here too.
+        if self.state.encode_job.is_some() {
+            eprintln!("[export] ignoring RenderMP4: encode already in progress");
+            return;
+        }
+
+        let default_name = format!("{filename}.mp4");
+        let dest = match FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("MP4 Video", &["mp4"])
+            .save_file()
+        {
+            Some(p) => p,
+            None    => return, // user cancelled the dialog — no-op
+        };
+
+        // Resolve timeline clips to ClipSpec by joining with the library.
+        // Clips are sorted by start_time so the output timeline is correct even
+        // if the Vec is not stored in order.
+        let mut timeline = self.state.timeline.clone();
+        timeline.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+
+        let clip_specs: Vec<ClipSpec> = timeline
+            .iter()
+            .filter_map(|tc| {
+                self.state.library.iter()
+                    .find(|lc| lc.id == tc.media_id)
+                    .map(|lc| ClipSpec {
+                        path:          lc.path.clone(),
+                        source_offset: tc.source_offset,
+                        duration:      tc.duration,
+                    })
+            })
+            .collect();
+
+        if clip_specs.is_empty() {
+            eprintln!("[export] no resolvable clips — aborting render");
+            return;
+        }
+
+        let job_id = Uuid::new_v4();
+        let spec   = EncodeSpec { job_id, clips: clip_specs, width, height, fps, output: dest };
+
+        // Arm encode state before handing to the worker so ingest_media_results
+        // can route EncodeProgress into the right fields immediately.
+        self.state.encode_job      = Some(job_id);
+        self.state.encode_progress = Some((0, (self.state.total_duration() * fps as f64).ceil() as u64));
+        self.state.encode_done     = None;
+        self.state.encode_error    = None;
+
+        self.context.media_worker.start_encode(spec);
     }
 
     fn poll_media(&mut self, ctx: &egui::Context) {
@@ -241,7 +313,6 @@ impl VeloCutApp {
             }
         }
     }
-
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -337,6 +408,14 @@ impl eframe::App for VeloCutApp {
                 self.state.current_time = total - 0.001;
                 self.state.is_playing   = false;
             }
+            ctx.request_repaint();
+        }
+
+        // Keep repainting while an encode is running so the progress bar stays live.
+        if self.state.encode_job.is_some()
+            && self.state.encode_done.is_none()
+            && self.state.encode_error.is_none()
+        {
             ctx.request_repaint();
         }
     }

@@ -3,6 +3,7 @@
 // MediaWorker: owns the frame-request slot and playback decode thread.
 // All public API that velocut-ui calls lives here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
 use std::thread;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 use velocut_core::media_types::{MediaResult, PlaybackFrame};
 
 use crate::decode::{LiveDecoder, decode_frame};
+use crate::encode::{EncodeSpec, encode_timeline};
 use crate::probe::{probe_duration, probe_video_size_and_thumbnail};
 use crate::waveform::extract_waveform;
 use crate::audio::extract_audio;
@@ -44,6 +46,10 @@ pub struct MediaWorker {
     shutdown:  Arc<AtomicBool>,
     /// Limits concurrent probe threads: (active_count, Condvar). Max = PROBE_CONCURRENCY.
     probe_sem: Arc<(Mutex<u32>, Condvar)>,
+    /// Per-job cancel flags. Keyed by job_id so cancellation is targeted.
+    /// Entries are inserted by start_encode and removed by cancel_encode or on
+    /// the next start_encode call (old jobs are implicitly superseded).
+    encode_cancels: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
 }
 
 impl MediaWorker {
@@ -181,13 +187,19 @@ impl MediaWorker {
 
         Self {
             rx, tx, frame_req, pb_tx, pb_rx,
-            shutdown:  Arc::new(AtomicBool::new(false)),
-            probe_sem: Arc::new((Mutex::new(0), Condvar::new())),
+            shutdown:       Arc::new(AtomicBool::new(false)),
+            probe_sem:      Arc::new((Mutex::new(0), Condvar::new())),
+            encode_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // Cancel any active encode jobs.
+        let cancels = self.encode_cancels.lock().unwrap();
+        for flag in cancels.values() {
+            flag.store(true, Ordering::Relaxed);
+        }
         // Wake the scrub decode thread with a poison-pill so it exits cleanly
         // instead of blocking forever on the condvar.
         let (lock, cvar) = &*self.frame_req;
@@ -286,5 +298,47 @@ impl MediaWorker {
                 eprintln!("[media] extract_frame_hq: {e}");
             }
         });
+    }
+
+    /// Spawn a background thread to encode `spec` to disk.
+    ///
+    /// Only one encode job runs at a time from the UI's perspective (ExportModule
+    /// tracks `encode_job_id`), but the architecture supports multiple concurrent
+    /// jobs if needed in the future — each has its own cancel flag keyed by job_id.
+    pub fn start_encode(&self, spec: EncodeSpec) {
+        let job_id = spec.job_id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tx     = self.tx.clone();
+        let sd     = self.shutdown.clone();
+
+        // Register cancel flag before spawning — avoids a window where
+        // cancel_encode is called before the thread has inserted the flag.
+        self.encode_cancels.lock().unwrap().insert(job_id, Arc::clone(&cancel));
+
+        let cancels_ref = Arc::clone(&self.encode_cancels);
+        thread::spawn(move || {
+            if sd.load(Ordering::Relaxed) {
+                let _ = tx.send(MediaResult::EncodeError {
+                    job_id,
+                    msg: "worker shutting down".into(),
+                });
+                return;
+            }
+
+            encode_timeline(spec, cancel, tx);
+
+            // Remove cancel flag once the job is done (avoids unbounded growth
+            // of the HashMap if many short encodes are started over a session).
+            cancels_ref.lock().unwrap().remove(&job_id);
+        });
+    }
+
+    /// Signal the encode job identified by `job_id` to stop.
+    /// The thread will finish its current frame and then exit, sending
+    /// `EncodeError { msg: "cancelled" }` over the result channel.
+    pub fn cancel_encode(&self, job_id: Uuid) {
+        if let Some(flag) = self.encode_cancels.lock().unwrap().get(&job_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 }
