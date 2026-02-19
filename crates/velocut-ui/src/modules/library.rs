@@ -50,11 +50,17 @@ pub struct LibraryModule {
     /// All clips currently in the multi-selection set.
     /// Single-click replaces this with exactly one id (or clears it).
     pub multi_selection: HashSet<Uuid>,
+    /// Clip IDs whose cards fell within the scroll viewport last frame.
+    /// Populated during ui() via `ui.is_rect_visible(card_rect)` and
+    /// consumed by app.rs::poll_media the following frame to sort
+    /// pending_probes — visible clips are dispatched to the probe semaphore
+    /// first so their thumbnails appear before off-screen clips.
+    pub visible_ids: HashSet<Uuid>,
 }
 
 impl LibraryModule {
     pub fn new() -> Self {
-        Self { multi_selection: HashSet::new() }
+        Self { multi_selection: HashSet::new(), visible_ids: HashSet::new() }
     }
 
     /// True if `id` is considered "selected" in any mode.
@@ -85,6 +91,11 @@ impl EditorModule for LibraryModule {
         thumb_cache: &mut ThumbnailCache,
         cmd:         &mut Vec<EditorCommand>,
     ) {
+        // Refresh visible-card set each frame so poll_media has an up-to-date
+        // list for probe prioritisation. Must be cleared before the layout pass
+        // because paint_card re-inserts every card that is actually on-screen.
+        self.visible_ids.clear();
+
         let ctrl  = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
         let shift = ui.input(|i| i.modifiers.shift);
 
@@ -175,6 +186,12 @@ impl EditorModule for LibraryModule {
                                 }
 
                                 let card_resp = paint_card(ui, clip, is_selected, in_multi, is_dragging, thumb_cache);
+
+                                // Record whether this card is within the scroll
+                                // viewport so poll_media can probe it first.
+                                if ui.is_rect_visible(card_resp.rect) {
+                                    self.visible_ids.insert(id);
+                                }
 
                                 let interact = ui.interact(
                                     card_resp.rect,

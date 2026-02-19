@@ -329,7 +329,17 @@ impl VeloCutApp {
             cleanup_audio_temp(&path);
         }
 
-        let pending: Vec<_> = self.state.pending_probes.drain(..).collect();
+        let mut pending: Vec<_> = self.state.pending_probes.drain(..).collect();
+        // ── Visible-first probe ordering ──────────────────────────────────────
+        // Sort so clips whose cards are on-screen (last frame's visible set) are
+        // dispatched to probe_clip before off-screen ones. The gatekeeper threads
+        // race for the semaphore in spawn order, so earlier = higher priority.
+        // Uses the previous frame's visible_ids — always valid after the first
+        // render, which is when real batch imports happen.
+        {
+            let vis = &self.library.visible_ids;
+            pending.sort_by_key(|(id, _)| if vis.contains(id) { 0u8 } else { 1u8 });
+        }
         for (id, path) in pending {
             self.context.media_worker.probe_clip(id, path);
         }

@@ -28,6 +28,12 @@ pub struct LiveDecoder {
     pub out_w:          u32,
     pub out_h:          u32,
     pub scaler:         SwsContext,
+    /// Source decoder format + dimensions — used as the cache key when the scrub
+    /// thread tries to reuse a SwsContext across a LiveDecoder reset.  SwsContext
+    /// only needs to be re-created when these change (different camera/format).
+    pub decoder_fmt:    Pixel,
+    pub decoder_w:      u32,
+    pub decoder_h:      u32,
     /// If non-zero, next_frame() skips (decode-only, no scale/alloc) all frames
     /// whose PTS is below this threshold, then clears the field.
     /// Used to burn through the GOP after a keyframe-aligned seek without blocking
@@ -43,7 +49,20 @@ pub struct LiveDecoder {
 }
 
 impl LiveDecoder {
-    pub fn open(path: &PathBuf, timestamp: f64, aspect: f32) -> Result<Self> {
+    /// Open a decoder at `timestamp` seconds.
+    ///
+    /// `cached_scaler` — if the caller holds a `SwsContext` from a previous
+    /// `LiveDecoder` (same scrub thread, different clip), pass it here with
+    /// its source key `(fmt, w, h)`.  If the key matches the new clip's codec
+    /// parameters the context is reused and `SwsContext::get` is skipped,
+    /// saving the internal lookup-table initialisation that dominates
+    /// construction cost.
+    pub fn open(
+        path:          &PathBuf,
+        timestamp:     f64,
+        aspect:        f32,
+        cached_scaler: Option<(SwsContext, Pixel, u32, u32)>,
+    ) -> Result<Self> {
         let mut ictx = input(path)?;
         let video_idx = ictx.streams().best(Type::Video)
             .ok_or_else(|| anyhow::anyhow!("no video stream"))?.index();
@@ -75,10 +94,19 @@ impl LiveDecoder {
             (w, h)
         };
 
-        let scaler = SwsContext::get(
-            decoder.format(), decoder.width(), decoder.height(),
-            Pixel::RGBA, out_w, out_h, Flags::BILINEAR,
-        )?;
+        let dec_fmt = decoder.format();
+        let dec_w   = decoder.width();
+        let dec_h   = decoder.height();
+
+        // [Opt #1] Reuse cached SwsContext when source format/dimensions haven't
+        // changed — avoids re-running lookup-table initialisation on every
+        // backward scrub or cross-clip reset.  Out dimensions are fixed for the
+        // lifetime of a session (same `aspect` is always passed), so a matching
+        // source key is sufficient to guarantee safe reuse.
+        let scaler = match cached_scaler {
+            Some((sws, cf, cw, ch)) if cf == dec_fmt && cw == dec_w && ch == dec_h => sws,
+            _ => SwsContext::get(dec_fmt, dec_w, dec_h, Pixel::RGBA, out_w, out_h, Flags::BILINEAR)?,
+        };
 
         Ok(Self {
             path: path.clone(), ictx, decoder, video_idx,
@@ -88,6 +116,7 @@ impl LiveDecoder {
             // advance_to() fires correctly when called with target == seek_ts, since
             // the check is tpts > last_pts (strictly greater).
             last_pts: seek_ts.saturating_sub(1), tb_num, tb_den, out_w, out_h, scaler,
+            decoder_fmt: dec_fmt, decoder_w: dec_w, decoder_h: dec_h,
             skip_until_pts: 0,
             // [Opt 1] Pre-allocate frame buffer at the exact output size.
             frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),

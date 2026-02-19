@@ -9,7 +9,12 @@ use uuid::Uuid;
 
 use velocut_core::media_types::MediaResult;
 
-const WAVEFORM_COLS: usize = 1000;
+// At render time timeline.rs::draw_waveform() sub-samples peaks to the clip's
+// pixel width, so clips that are narrow on screen are unaffected by a higher
+// column count.  4 000 columns means a clip must be > 4 000 px wide before
+// the waveform starts looking blocky — effectively never at typical zoom levels.
+// Memory cost: 4 000 × 4 B = 16 KB per clip, negligible for typical library sizes.
+const WAVEFORM_COLS: usize = 4000;
 
 pub fn extract_waveform(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) {
     let result = std::process::Command::new("ffmpeg")

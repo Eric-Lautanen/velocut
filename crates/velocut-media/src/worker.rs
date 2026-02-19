@@ -115,7 +115,14 @@ impl MediaWorker {
                 }).unwrap_or(true);
 
                 if needs_reset {
-                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect) {
+                    // [Opt #1] Move the old decoder's SwsContext out before dropping it.
+                    // If the new clip has the same source format/dimensions the context
+                    // is reused instead of calling SwsContext::get (which re-runs
+                    // internal lookup-table init — measurable cost on the scrub path).
+                    let cached_sws = live.take().map(|d| {
+                        (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h)
+                    });
+                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws) {
                         Ok(mut d) => {
                             // Set skip_until_pts so next_frame() burns through the GOP
                             // (decode-only, no scale/alloc) and returns the frame at
@@ -157,7 +164,7 @@ impl MediaWorker {
                 if let Some((id, ref mut d)) = decoder {
                     match pb_cmd_rx.try_recv() {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
-                            match LiveDecoder::open(&path, ts, aspect) {
+                            match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut nd) => {
                                     // burn_to_pts runs synchronously (decode-only, no scale)
                                     // before we enter the send loop. The channel is empty at
@@ -192,7 +199,7 @@ impl MediaWorker {
                 } else {
                     match pb_cmd_rx.recv() {
                         Ok(PlaybackCmd::Start { id, path, ts, aspect }) => {
-                            match LiveDecoder::open(&path, ts, aspect) {
+                            match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut d) => {
                                     let tpts = d.ts_to_pts(ts);
                                     d.burn_to_pts(tpts);
