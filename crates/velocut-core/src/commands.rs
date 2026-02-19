@@ -43,6 +43,9 @@ pub enum EditorCommand {
     /// Clear encode_job / encode_progress / encode_done / encode_error in
     /// ProjectState. Emitted when the user dismisses a done/error banner.
     ClearEncodeStatus,
+    /// Set the crossfade duration (in seconds) applied between all adjacent clips.
+    /// 0.0 = hard cut (no transition). Stored in ProjectState and serialized.
+    SetCrossfadeDuration(f32),
 
     // ── View / UI ────────────────────────────────────────────────────────────
     SetAspectRatio(AspectRatio),

@@ -450,6 +450,37 @@ impl ExportModule {
 
         ui.add_space(10.0);
 
+        // ── Transitions ───────────────────────────────────────────────────────
+        // A single duration slider controls the crossfade between all adjacent
+        // clips. 0.0 = hard cut (no overhead). The value is stored in
+        // ProjectState so it survives project reloads.
+        ui.label(RichText::new("Transitions").size(11.0).color(DARK_TEXT_DIM));
+        ui.add_space(2.0);
+        ui.add_enabled_ui(!is_encoding, |ui| {
+            let mut d = state.crossfade_duration_secs;
+            let mode_label = if d == 0.0 { "Cut" } else { "Crossfade" };
+            let slider = egui::Slider::new(&mut d, 0.0f32..=2.0)
+                .step_by(0.05)
+                .suffix("s")
+                .text(mode_label);
+            if ui.add(slider).changed() {
+                cmd.push(EditorCommand::SetCrossfadeDuration(d));
+            }
+            if d > 0.0 {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{:.2}s dissolve between each clip",
+                        d
+                    ))
+                    .size(10.0)
+                    .color(DARK_TEXT_DIM),
+                );
+            }
+        });
+
+        ui.add_space(10.0);
+
         // ── Stats ─────────────────────────────────────────────────────────────
         egui::Frame::new()
             .fill(DARK_BG_3)

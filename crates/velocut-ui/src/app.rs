@@ -3,6 +3,7 @@ use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
+use velocut_core::transitions::{ClipTransition, TransitionType};
 use crate::context::AppContext;
 use crate::theme::configure_style;
 use crate::modules::{
@@ -100,8 +101,8 @@ impl VeloCutApp {
             EditorCommand::SetPlayhead(t) => {
                 self.state.current_time = t;
                 self.context.audio_sinks.clear();
-                self.context.audio_was_playing = false;
-                self.context.pending_pb_frame = None;
+                self.context.playback.audio_was_playing = false;
+                self.context.cache.pending_pb_frame = None;
             }
             EditorCommand::SetVolume(v) => {
                 self.state.volume = v;
@@ -178,6 +179,9 @@ impl VeloCutApp {
                 self.state.encode_done     = None;
                 self.state.encode_error    = None;
             }
+            EditorCommand::SetCrossfadeDuration(secs) => {
+                self.state.crossfade_duration_secs = secs.max(0.0);
+            }
 
             // ── View / UI ────────────────────────────────────────────────────
             EditorCommand::SetAspectRatio(ar) => {
@@ -250,7 +254,29 @@ impl VeloCutApp {
         }
 
         let job_id = Uuid::new_v4();
-        let spec   = EncodeSpec { job_id, clips: clip_specs, width, height, fps, output: dest };
+        let spec   = EncodeSpec {
+            job_id,
+            clips: clip_specs.clone(),
+            width,
+            height,
+            fps,
+            output: dest,
+            // Fan out the project-level crossfade setting into per-boundary transitions.
+            // A crossfade of 0.0 produces an empty vec, which the encoder treats as
+            // all cuts — identical behaviour to before the transitions feature existed.
+            transitions: if self.state.crossfade_duration_secs > 0.0 {
+                (0..clip_specs.len().saturating_sub(1))
+                    .map(|i| ClipTransition {
+                        after_clip_index: i,
+                        kind: TransitionType::Crossfade {
+                            duration_secs: self.state.crossfade_duration_secs,
+                        },
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        };
 
         // Arm encode state before handing to the worker so ingest_media_results
         // can route EncodeProgress into the right fields immediately.
@@ -361,7 +387,7 @@ impl eframe::App for VeloCutApp {
             .min_height(160.0)
             .default_height(220.0)
             .show(ctx, |ui| {
-                self.timeline.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
+                self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
         egui::SidePanel::left("library_panel")
@@ -369,7 +395,7 @@ impl eframe::App for VeloCutApp {
             .default_width(220.0)
             .min_width(160.0)
             .show(ctx, |ui| {
-                self.library.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
+                self.library.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
         egui::SidePanel::right("inspector_panel")
@@ -377,7 +403,7 @@ impl eframe::App for VeloCutApp {
             .default_width(220.0)
             .min_width(160.0)
             .show(ctx, |ui| {
-                self.export.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
+                self.export.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -386,9 +412,9 @@ impl eframe::App for VeloCutApp {
             // pure thumbnails and PreviewModule owns its frame reference.
             let active_id = VideoModule::active_media_id(&self.state);
             self.preview.current_frame = active_id
-                .and_then(|id| self.context.frame_cache.get(&id).cloned());
+                .and_then(|id| self.context.cache.frame_cache.get(&id).cloned());
 
-            self.preview.ui(ui, &self.state, &mut self.context.thumbnail_cache, &mut self.pending_cmds);
+            self.preview.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
         });
 
         // ── Process commands emitted by modules this frame ────────────────────

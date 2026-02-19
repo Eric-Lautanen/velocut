@@ -62,19 +62,19 @@ impl VideoModule {
         // from poll_media() before update() — closes the window entirely.
         //
         // We detect the transition by comparing current_media_id to
-        // ctx.playback_media_id (the id that was active last tick).  We only read
+        // ctx.playback.playback_media_id (the id that was active last tick).  We only read
         // playback_media_id here; tick() remains responsible for writing it.
         if state.is_playing {
-            let clip_changed = match (current_media_id, ctx.playback_media_id) {
+            let clip_changed = match (current_media_id, ctx.playback.playback_media_id) {
                 (Some(cur), Some(prev)) => cur != prev,
                 (Some(_), None)         => true,  // playback just started
                 _                       => false,
             };
             if clip_changed {
                 if let Some(id) = current_media_id {
-                    ctx.frame_cache.remove(&id);
+                    ctx.cache.frame_cache.remove(&id);
                 }
-                ctx.pending_pb_frame = None;
+                ctx.cache.pending_pb_frame = None;
             }
         }
 
@@ -93,18 +93,18 @@ impl VideoModule {
         //    is T + burn_time. If burn_time > lower_bound the frame is rejected
         //    but never discarded — permanent freeze. The too_old guard here
         //    discards it immediately so the slot opens for the next frame.
-        if let Some(pending) = &ctx.pending_pb_frame {
+        if let Some(pending) = &ctx.cache.pending_pb_frame {
             let wrong_clip = current_media_id.map(|id| id != pending.id).unwrap_or(true);
             let too_old    = pb_local_t.map(|lt| pending.timestamp < lt - 3.0).unwrap_or(false);
             if wrong_clip || too_old {
-                ctx.pending_pb_frame = None;
+                ctx.cache.pending_pb_frame = None;
             }
         }
 
         // Step 1: fill pending slot if empty.
-        if ctx.pending_pb_frame.is_none() {
+        if ctx.cache.pending_pb_frame.is_none() {
             if let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
-                ctx.pending_pb_frame = Some(f);
+                ctx.cache.pending_pb_frame = Some(f);
             }
         }
 
@@ -112,13 +112,13 @@ impl VideoModule {
         // With the 32-frame channel and burn_to_pts completing before first send,
         // this drains the early keyframe frames in a single tick after seek.
         if let Some(local_t) = pb_local_t {
-            while ctx.pending_pb_frame
+            while ctx.cache.pending_pb_frame
                 .as_ref()
                 .map(|f: &PlaybackFrame| f.timestamp < local_t - (1.0 / 30.0))
                 .unwrap_or(false)
             {
                 match ctx.media_worker.pb_rx.try_recv() {
-                    Ok(newer) => { ctx.pending_pb_frame = Some(newer); }
+                    Ok(newer) => { ctx.cache.pending_pb_frame = Some(newer); }
                     Err(_)    => break,
                 }
             }
@@ -131,7 +131,7 @@ impl VideoModule {
         // At 60 fps H.264 with a 5 s GOP, burn is ~300 frames × ~2 ms = ~600 ms.
         // 3 s is ample headroom. Genuine staleness (different clip, scrub bleed)
         // is caught by the wrong_clip / too_old guards above.
-        let frame_due = ctx.pending_pb_frame.as_ref().map(|f: &PlaybackFrame| {
+        let frame_due = ctx.cache.pending_pb_frame.as_ref().map(|f: &PlaybackFrame| {
             pb_local_t.map(|lt| {
                 f.timestamp <= lt + (1.0 / 60.0)
                     && f.timestamp >= lt - 3.0
@@ -139,7 +139,7 @@ impl VideoModule {
         }).unwrap_or(false);
 
         if frame_due {
-            if let Some(f) = ctx.pending_pb_frame.take() {
+            if let Some(f) = ctx.cache.pending_pb_frame.take() {
                 let tex = egui_ctx.load_texture(
                     format!("pb-{}", f.id),
                     egui::ColorImage::from_rgba_unmultiplied(
@@ -147,11 +147,11 @@ impl VideoModule {
                     ),
                     egui::TextureOptions::LINEAR,
                 );
-                ctx.frame_cache.insert(f.id, tex);
+                ctx.cache.frame_cache.insert(f.id, tex);
                 egui_ctx.request_repaint();
                 // Pre-pull next frame so it's ready for the next tick.
                 if let Ok(next) = ctx.media_worker.pb_rx.try_recv() {
-                    ctx.pending_pb_frame = Some(next);
+                    ctx.cache.pending_pb_frame = Some(next);
                 }
             }
         }
@@ -160,9 +160,9 @@ impl VideoModule {
     // ── tick ──────────────────────────────────────────────────────────────────
     /// 3-layer scrub + playback start/stop. Call every frame from app::update().
     pub fn tick(state: &ProjectState, ctx: &mut AppContext) {
-        let just_started = state.is_playing && !ctx.prev_playing;
-        let just_stopped = !state.is_playing && ctx.prev_playing;
-        ctx.prev_playing = state.is_playing;
+        let just_started = state.is_playing && !ctx.playback.prev_playing;
+        let just_stopped = !state.is_playing && ctx.playback.prev_playing;
+        ctx.playback.prev_playing = state.is_playing;
 
         let current_clip = state.timeline.iter().find(|c| {
             state.current_time >= c.start_time
@@ -172,12 +172,12 @@ impl VideoModule {
         // ── Playback mode ─────────────────────────────────────────────────────
         if state.is_playing {
             if let Some(clip) = &current_clip {
-                let clip_changed = Some(clip.media_id) != ctx.playback_media_id;
+                let clip_changed = Some(clip.media_id) != ctx.playback.playback_media_id;
                 if just_started || clip_changed {
-                    ctx.playback_media_id = Some(clip.media_id);
+                    ctx.playback.playback_media_id = Some(clip.media_id);
                     // Drop stale scrub frame so preview doesn't freeze on wrong pos.
-                    ctx.frame_cache.remove(&clip.media_id);
-                    ctx.pending_pb_frame = None;
+                    ctx.cache.frame_cache.remove(&clip.media_id);
+                    ctx.cache.pending_pb_frame = None;
                     if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
                         let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         let aspect   = state.active_video_ratio();
@@ -191,17 +191,17 @@ impl VideoModule {
         // ── Transition: playing → stopped ─────────────────────────────────────
         if just_stopped {
             ctx.media_worker.stop_playback();
-            ctx.playback_media_id = None;
-            ctx.last_frame_req    = None;
-            ctx.scrub_last_moved  = None;
-            ctx.scrub_coarse_req  = None;
-            ctx.pending_pb_frame  = None;
+            ctx.playback.playback_media_id = None;
+            ctx.playback.last_frame_req    = None;
+            ctx.playback.scrub_last_moved  = None;
+            ctx.playback.scrub_coarse_req  = None;
+            ctx.cache.pending_pb_frame  = None;
         }
 
         let Some(clip) = current_clip else {
-            ctx.last_frame_req   = None;
-            ctx.scrub_last_moved = None;
-            ctx.scrub_coarse_req = None;
+            ctx.playback.last_frame_req   = None;
+            ctx.playback.scrub_last_moved = None;
+            ctx.playback.scrub_coarse_req = None;
             return;
         };
 
@@ -213,28 +213,28 @@ impl VideoModule {
         // scrub_moved: any position change > ~10ms fires a new decode request.
         // Compare exact f64 ts so every ruler pixel triggers a request, not just
         // every ¼s bucket crossing. The latest-wins condvar slot is the rate limiter.
-        let scrub_moved = ctx.last_frame_req
+        let scrub_moved = ctx.playback.last_frame_req
             .map(|(rid, last_ts)| rid != clip.media_id || (last_ts - local_t).abs() > 0.010)
             .unwrap_or(true);
 
         if scrub_moved {
-            ctx.scrub_last_moved = Some(std::time::Instant::now());
+            ctx.playback.scrub_last_moved = Some(std::time::Instant::now());
 
-            if let Some((prev_id, _)) = ctx.last_frame_req {
+            if let Some((prev_id, _)) = ctx.playback.last_frame_req {
                 if prev_id != clip.media_id {
-                    ctx.frame_cache.remove(&prev_id);
-                    ctx.scrub_coarse_req = None;
+                    ctx.cache.frame_cache.remove(&prev_id);
+                    ctx.playback.scrub_coarse_req = None;
                 }
             }
-            ctx.last_frame_req = Some((clip.media_id, local_t));
+            ctx.playback.last_frame_req = Some((clip.media_id, local_t));
 
             // Layer 1 (0ms): show nearest cached frame immediately.
             let found_nearby = (0..=8u32).find_map(|delta| {
                 let b = fine_bucket.saturating_sub(delta);
-                ctx.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
+                ctx.cache.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
             });
             if let Some(cached) = found_nearby {
-                ctx.frame_cache.insert(clip.media_id, cached);
+                ctx.cache.frame_cache.insert(clip.media_id, cached);
             }
 
             // Layer 2 (every scrub move): fire exact-timestamp decode request.
@@ -245,8 +245,8 @@ impl VideoModule {
 
             // Layer 2b (per 2s): coarse warm-up prefetch ahead of scrub head.
             let coarse_key = (clip.media_id, coarse_bucket);
-            if ctx.scrub_coarse_req != Some(coarse_key) {
-                ctx.scrub_coarse_req = Some(coarse_key);
+            if ctx.playback.scrub_coarse_req != Some(coarse_key) {
+                ctx.playback.scrub_coarse_req = Some(coarse_key);
                 if let Some(lib) = state.library.iter().find(|m| m.id == clip.media_id) {
                     let aspect = state.active_video_ratio();
                     ctx.media_worker.request_frame(lib.id, lib.path.clone(), coarse_bucket as f64 * 2.0, aspect);
@@ -254,12 +254,12 @@ impl VideoModule {
             }
         } else {
             // Layer 3 (150ms idle): precise frame after scrub stops moving.
-            if ctx.frame_cache.contains_key(&clip.media_id) {
-                let idle = ctx.scrub_last_moved
+            if ctx.cache.frame_cache.contains_key(&clip.media_id) {
+                let idle = ctx.playback.scrub_last_moved
                     .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
                     .unwrap_or(false);
                 if !idle { return; }
-                if ctx.frame_bucket_cache.contains_key(&fine_key) { return; }
+                if ctx.cache.frame_bucket_cache.contains_key(&fine_key) { return; }
                 if let Some(lib) = state.library.iter().find(|m| m.id == clip.media_id) {
                     let aspect = state.active_video_ratio();
                     ctx.media_worker.request_frame(lib.id, lib.path.clone(), fine_bucket as f64 / 4.0, aspect);

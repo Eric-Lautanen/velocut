@@ -60,6 +60,7 @@ use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
 
 use velocut_core::media_types::MediaResult;
+use velocut_core::transitions::{ClipTransition, TransitionType};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -86,6 +87,10 @@ pub struct EncodeSpec {
     pub fps:     u32,
     /// Destination file, including extension (`.mp4`).
     pub output:  PathBuf,
+    /// Transitions between adjacent clips.
+    /// Index N means "between clips[N] and clips[N+1]".
+    /// Missing entries default to Cut (hard splice, zero overhead).
+    pub transitions: Vec<ClipTransition>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -388,14 +393,45 @@ fn run_encode(
 
     // ── Per-clip encode loop ──────────────────────────────────────────────────
     let mut output_frame_idx: i64 = 0;
+    // How many seconds to skip at the START of the next clip (set when an
+    // outgoing crossfade blends the incoming clip's head, so encode_clip
+    // doesn't re-encode those frames).
+    let mut incoming_skip_secs: f64 = 0.0;
 
-    for clip in &spec.clips {
+    for (clip_idx, clip) in spec.clips.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
 
+        // Snapshot the incoming skip for this clip, then reset for the next one.
+        let skip = incoming_skip_secs;
+        incoming_skip_secs = 0.0;
+
+        // Check for an outgoing crossfade after this clip.
+        let crossfade_secs: f64 = if clip_idx + 1 < spec.clips.len() {
+            spec.transitions.iter()
+                .find(|t| t.after_clip_index == clip_idx)
+                .and_then(|t| match &t.kind {
+                    TransitionType::Crossfade { duration_secs } => Some(*duration_secs as f64),
+                    TransitionType::Cut => None,
+                })
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        // Build the effective ClipSpec for this clip:
+        //   - skip: skip the head that was already blended by the incoming crossfade
+        //   - crossfade_secs: stop that many seconds early so apply_crossfade can
+        //     blend the tail with the next clip's head
+        let effective = ClipSpec {
+            path:          clip.path.clone(),
+            source_offset: clip.source_offset + skip,
+            duration:      (clip.duration - skip - crossfade_secs).max(0.0),
+        };
+
         output_frame_idx = encode_clip(
-            clip,
+            &effective,
             spec,
             &mut octx,
             &mut video_encoder,
@@ -406,6 +442,41 @@ fn run_encode(
             &cancel,
             tx,
         )?;
+
+        // ── Transition hook ───────────────────────────────────────────────────
+        if crossfade_secs > 0.0 {
+            let next_clip = &spec.clips[clip_idx + 1];
+
+            // Tail: last `crossfade_secs` of the current clip (just after encode_clip stopped).
+            let tail_spec = ClipSpec {
+                path:          clip.path.clone(),
+                source_offset: effective.source_offset + effective.duration,
+                duration:      crossfade_secs,
+            };
+            // Head: first `crossfade_secs` of the next clip.
+            let head_spec = ClipSpec {
+                path:          next_clip.path.clone(),
+                source_offset: next_clip.source_offset,
+                duration:      crossfade_secs,
+            };
+
+            output_frame_idx = apply_crossfade(
+                &tail_spec,
+                &head_spec,
+                spec,
+                &mut octx,
+                &mut video_encoder,
+                &mut audio_state,
+                output_frame_idx,
+                total_frames,
+                frame_tb,
+                &cancel,
+                tx,
+            )?;
+
+            // Tell the next iteration to skip the head it already blended.
+            incoming_skip_secs = crossfade_secs;
+        }
 
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -731,6 +802,278 @@ fn encode_clip(
             }
         }
         audio_state.drain_fifo(octx, false)?;
+    }
+
+    Ok(out_frame_idx)
+}
+// ── Crossfade helpers ─────────────────────────────────────────────────────────
+
+/// Decode all video frames from `clip` into packed YUV420P byte vectors.
+///
+/// Each entry in the returned Vec is one frame's worth of YUV420P data laid out
+/// as: [Y plane (w×h)] ++ [U plane (w/2 × h/2)] ++ [V plane (w/2 × h/2)].
+/// Strides are removed — each row is packed tightly to exactly `w` (or `w/2`) bytes.
+///
+/// Used by apply_crossfade to collect the tail frames of clip A and head frames
+/// of clip B before blending them.
+fn decode_clip_frames(
+    clip: &ClipSpec,
+    spec: &EncodeSpec,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut ictx = open_input(&clip.path)
+        .map_err(|e| format!("crossfade open '{}': {e}", clip.path.display()))?;
+
+    let video_stream_idx = ictx.streams().best(MediaType::Video)
+        .ok_or_else(|| format!("no video stream in '{}' for crossfade", clip.path.display()))?
+        .index();
+
+    let in_video_tb = ictx.stream(video_stream_idx).unwrap().time_base();
+
+    let (src_display_w, src_display_h) = {
+        let stream = ictx.stream(video_stream_idx).unwrap();
+        let params = stream.parameters();
+        let w = params.width() as u32;
+        let h = params.height() as u32;
+        (w, h)
+    };
+
+    let vdec_ctx = codec::context::Context::from_parameters(
+        ictx.stream(video_stream_idx).unwrap().parameters(),
+    ).map_err(|e| format!("crossfade video decoder context: {e}"))?;
+
+    let mut video_decoder = vdec_ctx.decoder().video()
+        .map_err(|e| format!("crossfade open video decoder: {e}"))?;
+
+    if clip.source_offset > 0.0 {
+        let seek_ts = (clip.source_offset * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
+        // Seek failure is treated as a soft error on Windows (EPERM from avformat).
+        // The frame-level PTS check below (`pts_secs < clip.source_offset`) will
+        // skip pre-roll frames correctly even without the seek — just slightly slower.
+        if let Err(e) = ictx.seek(seek_ts, seek_ts..) {
+            eprintln!("[crossfade] seek soft-fail in '{}': {e} — decoding from start", clip.path.display());
+        }
+    }
+
+    let mut video_scaler: Option<ScaleCtx> = None;
+    let clip_end   = clip.source_offset + clip.duration;
+    let half_frame = 0.5 / spec.fps as f64;
+    let w = spec.width  as usize;
+    let h = spec.height as usize;
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+
+    /// Extract packed YUV420P bytes from a scaled VideoFrame, removing strides.
+    fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usize) -> Vec<u8> {
+        let mut raw = vec![0u8; w * h + uv_w * uv_h * 2];
+
+        let y_stride = yuv.stride(0);
+        let y_src = yuv.data(0);
+        for row in 0..h {
+            raw[row * w .. row * w + w]
+                .copy_from_slice(&y_src[row * y_stride .. row * y_stride + w]);
+        }
+
+        let u_offset = w * h;
+        let u_stride = yuv.stride(1);
+        let u_src = yuv.data(1);
+        for row in 0..uv_h {
+            let dst = u_offset + row * uv_w;
+            raw[dst .. dst + uv_w]
+                .copy_from_slice(&u_src[row * u_stride .. row * u_stride + uv_w]);
+        }
+
+        let v_offset = u_offset + uv_w * uv_h;
+        let v_stride = yuv.stride(2);
+        let v_src = yuv.data(2);
+        for row in 0..uv_h {
+            let dst = v_offset + row * uv_w;
+            raw[dst .. dst + uv_w]
+                .copy_from_slice(&v_src[row * v_stride .. row * v_stride + uv_w]);
+        }
+
+        raw
+    }
+
+    'packet_loop: for result in ictx.packets() {
+        let (stream, packet) = result
+            .map_err(|e| format!("crossfade read packet: {e}"))?;
+
+        if stream.index() != video_stream_idx { continue; }
+
+        video_decoder.send_packet(&packet)
+            .map_err(|e| format!("crossfade send packet: {e}"))?;
+
+        let mut decoded = VideoFrame::empty();
+        while video_decoder.receive_frame(&mut decoded).is_ok() {
+            let pts_secs = decoded.pts()
+                .map(|pts| pts as f64 * f64::from(in_video_tb))
+                .unwrap_or(0.0);
+
+            if pts_secs < clip.source_offset - half_frame { continue; }
+            if pts_secs >= clip_end { break 'packet_loop; }
+
+            let sc = video_scaler.get_or_insert_with(|| {
+                ScaleCtx::get(
+                    decoded.format(), src_display_w, src_display_h,
+                    Pixel::YUV420P, spec.width, spec.height,
+                    ScaleFlags::BILINEAR,
+                ).expect("crossfade scaler")
+            });
+
+            let mut yuv = VideoFrame::empty();
+            sc.run(&decoded, &mut yuv)
+                .map_err(|e| format!("crossfade scale: {e}"))?;
+
+            frames.push(extract_yuv(&yuv, w, h, uv_w, uv_h));
+        }
+    }
+
+    // Flush decoder tail
+    let _ = video_decoder.send_eof();
+    let mut decoded = VideoFrame::empty();
+    while video_decoder.receive_frame(&mut decoded).is_ok() {
+        let pts_secs = decoded.pts()
+            .map(|pts| pts as f64 * f64::from(in_video_tb))
+            .unwrap_or(0.0);
+        if pts_secs >= clip_end { break; }
+
+        if let Some(sc) = &mut video_scaler {
+            let mut yuv = VideoFrame::empty();
+            if sc.run(&decoded, &mut yuv).is_ok() {
+                frames.push(extract_yuv(&yuv, w, h, uv_w, uv_h));
+            }
+        }
+    }
+
+    Ok(frames)
+}
+
+/// Linear blend of two packed YUV420P frames.
+///
+/// `alpha` = 0.0 → 100% frame_a;  `alpha` = 1.0 → 100% frame_b.
+/// The blend is performed on raw byte values which is a linear approximation
+/// in gamma-encoded space — visually correct for typical crossfades.
+fn blend_yuv_frame(frame_a: &[u8], frame_b: &[u8], alpha: f32) -> Vec<u8> {
+    let inv = 1.0 - alpha;
+    frame_a.iter().zip(frame_b.iter())
+        .map(|(&a, &b)| (inv * a as f32 + alpha * b as f32).round() as u8)
+        .collect()
+}
+
+/// Encode the crossfade blend between `tail_spec` (end of clip A) and
+/// `head_spec` (start of clip B).
+///
+/// Steps:
+///   1. Decode all frames from both specs into packed YUV420P.
+///   2. For each frame pair blend with alpha going from 0 (exclusive) → 1 (exclusive).
+///   3. Encode each blended frame into octx, advancing `out_frame_idx`.
+///   4. Drain the audio FIFO after each video frame (audio carries over naturally
+///      from clip A's tail that was pushed during encode_clip).
+///
+/// Returns the next unused `out_frame_idx`.
+fn apply_crossfade(
+    tail_spec:     &ClipSpec,
+    head_spec:     &ClipSpec,
+    spec:          &EncodeSpec,
+    octx:          &mut ffmpeg::format::context::Output,
+    video_encoder: &mut ffmpeg::encoder::video::Video,
+    audio_state:   &mut AudioEncState,
+    mut out_frame_idx: i64,
+    total_frames:  u64,
+    frame_tb:      Rational,
+    cancel:        &Arc<AtomicBool>,
+    tx:            &Sender<MediaResult>,
+) -> Result<i64, String> {
+    let tail_frames = decode_clip_frames(tail_spec, spec)?;
+    let head_frames = decode_clip_frames(head_spec, spec)?;
+
+    let n = tail_frames.len().min(head_frames.len());
+    if n == 0 {
+        return Ok(out_frame_idx);
+    }
+
+    let w = spec.width  as usize;
+    let h = spec.height as usize;
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let ost_tb = octx.stream(0).unwrap().time_base();
+
+    for i in 0..n {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        // alpha goes from just above 0 to just below 1 — no pure A or pure B frame
+        // (those are handled by encode_clip on each side).
+        let alpha = (i + 1) as f32 / (n + 1) as f32;
+        let blended = blend_yuv_frame(&tail_frames[i], &head_frames[i], alpha);
+
+        // Build a VideoFrame from the packed blended data.
+        let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
+        yuv.set_pts(Some(out_frame_idx));
+        unsafe {
+            (*yuv.as_mut_ptr()).sample_aspect_ratio =
+                ffmpeg::ffi::AVRational { num: 1, den: 1 };
+        }
+
+        // Copy Y plane (de-strided).
+        {
+            let y_stride = yuv.stride(0);
+            let y_dst = yuv.data_mut(0);
+            for row in 0..h {
+                let src = row * w;
+                let dst = row * y_stride;
+                y_dst[dst .. dst + w].copy_from_slice(&blended[src .. src + w]);
+            }
+        }
+        // Copy U plane.
+        {
+            let u_stride = yuv.stride(1);
+            let u_offset = w * h;
+            let u_dst = yuv.data_mut(1);
+            for row in 0..uv_h {
+                let src = u_offset + row * uv_w;
+                let dst = row * u_stride;
+                u_dst[dst .. dst + uv_w].copy_from_slice(&blended[src .. src + uv_w]);
+            }
+        }
+        // Copy V plane.
+        {
+            let v_stride = yuv.stride(2);
+            let v_offset = w * h + uv_w * uv_h;
+            let v_dst = yuv.data_mut(2);
+            for row in 0..uv_h {
+                let src = v_offset + row * uv_w;
+                let dst = row * v_stride;
+                v_dst[dst .. dst + uv_w].copy_from_slice(&blended[src .. src + uv_w]);
+            }
+        }
+
+        video_encoder.send_frame(&yuv)
+            .map_err(|e| format!("crossfade encode frame: {e}"))?;
+
+        let mut pkt = Packet::empty();
+        while video_encoder.receive_packet(&mut pkt).is_ok() {
+            pkt.set_stream(0);
+            pkt.rescale_ts(frame_tb, ost_tb);
+            pkt.write_interleaved(octx)
+                .map_err(|e| format!("crossfade write packet: {e}"))?;
+        }
+
+        // Drain whatever audio the FIFO has from clip A's tail.
+        audio_state.drain_fifo(octx, false)?;
+
+        out_frame_idx += 1;
+
+        if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+            let _ = tx.send(MediaResult::EncodeProgress {
+                job_id:       spec.job_id,
+                frame:        out_frame_idx as u64,
+                total_frames,
+            });
+        }
     }
 
     Ok(out_frame_idx)

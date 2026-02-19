@@ -3,6 +3,14 @@
 // AppContext owns all runtime handles that are NOT part of the serializable
 // project state.  VeloCutApp holds one of these plus a ProjectState and the
 // module list — nothing else.
+//
+// Sub-struct layout:
+//   AppContext
+//     ├── media_worker        — the FFmpeg worker + all channel handles
+//     ├── cache: CacheContext — all GPU texture caches with a memory ceiling
+//     ├── playback: PlaybackContext — scrub/playback decode tracking
+//     ├── audio_stream        — rodio OutputStream (must outlive all sinks)
+//     └── audio_sinks         — per-clip Sink map (managed by audio_module only)
 
 use velocut_media::{MediaWorker, MediaResult};
 use velocut_core::media_types::PlaybackFrame;
@@ -13,38 +21,140 @@ use rodio::{OutputStream, Sink};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+// ── Memory ceiling ────────────────────────────────────────────────────────────
+// Approximate byte budget for GPU-resident frame textures.
+// At 640×360 RGBA each frame is ~900 KB; 128 frames ≈ 115 MB.
+// This constant is checked on every frame_bucket_cache insert.
+// Change it here to tune the scrub cache size without touching eviction logic.
+const MAX_FRAME_CACHE_BYTES: usize = 192 * 1024 * 1024; // 192 MB
+
+// ── CacheContext ──────────────────────────────────────────────────────────────
+// Owns all GPU-resident texture caches and the memory ceiling that governs them.
+// Nothing outside AppContext should own or evict textures — route all cache
+// writes through CacheContext methods so the budget stays accurate.
+pub struct CacheContext {
+    /// GPU-resident clip thumbnails (library card images).
+    /// Never evicted today — see Optimization Opportunities §thumbnail eviction.
+    pub thumbnail_cache: ThumbnailCache,
+
+    /// Latest live-playback or scrub frame per media_id.
+    /// Written by ingest_media_results (scrub) and poll_playback (playback).
+    pub frame_cache: HashMap<Uuid, egui::TextureHandle>,
+
+    /// Next-to-display playback frame, held until its PTS is due.
+    /// Prevents the drain-all pattern from racing ahead of wall-clock time.
+    pub pending_pb_frame: Option<PlaybackFrame>,
+
+    /// Decoded frames keyed by (media_id, fine_bucket) — the scrub look-ahead store.
+    /// Eviction: when byte estimate exceeds MAX_FRAME_CACHE_BYTES, evict the 32
+    /// entries furthest from the current playhead (not random, not LRU).
+    pub frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
+
+    /// Approximate bytes currently held in frame_bucket_cache.
+    /// Updated on insert and eviction.  Treated as an estimate (we don't track
+    /// exact compressed GPU size) — uses raw RGBA bytes as a conservative ceiling.
+    frame_cache_bytes: usize,
+}
+
+impl CacheContext {
+    fn new() -> Self {
+        Self {
+            thumbnail_cache:    HashMap::new(),
+            frame_cache:        HashMap::new(),
+            pending_pb_frame:   None,
+            frame_bucket_cache: HashMap::new(),
+            frame_cache_bytes:  0,
+        }
+    }
+
+    /// Insert a decoded frame into the bucket cache, evicting if over budget.
+    /// `width` and `height` are the frame dimensions (for byte accounting).
+    /// Returns a clone of the inserted TextureHandle for the caller's use.
+    pub fn insert_bucket_frame(
+        &mut self,
+        key: (Uuid, u32),
+        tex: egui::TextureHandle,
+        width: usize,
+        height: usize,
+        current_time: f64,
+    ) -> egui::TextureHandle {
+        let frame_bytes = width * height * 4;
+
+        // Evict if this insert would exceed the budget.
+        if self.frame_cache_bytes + frame_bytes > MAX_FRAME_CACHE_BYTES {
+            let current_bucket = (current_time * 4.0) as u32;
+            let mut keys: Vec<_> = self.frame_bucket_cache.keys().copied().collect();
+            // Sort furthest-first so we truncate the tail.
+            keys.sort_by_key(|(_, b)| std::cmp::Reverse(b.abs_diff(current_bucket)));
+            keys.truncate(32);
+            for k in &keys {
+                // Subtract evicted bytes. Approximate: assume all frames same size.
+                self.frame_cache_bytes =
+                    self.frame_cache_bytes.saturating_sub(frame_bytes);
+                self.frame_bucket_cache.remove(k);
+            }
+        }
+
+        self.frame_bucket_cache.insert(key, tex.clone());
+        self.frame_cache_bytes += frame_bytes;
+        tex
+    }
+}
+
+// ── PlaybackContext ───────────────────────────────────────────────────────────
+// Owns all decode-tracking state for the 3-layer scrub system and the
+// playback pipeline.  Isolated here so video_module.rs has a clear home for
+// the state it mutates, and it never accidentally touches cache or audio.
+pub struct PlaybackContext {
+    /// Exact (media_id, timestamp_secs) of the last scrub decode request.
+    /// Stored as exact f64 (not a ¼s bucket) so scrub fires on every drag pixel.
+    pub last_frame_req: Option<(Uuid, f64)>,
+
+    /// Coarse-bucket key (media_id, 2 s bucket) of the last background prefetch.
+    pub scrub_coarse_req: Option<(Uuid, u32)>,
+
+    /// Wall-clock instant the scrub head last moved (for 150 ms L3 debounce).
+    pub scrub_last_moved: Option<std::time::Instant>,
+
+    /// Which clip the live-playback thread is currently decoding.
+    pub playback_media_id: Option<Uuid>,
+
+    /// Was is_playing true on the previous frame?  Used to detect play/stop edges.
+    pub prev_playing: bool,
+
+    /// Was audio running before the last scrub or seek?
+    /// Lets audio_module restart the sink after a scrub without double-starting.
+    pub audio_was_playing: bool,
+}
+
+impl PlaybackContext {
+    fn new() -> Self {
+        Self {
+            last_frame_req:    None,
+            scrub_coarse_req:  None,
+            scrub_last_moved:  None,
+            playback_media_id: None,
+            prev_playing:      false,
+            audio_was_playing: false,
+        }
+    }
+}
+
+// ── AppContext ────────────────────────────────────────────────────────────────
+
 pub struct AppContext {
     // ── Media worker ─────────────────────────────────────────────────────────
     pub media_worker: MediaWorker,
 
-    // ── Per-frame decode tracking (3-layer scrub system) ────────────────────
-    /// Exact (media_id, timestamp_secs) of the last scrub decode request.
-    /// Storing exact secs (not a ¼s bucket) so scrub_moved fires on every pixel of drag.
-    pub last_frame_req: Option<(Uuid, f64)>,
-    /// Coarse-bucket key (media_id, 2 s bucket) of the last background prefetch
-    pub scrub_coarse_req: Option<(Uuid, u32)>,
-    /// Wall-clock instant the scrub head last moved (for 150 ms debounce)
-    pub scrub_last_moved: Option<std::time::Instant>,
-    /// Tracks which clip the live-playback thread is currently decoding
-    pub playback_media_id: Option<Uuid>,
-    pub prev_playing: bool,
-    pub audio_was_playing: bool,
+    // ── Texture caches (with memory budget) ──────────────────────────────────
+    pub cache: CacheContext,
 
-    // ── Texture caches ───────────────────────────────────────────────────────
-    /// GPU-resident clip thumbnails (library card images)
-    pub thumbnail_cache: ThumbnailCache,
-    /// Latest live-playback frame per media_id
-    pub frame_cache: HashMap<Uuid, egui::TextureHandle>,
-    /// Next-to-display playback frame, held until its PTS is due.
-    /// Prevents the drain-all pattern from racing ahead of wall-clock time.
-    pub pending_pb_frame: Option<PlaybackFrame>,
-    /// Decoded frames keyed by (media_id, fine_bucket) — the scrub look-ahead store
-    /// Cap: 128 entries; evict 32 at a time to avoid O(n) clear.
-    pub frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
+    // ── Scrub / playback decode tracking ─────────────────────────────────────
+    pub playback: PlaybackContext,
 
     // ── Audio (rodio 0.21) ───────────────────────────────────────────────────
     // OutputStream MUST stay alive for the entire app lifetime — dropping it
-    // stops all audio. audio_module borrows it each tick via .mixer().
+    // stops all audio.  audio_module borrows it each tick via .mixer().
     pub audio_stream: Option<OutputStream>,
     pub audio_sinks:  HashMap<Uuid, Sink>,
 }
@@ -57,18 +167,10 @@ impl AppContext {
         eprintln!("[audio] stream ready: {}", audio_stream.is_some());
         Self {
             media_worker,
-            last_frame_req:     None,
-            scrub_coarse_req:   None,
-            scrub_last_moved:   None,
-            playback_media_id:  None,
-            prev_playing:       false,
-            audio_was_playing:  false,
-            thumbnail_cache:    HashMap::new(),
-            frame_cache:        HashMap::new(),
-            pending_pb_frame:   None,
-            frame_bucket_cache: HashMap::new(),
+            cache:        CacheContext::new(),
+            playback:     PlaybackContext::new(),
             audio_stream,
-            audio_sinks:        HashMap::new(),
+            audio_sinks:  HashMap::new(),
         }
     }
 
@@ -106,7 +208,7 @@ impl AppContext {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.thumbnail_cache.insert(id, tex);
+                    self.cache.thumbnail_cache.insert(id, tex);
                     ctx.request_repaint();
                 }
 
@@ -120,7 +222,6 @@ impl AppContext {
                         clip.video_size = Some((width, height));
                     }
                     // Auto-set aspect ratio from the first clip that reports a size.
-                    // The count includes the clip that just updated, so == 1 fires exactly once.
                     let is_first = state.library.iter()
                         .filter(|c| c.video_size.is_some()).count() == 1;
                     if is_first && width > 0 && height > 0 {
@@ -161,11 +262,11 @@ impl AppContext {
                     );
 
                     // Derive the ¼s bucket key for frame_bucket_cache.
-                    // last_frame_req stores exact f64 ts (not a bucket) — convert here.
-                    let bucket: u32 = self.last_frame_req
+                    // playback.last_frame_req stores exact f64 ts — convert here.
+                    let bucket: u32 = self.playback.last_frame_req
                         .filter(|(rid, _)| *rid == id)
                         .map(|(_, ts)| (ts * 4.0) as u32)
-                        .or_else(|| self.scrub_coarse_req
+                        .or_else(|| self.playback.scrub_coarse_req
                             .filter(|(rid, _)| *rid == id)
                             .map(|(_, cb)| cb * 8))
                         .unwrap_or_else(|| {
@@ -178,24 +279,19 @@ impl AppContext {
                                 .unwrap_or(0)
                         });
 
-                    // Evict the 32 entries furthest from the current playhead when
-                    // the cache hits its 128-entry cap. Random HashMap iteration order
-                    // (the previous approach) could evict the frames nearest the scrub
-                    // head, which are exactly the ones about to be needed.
-                    if self.frame_bucket_cache.len() >= 128 {
-                        let current_bucket = (state.current_time * 4.0) as u32;
-                        let mut keys: Vec<_> = self.frame_bucket_cache.keys().copied().collect();
-                        keys.sort_by_key(|(_, b)| std::cmp::Reverse(b.abs_diff(current_bucket)));
-                        keys.truncate(32);
-                        for k in keys { self.frame_bucket_cache.remove(&k); }
-                    }
-                    self.frame_bucket_cache.insert((id, bucket), tex.clone());
+                    let tex = self.cache.insert_bucket_frame(
+                        (id, bucket),
+                        tex,
+                        width as usize,
+                        height as usize,
+                        state.current_time,
+                    );
 
-                    // During playback the pb channel owns frame_cache; a late-arriving
+                    // During playback the pb channel owns frame_cache — a late-arriving
                     // scrub result would overwrite the correct playback frame with a
                     // wrong-position one.  Skip the frame_cache write while playing.
                     if !state.is_playing {
-                        self.frame_cache.insert(id, tex);
+                        self.cache.frame_cache.insert(id, tex);
                         ctx.request_repaint();
                     }
                 }
@@ -218,15 +314,10 @@ impl AppContext {
 
                 MediaResult::EncodeDone { job_id, path } => {
                     if state.encode_job == Some(job_id) {
-                        // Snap progress to 100 % so the bar is full in the instant
-                        // before the done banner replaces it.
                         if let Some((_, total)) = state.encode_progress {
                             state.encode_progress = Some((total, total));
                         }
                         state.encode_done = Some(path);
-                        // encode_job is intentionally left set here. ExportModule
-                        // uses it to distinguish "idle" from "done-but-not-dismissed".
-                        // ClearEncodeStatus (emitted by the Dismiss button) clears it.
                         ctx.request_repaint();
                     }
                 }
@@ -234,8 +325,6 @@ impl AppContext {
                 MediaResult::EncodeError { job_id, msg } => {
                     if state.encode_job == Some(job_id) {
                         state.encode_error = Some(msg);
-                        // Same rationale as EncodeDone: leave encode_job set until
-                        // the user explicitly dismisses the error banner.
                         ctx.request_repaint();
                     }
                 }

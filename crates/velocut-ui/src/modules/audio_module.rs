@@ -35,14 +35,14 @@ impl AudioModule {
 
         if !state.is_playing {
             // Clear sinks only on the play→stop transition.
-            if ctx.audio_was_playing {
-                ctx.audio_was_playing = false;
+            if ctx.playback.audio_was_playing {
+                ctx.playback.audio_was_playing = false;
                 ctx.audio_sinks.clear();
                 self.exhausted.clear();
             }
             return;
         }
-        ctx.audio_was_playing = true;
+        ctx.playback.audio_was_playing = true;
 
         let t = state.current_time;
 
