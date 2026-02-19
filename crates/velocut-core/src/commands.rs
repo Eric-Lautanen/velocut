@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use uuid::Uuid;
 use crate::state::AspectRatio;
+use crate::transitions::TransitionType;
 
 #[derive(Debug, Clone)]
 pub enum EditorCommand {
@@ -43,9 +44,15 @@ pub enum EditorCommand {
     /// Clear encode_job / encode_progress / encode_done / encode_error in
     /// ProjectState. Emitted when the user dismisses a done/error banner.
     ClearEncodeStatus,
-    /// Set the crossfade duration (in seconds) applied between all adjacent clips.
-    /// 0.0 = hard cut (no transition). Stored in ProjectState and serialized.
+    /// Set the crossfade duration (in seconds) for ALL clip boundaries at once.
+    /// Convenience for the global slider; sets a Crossfade transition on every
+    /// adjacent touching pair. 0.0 clears all transitions (all become Cut).
     SetCrossfadeDuration(f32),
+    /// Set or update the transition at a specific clip boundary.
+    /// `after_clip_id` is the TimelineClip UUID that comes before the transition.
+    SetTransition { after_clip_id: Uuid, kind: TransitionType },
+    /// Remove the transition after a specific clip, reverting it to a hard cut.
+    RemoveTransition(Uuid),
 
     // ── View / UI ────────────────────────────────────────────────────────────
     SetAspectRatio(AspectRatio),

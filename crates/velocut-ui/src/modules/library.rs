@@ -20,6 +20,8 @@
 use super::EditorModule;
 use velocut_core::state::{ProjectState, ClipType};
 use velocut_core::commands::EditorCommand;
+use velocut_core::helpers::time::format_duration;
+use crate::helpers::format::truncate;
 use crate::modules::ThumbnailCache;
 use crate::theme::{
     ACCENT, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BG_4,
@@ -507,24 +509,4 @@ fn empty_state(ui: &mut Ui) {
 
 fn clip_icon(t: ClipType) -> &'static str {
     match t { ClipType::Video => "🎬", ClipType::Audio => "🎵" }
-}
-
-fn format_duration(secs: f64) -> String {
-    if secs >= 3600.0 {
-        format!("{}:{:02}:{:02}", secs as u64 / 3600, (secs as u64 % 3600) / 60, secs as u64 % 60)
-    } else if secs >= 60.0 {
-        format!("{}:{:02}", secs as u64 / 60, secs as u64 % 60)
-    } else {
-        format!("{secs:.1}s")
-    }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
-    s.char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= max)
-        .last()
-        .map(|i| &s[..i])
-        .unwrap_or("")
 }

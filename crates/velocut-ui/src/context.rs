@@ -70,6 +70,12 @@ impl CacheContext {
     /// Insert a decoded frame into the bucket cache, evicting if over budget.
     /// `width` and `height` are the frame dimensions (for byte accounting).
     /// Returns a clone of the inserted TextureHandle for the caller's use.
+    ///
+    /// [Opt 4] Eviction now uses `select_nth_unstable_by_key` (O(N) partial select)
+    /// instead of a full sort (O(N log N)).  Both collect the key Vec — that part
+    /// stays O(N) — but the partial select avoids the full ordering pass over all
+    /// 128 entries.  The difference is modest at the current cap of 128 but grows
+    /// linearly if the cap is raised.
     pub fn insert_bucket_frame(
         &mut self,
         key: (Uuid, u32),
@@ -84,9 +90,18 @@ impl CacheContext {
         if self.frame_cache_bytes + frame_bytes > MAX_FRAME_CACHE_BYTES {
             let current_bucket = (current_time * 4.0) as u32;
             let mut keys: Vec<_> = self.frame_bucket_cache.keys().copied().collect();
-            // Sort furthest-first so we truncate the tail.
-            keys.sort_by_key(|(_, b)| std::cmp::Reverse(b.abs_diff(current_bucket)));
+
+            // [Opt 4] O(N) partial select: puts the 32 furthest entries at keys[..32]
+            // without fully sorting the remaining N-32 entries.
+            // `select_nth_unstable_by_key` is stable since Rust 1.64.
+            if keys.len() > 32 {
+                keys.select_nth_unstable_by_key(
+                    32,
+                    |(_, b)| std::cmp::Reverse(b.abs_diff(current_bucket)),
+                );
+            }
             keys.truncate(32);
+
             for k in &keys {
                 // Subtract evicted bytes. Approximate: assume all frames same size.
                 self.frame_cache_bytes =
@@ -181,11 +196,27 @@ impl AppContext {
     /// This is the single translation layer between raw `MediaWorker` output
     /// and UI-visible state — textures, waveform peaks, clip metadata, and
     /// save confirmations all land here, next to the caches they fill.
+    ///
+    /// [Opt 3] scrub_rx is drained first (before the shared rx) so scrub
+    /// VideoFrame results are never delayed behind probe or encode traffic.
     pub fn ingest_media_results(
         &mut self,
         state: &mut ProjectState,
         ctx:   &egui::Context,
     ) {
+        // ── [Opt 3] Scrub frames — high-priority path ─────────────────────────
+        // Drain the dedicated scrub channel before the shared channel.
+        // The scrub thread sends at most one result per condvar wake, so this
+        // loop typically executes 0 or 1 iterations per frame.
+        while let Ok(result) = self.media_worker.scrub_rx.try_recv() {
+            // Only VideoFrame arrives on scrub_rx — match exhaustively so the
+            // compiler warns if the channel ever carries an unexpected variant.
+            if let MediaResult::VideoFrame { id, width, height, data } = result {
+                self.ingest_video_frame(id, width, height, data, state, ctx);
+            }
+        }
+
+        // ── Shared channel: probes, waveforms, audio, encode, HQ frames ───────
         while let Ok(result) = self.media_worker.rx.try_recv() {
             match result {
                 MediaResult::AudioPath { id, path } => {
@@ -252,48 +283,11 @@ impl AppContext {
                     ctx.request_repaint();
                 }
 
+                // VideoFrame on the shared channel = HQ one-shot frame from
+                // extract_frame_hq.  Scrub frames no longer arrive here —
+                // they travel on scrub_rx and are consumed above.
                 MediaResult::VideoFrame { id, width, height, data } => {
-                    let tex = ctx.load_texture(
-                        format!("frame-{id}"),
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [width as usize, height as usize], &data,
-                        ),
-                        egui::TextureOptions::LINEAR,
-                    );
-
-                    // Derive the ¼s bucket key for frame_bucket_cache.
-                    // playback.last_frame_req stores exact f64 ts — convert here.
-                    let bucket: u32 = self.playback.last_frame_req
-                        .filter(|(rid, _)| *rid == id)
-                        .map(|(_, ts)| (ts * 4.0) as u32)
-                        .or_else(|| self.playback.scrub_coarse_req
-                            .filter(|(rid, _)| *rid == id)
-                            .map(|(_, cb)| cb * 8))
-                        .unwrap_or_else(|| {
-                            state.timeline.iter()
-                                .find(|c| c.media_id == id)
-                                .map(|c| {
-                                    let lt = (state.current_time - c.start_time).max(0.0);
-                                    (lt * 4.0) as u32
-                                })
-                                .unwrap_or(0)
-                        });
-
-                    let tex = self.cache.insert_bucket_frame(
-                        (id, bucket),
-                        tex,
-                        width as usize,
-                        height as usize,
-                        state.current_time,
-                    );
-
-                    // During playback the pb channel owns frame_cache — a late-arriving
-                    // scrub result would overwrite the correct playback frame with a
-                    // wrong-position one.  Skip the frame_cache write while playing.
-                    if !state.is_playing {
-                        self.cache.frame_cache.insert(id, tex);
-                        ctx.request_repaint();
-                    }
+                    self.ingest_video_frame(id, width, height, data, state, ctx);
                 }
 
                 MediaResult::Error { id, msg } => {
@@ -329,6 +323,63 @@ impl AppContext {
                     }
                 }
             }
+        }
+    }
+
+    /// Shared logic for handling a VideoFrame result from either channel.
+    ///
+    /// Factored out so both the scrub_rx fast path and the shared rx path
+    /// (HQ frames from extract_frame_hq) go through identical bucket-cache
+    /// and frame_cache logic without duplication.
+    fn ingest_video_frame(
+        &mut self,
+        id:     Uuid,
+        width:  u32,
+        height: u32,
+        data:   Vec<u8>,
+        state:  &mut ProjectState,
+        ctx:    &egui::Context,
+    ) {
+        let tex = ctx.load_texture(
+            format!("frame-{id}"),
+            egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize], &data,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+
+        // Derive the ¼s bucket key for frame_bucket_cache.
+        // playback.last_frame_req stores exact f64 ts — convert here.
+        let bucket: u32 = self.playback.last_frame_req
+            .filter(|(rid, _)| *rid == id)
+            .map(|(_, ts)| (ts * 4.0) as u32)
+            .or_else(|| self.playback.scrub_coarse_req
+                .filter(|(rid, _)| *rid == id)
+                .map(|(_, cb)| cb * 8))
+            .unwrap_or_else(|| {
+                state.timeline.iter()
+                    .find(|c| c.media_id == id)
+                    .map(|c| {
+                        let lt = (state.current_time - c.start_time).max(0.0);
+                        (lt * 4.0) as u32
+                    })
+                    .unwrap_or(0)
+            });
+
+        let tex = self.cache.insert_bucket_frame(
+            (id, bucket),
+            tex,
+            width as usize,
+            height as usize,
+            state.current_time,
+        );
+
+        // During playback the pb channel owns frame_cache — a late-arriving
+        // scrub result would overwrite the correct playback frame with a
+        // wrong-position one.  Skip the frame_cache write while playing.
+        if !state.is_playing {
+            self.cache.frame_cache.insert(id, tex);
+            ctx.request_repaint();
         }
     }
 }

@@ -2,6 +2,7 @@
 
 mod app;
 mod context;
+mod helpers;
 mod modules;
 mod theme;
 

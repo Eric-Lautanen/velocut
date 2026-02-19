@@ -2,12 +2,24 @@
 use super::EditorModule;
 use velocut_core::state::{ProjectState, ClipType};
 use velocut_core::commands::EditorCommand;
+use velocut_core::helpers::time::format_time;
+use velocut_core::transitions::TransitionType;
+use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
-use crate::theme::{ACCENT, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BORDER, DARK_BG_2};
+use crate::theme::{ACCENT, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};
 use uuid::Uuid;
 
-pub struct TimelineModule;
+pub struct TimelineModule {
+    /// Which clip ID's outgoing transition popup is open, and where to show it.
+    transition_popup: Option<(Uuid, Pos2)>,
+}
+
+impl TimelineModule {
+    pub fn new() -> Self {
+        Self { transition_popup: None }
+    }
+}
 
 impl EditorModule for TimelineModule {
     fn name(&self) -> &str { "Timeline" }
@@ -28,26 +40,27 @@ impl EditorModule for TimelineModule {
         } else {
             ui.memory_mut(|mem| mem.data.remove::<f64>(egui::Id::new("save_status_time")));
         }
-        // Delete selected timeline clip
-        if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-            if let Some(id) = state.selected_timeline_clip {
-                cmd.push(EditorCommand::DeleteTimelineClip(id));
+
+        // Keyboard shortcuts (only when no popup is open)
+        if self.transition_popup.is_none() {
+            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                if let Some(id) = state.selected_timeline_clip {
+                    cmd.push(EditorCommand::DeleteTimelineClip(id));
+                }
             }
-        }
-        // Space = play/pause
-        if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            if state.is_playing { cmd.push(EditorCommand::Pause); }
-            else                { cmd.push(EditorCommand::Play);  }
-        }
-        // Arrow keys = frame step
-        if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-            cmd.push(EditorCommand::Pause);
-            cmd.push(EditorCommand::SetPlayhead((state.current_time - 1.0 / 30.0).max(0.0)));
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-            let total = state.total_duration();
-            cmd.push(EditorCommand::Pause);
-            cmd.push(EditorCommand::SetPlayhead((state.current_time + 1.0 / 30.0).min(total.max(0.0))));
+            if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                if state.is_playing { cmd.push(EditorCommand::Pause); }
+                else                { cmd.push(EditorCommand::Play);  }
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                cmd.push(EditorCommand::Pause);
+                cmd.push(EditorCommand::SetPlayhead((state.current_time - 1.0 / 30.0).max(0.0)));
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                let total = state.total_duration();
+                cmd.push(EditorCommand::Pause);
+                cmd.push(EditorCommand::SetPlayhead((state.current_time + 1.0 / 30.0).min(total.max(0.0))));
+            }
         }
 
         ui.vertical(|ui| {
@@ -78,17 +91,13 @@ impl EditorModule for TimelineModule {
                         });
                         if state.selected_timeline_clip.is_some() {
                             ui.group(|ui| {
-                                let extract_enabled = state.selected_timeline_clip
-                                    .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    .and_then(|tc| state.library.iter().find(|l| l.id == tc.media_id))
-                                    .is_some();
+                                let extract_enabled =
+                                    clip_query::selected_clip_library_entry(state).is_some();
                                 if ui.add_enabled(extract_enabled,
                                     egui::Button::new("⬛ First Frame")
                                 ).on_hover_text("Extract first frame as PNG").clicked() {
-                                    if let Some(tc) = state.selected_timeline_clip
-                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    {
-                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
+                                    if let Some(tc) = clip_query::selected_timeline_clip(state) {
+                                        if let Some(lib) = clip_query::library_entry_for(state, tc) {
                                             cmd.push(EditorCommand::RequestSaveFramePicker {
                                                 path: lib.path.clone(),
                                                 timestamp: tc.source_offset,
@@ -99,10 +108,8 @@ impl EditorModule for TimelineModule {
                                 if ui.add_enabled(extract_enabled,
                                     egui::Button::new("⬛ Last Frame")
                                 ).on_hover_text("Extract last frame as PNG").clicked() {
-                                    if let Some(tc) = state.selected_timeline_clip
-                                        .and_then(|id| state.timeline.iter().find(|c| c.id == id))
-                                    {
-                                        if let Some(lib) = state.library.iter().find(|l| l.id == tc.media_id) {
+                                    if let Some(tc) = clip_query::selected_timeline_clip(state) {
+                                        if let Some(lib) = clip_query::library_entry_for(state, tc) {
                                             let ts = (tc.source_offset + tc.duration - 1.0/30.0).max(0.0);
                                             cmd.push(EditorCommand::RequestSaveFramePicker {
                                                 path: lib.path.clone(),
@@ -199,8 +206,6 @@ impl EditorModule for TimelineModule {
                     if ruler_resp.clicked() || ruler_resp.dragged() {
                         if let Some(ptr) = ruler_resp.interact_pointer_pos() {
                             let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
-                            // Only emit Pause once at drag start, not every frame —
-                            // spamming Pause resets audio sink state on every scrub frame.
                             if ruler_resp.drag_started() || ruler_resp.clicked() {
                                 cmd.push(EditorCommand::Pause);
                             }
@@ -216,9 +221,6 @@ impl EditorModule for TimelineModule {
                     let content_rect = Rect::from_min_max(
                         Pos2::new(rect.min.x, rect.min.y + header_height), rect.max);
 
-                    // If a payload is live but the user released outside the drop zone,
-                    // no drop handler ever clears it. Clear it here so the next hover
-                    // doesn't show a ghost drop indicator from a completed/aborted drag.
                     if payload.is_some() && !ui.input(|i| i.pointer.any_down()) {
                         ui.memory_mut(|mem| mem.data.remove::<Uuid>(Id::new("DND_PAYLOAD")));
                     }
@@ -257,11 +259,11 @@ impl EditorModule for TimelineModule {
                         }
                     }
 
-                    // ── Timeline Clips ─────────────────────────────────────────
+                    // ── Timeline Clips ─────────────────────────────────────────────
                     let mut to_delete: Option<Uuid> = None;
 
                     for clip in &state.timeline {
-                        let lib       = state.library.iter().find(|l| l.id == clip.media_id);
+                        let lib        = clip_query::library_entry_for(state, clip);
                         let media_name = lib.map(|l| l.name.as_str()).unwrap_or("Unknown");
                         let clip_type  = lib.map(|l| l.clip_type).unwrap_or(ClipType::Video);
                         let waveform   = lib.map(|l| l.waveform_peaks.as_slice()).unwrap_or(&[]);
@@ -281,11 +283,10 @@ impl EditorModule for TimelineModule {
 
                         painter.rect_filled(clip_rect, 4.0, body_color);
 
-                        // ── Thumbnail strip on video clips ──────────────────
+                        // Thumbnail strip on video clips
                         if clip_type == ClipType::Video && width > 20.0 {
                             if let Some(media) = lib {
                                 if let Some(tex) = thumb_cache.get(&media.id) {
-                                    // Tile the thumbnail across the clip width
                                     let tex_aspect = tex.size_vec2().x / tex.size_vec2().y.max(1.0);
                                     let tile_w = (track_height * tex_aspect).min(width);
                                     let mut tx_start = clip_rect.min.x;
@@ -329,7 +330,6 @@ impl EditorModule for TimelineModule {
 
                         // Name label
                         if width > 30.0 {
-                            // Dark pill behind text for readability over thumbnails
                             let label_pos = clip_rect.min + Vec2::new(6.0, 8.0);
                             painter.text(label_pos, Align2::LEFT_TOP, media_name,
                                 FontId::proportional(11.0),
@@ -344,15 +344,18 @@ impl EditorModule for TimelineModule {
                                 Color32::from_rgba_unmultiplied(255, 255, 255, 140));
                         }
 
-                        // Click/drag to select and move
+                        // Click/drag
                         let clip_interact = ui.interact(clip_rect, Id::new(clip.id), Sense::click_and_drag());
                         if clip_interact.clicked() {
                             cmd.push(EditorCommand::SelectTimelineClip(Some(clip.id)));
                             cmd.push(EditorCommand::SelectLibraryClip(None));
+                            // Close transition popup when clicking a clip
+                            self.transition_popup = None;
                         }
                         if clip_interact.drag_started() {
                             cmd.push(EditorCommand::SelectTimelineClip(Some(clip.id)));
                             cmd.push(EditorCommand::SelectLibraryClip(None));
+                            self.transition_popup = None;
                         }
                         if clip_interact.dragged() {
                             let delta_t = clip_interact.drag_delta().x as f64 / state.timeline_zoom as f64;
@@ -396,6 +399,101 @@ impl EditorModule for TimelineModule {
                         });
                     }
 
+                    // ── Transition badges ──────────────────────────────────────────
+                    // For each track, find adjacent touching clip pairs and render a
+                    // small clickable badge at the join point.
+                    for track_row in 0..num_tracks {
+                        let mut track_clips: Vec<_> = state.timeline.iter()
+                            .filter(|c| c.track_row == track_row)
+                            .collect();
+                        track_clips.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+
+                        for i in 0..track_clips.len().saturating_sub(1) {
+                            let clip_a = track_clips[i];
+                            let clip_b = track_clips[i + 1];
+                            let gap = clip_b.start_time - (clip_a.start_time + clip_a.duration);
+                            if gap.abs() > 0.25 { continue; } // only touching clips
+
+                            let join_x = rect.min.x
+                                + ((clip_a.start_time + clip_a.duration) as f32 * state.timeline_zoom);
+                            let y_off = header_height + track_row as f32 * (track_height + track_gap);
+                            let badge_center = Pos2::new(
+                                join_x,
+                                rect.min.y + y_off + track_height * 0.5,
+                            );
+
+                            let current_kind = state.transitions.iter()
+                                .find(|t| t.after_clip_id == clip_a.id)
+                                .map(|t| &t.kind);
+
+                            let has_transition = matches!(current_kind, Some(TransitionType::Crossfade { .. }));
+                            let is_open = self.transition_popup.map(|(id, _)| id == clip_a.id).unwrap_or(false);
+
+                            let badge_color = if is_open {
+                                ACCENT
+                            } else if has_transition {
+                                Color32::from_rgb(120, 180, 255)
+                            } else {
+                                Color32::from_gray(90)
+                            };
+
+                            // Badge: small pill straddling the join line
+                            let badge_rect = Rect::from_center_size(
+                                badge_center,
+                                egui::vec2(18.0, 18.0),
+                            );
+                            painter.rect_filled(
+                                badge_rect,
+                                5.0,
+                                if is_open {
+                                    badge_color.linear_multiply(0.35)
+                                } else {
+                                    badge_color.linear_multiply(0.18)
+                                },
+                            );
+                            painter.rect_stroke(
+                                badge_rect,
+                                5.0,
+                                Stroke::new(1.0, badge_color),
+                                egui::StrokeKind::Outside,
+                            );
+                            // Icon: ⇌ for crossfade, ✂ for cut
+                            let icon = if has_transition { "⇌" } else { "✂" };
+                            painter.text(
+                                badge_center,
+                                Align2::CENTER_CENTER,
+                                icon,
+                                FontId::proportional(10.0),
+                                badge_color,
+                            );
+
+                            // Hit area and interaction
+                            let badge_sense = ui.interact(
+                                badge_rect,
+                                Id::new(("transition_badge", clip_a.id)),
+                                Sense::click(),
+                            );
+                            let badge_sense = badge_sense.on_hover_ui(|ui: &mut egui::Ui| {
+                                let tip = match current_kind {
+                                    Some(TransitionType::Crossfade { duration_secs }) =>
+                                        format!("Crossfade  {:.2}s — click to edit", duration_secs),
+                                    _ => "Cut — click to add transition".to_string(),
+                                };
+                                ui.label(RichText::new(tip).size(11.0));
+                            });
+                            if badge_sense.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if badge_sense.clicked() {
+                                if is_open {
+                                    self.transition_popup = None;
+                                } else {
+                                    self.transition_popup = Some((clip_a.id, badge_center));
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(del_id) = to_delete {
                         cmd.push(EditorCommand::DeleteTimelineClip(del_id));
                     }
@@ -420,7 +518,7 @@ impl EditorModule for TimelineModule {
                              Pos2::new(ph_x, rect.min.y + 12.0)],
                         ACCENT, Stroke::NONE));
 
-                    // Playhead triangle handle drag
+                    // Playhead handle drag
                     let handle_rect = Rect::from_center_size(
                         Pos2::new(ph_x, rect.min.y + 6.0),
                         egui::vec2(16.0, 16.0),
@@ -431,7 +529,6 @@ impl EditorModule for TimelineModule {
                     if handle_resp.dragged() {
                         if let Some(ptr) = handle_resp.interact_pointer_pos() {
                             let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
-                            // Only emit Pause once at drag start.
                             if handle_resp.drag_started() {
                                 cmd.push(EditorCommand::Pause);
                             }
@@ -442,12 +539,128 @@ impl EditorModule for TimelineModule {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
 
-                    // Background click = deselect
+                    // Background click = deselect + close popup
                     if response.clicked() {
                         cmd.push(EditorCommand::SelectTimelineClip(None));
                         cmd.push(EditorCommand::SelectLibraryClip(None));
                     }
                 });
+
+            // ── Transition popup ───────────────────────────────────────────────
+            // Rendered outside the ScrollArea so it floats above everything.
+            if let Some((after_clip_id, badge_pos)) = self.transition_popup {
+                let current_kind = state.transitions.iter()
+                    .find(|t| t.after_clip_id == after_clip_id)
+                    .map(|t| t.kind.clone())
+                    .unwrap_or(TransitionType::Cut);
+
+                // Position the popup below and centered on the badge.
+                // Clamp to avoid going off-screen bottom.
+                let popup_pos = Pos2::new(badge_pos.x - 90.0, badge_pos.y + 16.0);
+
+                let area_resp = egui::Area::new(Id::new("transition_popup_area"))
+                    .fixed_pos(popup_pos)
+                    .order(egui::Order::Foreground)
+                    .interactable(true)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(DARK_BG_3)
+                            .stroke(Stroke::new(1.0, DARK_BORDER))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(10))
+                            .shadow(egui::Shadow {
+                                offset: [0, 4],
+                                blur: 12,
+                                spread: 0,
+                                color: Color32::from_black_alpha(120),
+                            })
+                            .show(ui, |ui| {
+                                ui.set_min_width(180.0);
+
+                                // Header
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("⇌  Transition")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(ACCENT),
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+
+                                // Type selector buttons
+                                ui.horizontal(|ui| {
+                                    let cut_selected = matches!(current_kind, TransitionType::Cut);
+                                    let fade_selected = matches!(current_kind, TransitionType::Crossfade { .. });
+
+                                    let cut_btn = egui::Button::new(
+                                        RichText::new("✂  Cut")
+                                            .size(11.0)
+                                            .color(if cut_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                    )
+                                    .fill(if cut_selected { ACCENT } else { DARK_BG_2 })
+                                    .stroke(Stroke::new(1.0, if cut_selected { ACCENT } else { DARK_BORDER }))
+                                    .min_size(egui::vec2(80.0, 26.0));
+
+                                    let fade_btn = egui::Button::new(
+                                        RichText::new("⇌  Dissolve")
+                                            .size(11.0)
+                                            .color(if fade_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                    )
+                                    .fill(if fade_selected { ACCENT } else { DARK_BG_2 })
+                                    .stroke(Stroke::new(1.0, if fade_selected { ACCENT } else { DARK_BORDER }))
+                                    .min_size(egui::vec2(80.0, 26.0));
+
+                                    if ui.add(cut_btn).clicked() {
+                                        cmd.push(EditorCommand::RemoveTransition(after_clip_id));
+                                    }
+                                    if ui.add(fade_btn).clicked() {
+                                        let dur = match &current_kind {
+                                            TransitionType::Crossfade { duration_secs } => *duration_secs,
+                                            _ => 0.5,
+                                        };
+                                        cmd.push(EditorCommand::SetTransition {
+                                            after_clip_id,
+                                            kind: TransitionType::Crossfade { duration_secs: dur },
+                                        });
+                                    }
+                                });
+
+                                // Duration slider — only shown for Crossfade
+                                if let TransitionType::Crossfade { duration_secs } = &current_kind {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("Duration").size(10.0).color(DARK_TEXT_DIM),
+                                    );
+                                    ui.add_space(2.0);
+                                    let mut dur = *duration_secs;
+                                    let slider = egui::Slider::new(&mut dur, 0.1f32..=3.0)
+                                        .step_by(0.05)
+                                        .suffix("s")
+                                        .show_value(true);
+                                    if ui.add(slider).changed() {
+                                        cmd.push(EditorCommand::SetTransition {
+                                            after_clip_id,
+                                            kind: TransitionType::Crossfade { duration_secs: dur },
+                                        });
+                                    }
+                                }
+                            });
+                    });
+
+                // Close on click outside the popup
+                let clicked_somewhere = ui.input(|i| i.pointer.any_click());
+                if clicked_somewhere {
+                    let click_pos = ui.input(|i| i.pointer.interact_pos());
+                    if let Some(pos) = click_pos {
+                        if !area_resp.response.rect.contains(pos) {
+                            self.transition_popup = None;
+                        }
+                    }
+                }
+            }
         });
     }
 }
@@ -480,11 +693,4 @@ fn ruler_step(zoom: f32) -> f64 {
     else if zoom >= 80.0  { 1.0 }
     else if zoom >= 30.0  { 5.0 }
     else { 10.0 }
-}
-
-fn format_time(s: f64) -> String {
-    let m  = (s / 60.0) as u32;
-    let sc = (s % 60.0) as u32;
-    let fr = ((s * 30.0) as u32) % 30;
-    format!("{m:02}:{sc:02}:{fr:02}")
 }

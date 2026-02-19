@@ -3,7 +3,7 @@ use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
-use velocut_core::transitions::{ClipTransition, TransitionType};
+use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionType};
 use crate::context::AppContext;
 use crate::theme::configure_style;
 use crate::modules::{
@@ -66,14 +66,15 @@ impl VeloCutApp {
         }
 
         let context = AppContext::new(media_worker);
-        let library = LibraryModule::new();
+        let library  = LibraryModule::new();
+        let timeline = TimelineModule::new();
 
         Self {
             state,
             context,
             library,
             preview:      PreviewModule::new(),
-            timeline:     TimelineModule,
+            timeline,
             export:       ExportModule::default(),
             audio:        AudioModule::new(),
             video:        VideoModule::new(),
@@ -180,7 +181,40 @@ impl VeloCutApp {
                 self.state.encode_error    = None;
             }
             EditorCommand::SetCrossfadeDuration(secs) => {
-                self.state.crossfade_duration_secs = secs.max(0.0);
+                // Batch operation: set crossfade on every touching adjacent pair,
+                // or clear all transitions if secs == 0.
+                if secs <= 0.0 {
+                    self.state.transitions.clear();
+                } else {
+                    // Sort clips by start time to find adjacent pairs.
+                    let mut sorted = self.state.timeline.clone();
+                    sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+                    self.state.transitions.clear();
+                    for i in 0..sorted.len().saturating_sub(1) {
+                        let a = &sorted[i];
+                        let b = &sorted[i + 1];
+                        // Only pair clips on the same track that are touching.
+                        if a.track_row != b.track_row { continue; }
+                        let gap = b.start_time - (a.start_time + a.duration);
+                        if gap.abs() > 0.1 { continue; }
+                        self.state.transitions.push(TimelineTransition {
+                            after_clip_id: a.id,
+                            kind: TransitionType::Crossfade { duration_secs: secs },
+                        });
+                    }
+                }
+            }
+            EditorCommand::SetTransition { after_clip_id, kind } => {
+                if let Some(t) = self.state.transitions.iter_mut()
+                    .find(|t| t.after_clip_id == after_clip_id)
+                {
+                    t.kind = kind;
+                } else if kind != TransitionType::Cut {
+                    self.state.transitions.push(TimelineTransition { after_clip_id, kind });
+                }
+            }
+            EditorCommand::RemoveTransition(after_clip_id) => {
+                self.state.transitions.retain(|t| t.after_clip_id != after_clip_id);
             }
 
             // ── View / UI ────────────────────────────────────────────────────
@@ -254,28 +288,29 @@ impl VeloCutApp {
         }
 
         let job_id = Uuid::new_v4();
-        let spec   = EncodeSpec {
+
+        // Map TimelineTransitions (UUID-keyed) to ClipTransitions (index-keyed)
+        // by finding each after_clip_id's position in the sorted timeline vec.
+        // Clips that resolve out of range (e.g. last clip) are silently dropped.
+        let encode_transitions: Vec<ClipTransition> = self.state.transitions.iter()
+            .filter_map(|t| {
+                let idx = timeline.iter().position(|tc| tc.id == t.after_clip_id)?;
+                if idx + 1 < clip_specs.len() {
+                    Some(ClipTransition { after_clip_index: idx, kind: t.kind.clone() })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let spec = EncodeSpec {
             job_id,
-            clips: clip_specs.clone(),
+            clips: clip_specs,
             width,
             height,
             fps,
             output: dest,
-            // Fan out the project-level crossfade setting into per-boundary transitions.
-            // A crossfade of 0.0 produces an empty vec, which the encoder treats as
-            // all cuts — identical behaviour to before the transitions feature existed.
-            transitions: if self.state.crossfade_duration_secs > 0.0 {
-                (0..clip_specs.len().saturating_sub(1))
-                    .map(|i| ClipTransition {
-                        after_clip_index: i,
-                        kind: TransitionType::Crossfade {
-                            duration_secs: self.state.crossfade_duration_secs,
-                        },
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            transitions: encode_transitions,
         };
 
         // Arm encode state before handing to the worker so ingest_media_results

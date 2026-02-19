@@ -33,6 +33,7 @@
 use super::EditorModule;
 use velocut_core::state::{ProjectState, AspectRatio};
 use velocut_core::commands::EditorCommand;
+use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Color32, Margin, RichText, Stroke, Ui};
@@ -109,35 +110,7 @@ impl QualityPreset {
     }
 }
 
-// ── Aspect ratio helpers ──────────────────────────────────────────────────────
-
-fn aspect_ratio_value(ar: AspectRatio) -> f32 {
-    match ar {
-        AspectRatio::SixteenNine   => 16.0 / 9.0,
-        AspectRatio::NineSixteen   => 9.0  / 16.0,
-        AspectRatio::TwoThree      => 2.0  / 3.0,
-        AspectRatio::ThreeTwo      => 3.0  / 2.0,
-        AspectRatio::FourThree     => 4.0  / 3.0,
-        AspectRatio::OneOne        => 1.0,
-        AspectRatio::FourFive      => 4.0  / 5.0,
-        AspectRatio::TwentyOneNine => 21.0 / 9.0,
-        AspectRatio::Anamorphic    => 2.39,
-    }
-}
-
-fn aspect_ratio_label(ar: AspectRatio) -> &'static str {
-    match ar {
-        AspectRatio::SixteenNine   => "16:9  — Landscape / YouTube",
-        AspectRatio::NineSixteen   => "9:16  — Portrait / Reels / Shorts",
-        AspectRatio::FourThree     => "4:3   — Classic TV",
-        AspectRatio::ThreeTwo      => "3:2   — Landscape photo",
-        AspectRatio::TwoThree      => "2:3   — Portrait photo",
-        AspectRatio::OneOne        => "1:1   — Square",
-        AspectRatio::FourFive      => "4:5   — Instagram portrait",
-        AspectRatio::TwentyOneNine => "21:9  — Ultrawide / Cinema",
-        AspectRatio::Anamorphic    => "2.39  — Anamorphic widescreen",
-    }
-}
+// ── Aspect ratio constants ────────────────────────────────────────────────────
 
 const ALL_ASPECT_RATIOS: &[AspectRatio] = &[
     AspectRatio::SixteenNine,
@@ -451,33 +424,37 @@ impl ExportModule {
         ui.add_space(10.0);
 
         // ── Transitions ───────────────────────────────────────────────────────
-        // A single duration slider controls the crossfade between all adjacent
-        // clips. 0.0 = hard cut (no overhead). The value is stored in
-        // ProjectState so it survives project reloads.
-        ui.label(RichText::new("Transitions").size(11.0).color(DARK_TEXT_DIM));
-        ui.add_space(2.0);
-        ui.add_enabled_ui(!is_encoding, |ui| {
-            let mut d = state.crossfade_duration_secs;
-            let mode_label = if d == 0.0 { "Cut" } else { "Crossfade" };
-            let slider = egui::Slider::new(&mut d, 0.0f32..=2.0)
-                .step_by(0.05)
-                .suffix("s")
-                .text(mode_label);
-            if ui.add(slider).changed() {
-                cmd.push(EditorCommand::SetCrossfadeDuration(d));
-            }
-            if d > 0.0 {
+        // Transitions are set per clip boundary on the timeline — click the
+        // ✂ badge between any two touching clips to add a dissolve.
+        egui::Frame::new()
+            .fill(DARK_BG_3)
+            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let transition_count = state.transitions.iter()
+                    .filter(|t| !matches!(t.kind, velocut_core::transitions::TransitionType::Cut))
+                    .count();
+                if transition_count == 0 {
+                    ui.label(
+                        RichText::new("No transitions set")
+                            .size(11.0).color(DARK_TEXT_DIM),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("⇌  {} transition{} active",
+                            transition_count,
+                            if transition_count == 1 { "" } else { "s" }))
+                            .size(11.0).color(ACCENT),
+                    );
+                }
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new(format!(
-                        "{:.2}s dissolve between each clip",
-                        d
-                    ))
-                    .size(10.0)
-                    .color(DARK_TEXT_DIM),
+                    RichText::new("Click ✂ between clips on timeline to edit")
+                        .size(10.0).color(DARK_TEXT_DIM),
                 );
-            }
-        });
+            });
 
         ui.add_space(10.0);
 

@@ -36,8 +36,27 @@ enum PlaybackCmd {
 // ── MediaWorker ───────────────────────────────────────────────────────────────
 
 pub struct MediaWorker {
+    /// Shared result channel: probes, waveforms, audio, encode progress, HQ frames.
     pub rx:    Receiver<MediaResult>,
     tx:        Sender<MediaResult>,
+
+    /// [Opt 3] Dedicated channel for on-demand scrub VideoFrame results.
+    ///
+    /// Previously scrub frames traveled through the same `rx` channel as probe
+    /// results (Duration, Thumbnail, Waveform) and encode progress.  During a busy
+    /// import with 4 probe threads running that channel fills quickly, adding latency
+    /// between the scrub decode thread sending a frame and the UI consuming it.
+    ///
+    /// Separating it means scrub responsiveness is independent of import load.
+    /// The channel is drained by `AppContext::ingest_media_results` before the
+    /// shared channel so the UI sees scrub frames with minimal delay.
+    ///
+    /// Capacity = 8: the scrub slot is latest-wins, so at most one in-flight
+    /// request exists at a time; 8 gives headroom for back-to-back requests
+    /// during rapid scrub without dropping frames.
+    pub scrub_rx: Receiver<MediaResult>,
+    scrub_tx:     Sender<MediaResult>,
+
     /// Latest-wins slot for on-demand scrub frames.
     frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)>,
     /// Dedicated playback pipeline.
@@ -54,14 +73,18 @@ pub struct MediaWorker {
 
 impl MediaWorker {
     pub fn new() -> Self {
-        let (tx, rx) = bounded(512);
+        let (tx, rx)           = bounded(512);
+        let (scrub_tx, scrub_rx) = bounded(8); // [Opt 3] dedicated scrub channel
+
         let frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)> =
             Arc::new((Mutex::new(None), Condvar::new()));
 
         // ── Scrub frame decode thread ─────────────────────────────────────────
         // Blocks on the latest-wins slot; reuses the LiveDecoder when possible.
-        let result_tx = tx.clone();
-        let slot      = Arc::clone(&frame_req);
+        // [Opt 3] Sends VideoFrame on scrub_tx (not tx) so scrub results bypass
+        // the shared channel and are consumed with lower latency under probe load.
+        let scrub_result_tx = scrub_tx.clone();
+        let slot             = Arc::clone(&frame_req);
         thread::spawn(move || {
             let mut live: Option<LiveDecoder> = None;
             loop {
@@ -103,7 +126,7 @@ impl MediaWorker {
                             // avoids scaling every intermediate frame.
                             d.skip_until_pts = d.ts_to_pts(req.timestamp);
                             if let Some((data, w, h, _)) = d.next_frame() {
-                                let _ = result_tx.send(MediaResult::VideoFrame {
+                                let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                                     id: req.id, width: w, height: h, data,
                                 });
                             }
@@ -114,7 +137,7 @@ impl MediaWorker {
                 } else if let Some(d) = &mut live {
                     let tpts = d.ts_to_pts(req.timestamp);
                     if let Some((data, w, h)) = d.advance_to(tpts) {
-                        let _ = result_tx.send(MediaResult::VideoFrame {
+                        let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                             id: req.id, width: w, height: h, data,
                         });
                     }
@@ -186,7 +209,7 @@ impl MediaWorker {
         });
 
         Self {
-            rx, tx, frame_req, pb_tx, pb_rx,
+            rx, tx, scrub_rx, scrub_tx, frame_req, pb_tx, pb_rx,
             shutdown:       Arc::new(AtomicBool::new(false)),
             probe_sem:      Arc::new((Mutex::new(0), Condvar::new())),
             encode_cancels: Arc::new(Mutex::new(HashMap::new())),

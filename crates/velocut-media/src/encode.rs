@@ -61,6 +61,8 @@ use ffmpeg::Packet;
 
 use velocut_core::media_types::MediaResult;
 use velocut_core::transitions::{ClipTransition, TransitionType};
+use crate::helpers::yuv::{extract_yuv, blend_yuv_frame, write_yuv};
+use crate::helpers::seek::seek_to_secs;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -589,14 +591,14 @@ fn encode_clip(
         if w > 0 && h > 0 { (w, h) } else { (video_decoder.width(), video_decoder.height()) }
     };
 
-    // ── Seek to source_offset ─────────────────────────────────────────────────
     // Skip the seek when source_offset is zero — the demuxer starts at the
     // beginning of the file automatically, and avformat_seek_file(max_ts=0)
     // returns EPERM on Windows when called on a freshly-opened context.
-    if clip.source_offset > 0.0 {
-        let seek_ts = (clip.source_offset * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-        ictx.seek(seek_ts, seek_ts..)
-            .map_err(|e| format!("seek in '{}': {e}", clip.path.display()))?;
+    // seek_to_secs handles the 0.0 guard and Windows soft-fail internally.
+    // encode_clip treats seek failure as a hard error since a missed seek on
+    // a trimmed clip would produce incorrect output frames.
+    if clip.source_offset > 0.0 && !seek_to_secs(&mut ictx, clip.source_offset, "encode_clip") {
+        return Err(format!("seek failed in '{}' at {:.3}s", clip.path.display(), clip.source_offset));
     }
 
     // ── Format converters (deferred until first frame of each type) ───────────
@@ -844,15 +846,9 @@ fn decode_clip_frames(
     let mut video_decoder = vdec_ctx.decoder().video()
         .map_err(|e| format!("crossfade open video decoder: {e}"))?;
 
-    if clip.source_offset > 0.0 {
-        let seek_ts = (clip.source_offset * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-        // Seek failure is treated as a soft error on Windows (EPERM from avformat).
-        // The frame-level PTS check below (`pts_secs < clip.source_offset`) will
-        // skip pre-roll frames correctly even without the seek — just slightly slower.
-        if let Err(e) = ictx.seek(seek_ts, seek_ts..) {
-            eprintln!("[crossfade] seek soft-fail in '{}': {e} — decoding from start", clip.path.display());
-        }
-    }
+    // decode_clip_frames treats seek failure as soft — PTS filtering below
+    // will skip pre-roll frames if the seek didn't land accurately.
+    seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
 
     let mut video_scaler: Option<ScaleCtx> = None;
     let clip_end   = clip.source_offset + clip.duration;
@@ -863,38 +859,6 @@ fn decode_clip_frames(
     let uv_h = h / 2;
 
     let mut frames: Vec<Vec<u8>> = Vec::new();
-
-    /// Extract packed YUV420P bytes from a scaled VideoFrame, removing strides.
-    fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usize) -> Vec<u8> {
-        let mut raw = vec![0u8; w * h + uv_w * uv_h * 2];
-
-        let y_stride = yuv.stride(0);
-        let y_src = yuv.data(0);
-        for row in 0..h {
-            raw[row * w .. row * w + w]
-                .copy_from_slice(&y_src[row * y_stride .. row * y_stride + w]);
-        }
-
-        let u_offset = w * h;
-        let u_stride = yuv.stride(1);
-        let u_src = yuv.data(1);
-        for row in 0..uv_h {
-            let dst = u_offset + row * uv_w;
-            raw[dst .. dst + uv_w]
-                .copy_from_slice(&u_src[row * u_stride .. row * u_stride + uv_w]);
-        }
-
-        let v_offset = u_offset + uv_w * uv_h;
-        let v_stride = yuv.stride(2);
-        let v_src = yuv.data(2);
-        for row in 0..uv_h {
-            let dst = v_offset + row * uv_w;
-            raw[dst .. dst + uv_w]
-                .copy_from_slice(&v_src[row * v_stride .. row * v_stride + uv_w]);
-        }
-
-        raw
-    }
 
     'packet_loop: for result in ictx.packets() {
         let (stream, packet) = result
@@ -948,18 +912,6 @@ fn decode_clip_frames(
     }
 
     Ok(frames)
-}
-
-/// Linear blend of two packed YUV420P frames.
-///
-/// `alpha` = 0.0 → 100% frame_a;  `alpha` = 1.0 → 100% frame_b.
-/// The blend is performed on raw byte values which is a linear approximation
-/// in gamma-encoded space — visually correct for typical crossfades.
-fn blend_yuv_frame(frame_a: &[u8], frame_b: &[u8], alpha: f32) -> Vec<u8> {
-    let inv = 1.0 - alpha;
-    frame_a.iter().zip(frame_b.iter())
-        .map(|(&a, &b)| (inv * a as f32 + alpha * b as f32).round() as u8)
-        .collect()
 }
 
 /// Encode the crossfade blend between `tail_spec` (end of clip A) and
@@ -1018,38 +970,7 @@ fn apply_crossfade(
                 ffmpeg::ffi::AVRational { num: 1, den: 1 };
         }
 
-        // Copy Y plane (de-strided).
-        {
-            let y_stride = yuv.stride(0);
-            let y_dst = yuv.data_mut(0);
-            for row in 0..h {
-                let src = row * w;
-                let dst = row * y_stride;
-                y_dst[dst .. dst + w].copy_from_slice(&blended[src .. src + w]);
-            }
-        }
-        // Copy U plane.
-        {
-            let u_stride = yuv.stride(1);
-            let u_offset = w * h;
-            let u_dst = yuv.data_mut(1);
-            for row in 0..uv_h {
-                let src = u_offset + row * uv_w;
-                let dst = row * u_stride;
-                u_dst[dst .. dst + uv_w].copy_from_slice(&blended[src .. src + uv_w]);
-            }
-        }
-        // Copy V plane.
-        {
-            let v_stride = yuv.stride(2);
-            let v_offset = w * h + uv_w * uv_h;
-            let v_dst = yuv.data_mut(2);
-            for row in 0..uv_h {
-                let src = v_offset + row * uv_w;
-                let dst = row * v_stride;
-                v_dst[dst .. dst + uv_w].copy_from_slice(&blended[src .. src + uv_w]);
-            }
-        }
+        write_yuv(&blended, &mut yuv, w, h, uv_w, uv_h);
 
         video_encoder.send_frame(&yuv)
             .map_err(|e| format!("crossfade encode frame: {e}"))?;

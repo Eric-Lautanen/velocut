@@ -33,6 +33,13 @@ pub struct LiveDecoder {
     /// Used to burn through the GOP after a keyframe-aligned seek without blocking
     /// the thread on advance_to() — which scales every skipped frame needlessly.
     pub skip_until_pts: i64,
+
+    /// [Opt 1] Reusable RGBA output buffer — avoids a heap allocation per frame.
+    /// Capacity is pre-sized to out_w * out_h * 4 at construction and maintained
+    /// across calls. Each call: clear() + extend_from_slice per row (bulk memcpy),
+    /// then clone() once to hand off to the caller.  Saves the flat_map().collect()
+    /// iterator overhead and guarantees no mid-frame realloc.
+    frame_buf: Vec<u8>,
 }
 
 impl LiveDecoder {
@@ -82,6 +89,8 @@ impl LiveDecoder {
             // the check is tpts > last_pts (strictly greater).
             last_pts: seek_ts.saturating_sub(1), tb_num, tb_den, out_w, out_h, scaler,
             skip_until_pts: 0,
+            // [Opt 1] Pre-allocate frame buffer at the exact output size.
+            frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
         })
     }
 
@@ -99,6 +108,11 @@ impl LiveDecoder {
     /// but not scaled — decode-only is ~4x faster than decode+scale+alloc, so this
     /// burns through a GOP in ~50 ms instead of ~200 ms.  Once the threshold is
     /// reached the field is cleared and normal decode+scale resumes.
+    ///
+    /// [Opt 1] RGBA output is assembled via extend_from_slice (bulk memcpy per row)
+    /// into a reused self.frame_buf, then cloned once for the return value.  This
+    /// avoids the flat_map().collect() iterator overhead and the implicit Vec growth
+    /// that could occur when the size_hint is imprecise.
     pub fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
@@ -116,24 +130,27 @@ impl LiveDecoder {
                 let ts_secs = self.pts_to_secs(pts);
                 let mut out = ffmpeg::util::frame::video::Video::empty();
                 if self.scaler.run(&decoded, &mut out).is_err() { return None; }
-                let stride = out.stride(0);
-                let raw    = out.data(0);
-                let data: Vec<u8> = (0..self.out_h as usize)
-                    .flat_map(|row| {
-                        let s = row * stride;
-                        &raw[s..s + self.out_w as usize * 4]
-                    })
-                    .copied()
-                    .collect();
+                let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
                 return Some((data, self.out_w, self.out_h, ts_secs));
             }
         }
         None
     }
 
-    /// Read forward until we find a frame at or past `target_pts`. Returns RGBA pixels.
+    /// [Opt 2] Read forward until we find a frame at or past `target_pts`.
+    ///
+    /// Pre-target frames are now decoded-only (no swscale, no alloc) — identical to
+    /// the burn_to_pts fast-path.  The scaler runs exactly once on the frame that
+    /// meets or exceeds target_pts.  For a 5 s GOP at 60 fps that's ~300 frames
+    /// decoded without scaling instead of the original 300 × (decode + swscale + alloc).
+    ///
+    /// Behaviour change vs original: if the stream reaches EOF before target_pts is
+    /// found, None is returned (the caller keeps the last displayed frame).  The
+    /// original returned the last *scaled* frame on EOF, but that path triggered a
+    /// scaler alloc for every pre-target frame.  The EOF case (scrub past clip end)
+    /// is benign — the scrub thread's needs_reset logic handles re-open on the next
+    /// request.
     pub fn advance_to(&mut self, target_pts: i64) -> Option<(Vec<u8>, u32, u32)> {
-        let mut last_good: Option<Vec<u8>> = None;
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
             if self.decoder.send_packet(&packet).is_err() { continue; }
@@ -141,25 +158,18 @@ impl LiveDecoder {
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
-                let mut out = ffmpeg::util::frame::video::Video::empty();
-                if self.scaler.run(&decoded, &mut out).is_err() {
-                    return last_good.map(|d| (d, self.out_w, self.out_h));
-                }
-                let stride = out.stride(0);
-                let raw    = out.data(0);
-                let data: Vec<u8> = (0..self.out_h as usize)
-                    .flat_map(|row| {
-                        let s = row * stride;
-                        &raw[s..s + self.out_w as usize * 4]
-                    })
-                    .copied()
-                    .collect();
-                last_good = Some(data.clone());
+                // [Opt 2] Decode-only for all frames before the target PTS.
+                // ~4x faster than decode+scale+alloc for the same set of frames.
                 if pts < target_pts { continue; }
+                // Target reached — scale exactly this one frame and return.
+                let mut out = ffmpeg::util::frame::video::Video::empty();
+                if self.scaler.run(&decoded, &mut out).is_err() { return None; }
+                let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
                 return Some((data, self.out_w, self.out_h));
             }
         }
-        last_good.map(|d| (d, self.out_w, self.out_h))
+        // EOF before target_pts: return None. Caller retains its current frame.
+        None
     }
 
     /// Decode and discard frames without scaling until `last_pts >= target_pts`.
@@ -184,6 +194,39 @@ impl LiveDecoder {
             }
         }
     }
+}
+
+// ── Frame copy helper ─────────────────────────────────────────────────────────
+
+/// [Opt 1] Copy an RGBA-format ffmpeg VideoFrame into `buf`, stripping stride
+/// padding, and return a clone of the filled buffer.
+///
+/// `buf` is reused across calls — it is only reallocated when `out_w * out_h * 4`
+/// exceeds its current capacity (i.e. never in steady state for a fixed-resolution
+/// source).  The returned Vec is a single allocation of the exact frame size.
+#[inline]
+fn copy_frame_rgba(
+    buf:   &mut Vec<u8>,
+    frame: &ffmpeg::util::frame::video::Video,
+    out_w: u32,
+    out_h: u32,
+) -> Vec<u8> {
+    let stride    = frame.stride(0);
+    let raw       = frame.data(0);
+    let row_bytes = out_w as usize * 4;
+    let needed    = row_bytes * out_h as usize;
+
+    buf.clear();
+    // Reserve only triggers a realloc when dimensions change (e.g. first frame,
+    // or aspect ratio change mid-session).
+    if buf.capacity() < needed {
+        buf.reserve(needed);
+    }
+    for row in 0..out_h as usize {
+        let s = row * stride;
+        buf.extend_from_slice(&raw[s..s + row_bytes]);
+    }
+    buf.clone()
 }
 
 // ── One-shot frame decode (preview + PNG save) ────────────────────────────────

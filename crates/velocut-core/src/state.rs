@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
-use crate::transitions::ClipTransition;
+use crate::transitions::TimelineTransition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AspectRatio {
@@ -70,15 +70,10 @@ pub struct ProjectState {
     #[serde(default)]
     pub muted:                  bool,
     /// Transitions between adjacent timeline clips.
-    /// Empty by default — a missing entry between two clips means Cut.
+    /// Per-boundary transitions stored by clip UUID so they survive reordering.
+    /// Keyed by the TimelineClip ID that comes BEFORE the transition.
     #[serde(default)]
-    pub transitions: Vec<ClipTransition>,
-    /// Crossfade duration in seconds applied between all adjacent clips on export.
-    /// 0.0 = hard cut. Set by ExportModule slider, fanned out into transitions
-    /// vec in begin_render. Stored per-project so the setting survives reloads.
-    #[serde(default)]
-    pub crossfade_duration_secs: f32,
-    #[serde(skip)]
+    pub transitions: Vec<TimelineTransition>,
     pub pending_probes:         Vec<(Uuid, PathBuf)>,
     /// (clip_id, source_path, timestamp, dest_path)
     #[serde(skip)]
@@ -127,7 +122,6 @@ impl Default for ProjectState {
             volume:                 1.0,
             muted:                  false,
             transitions:            Vec::new(),
-            crossfade_duration_secs: 0.0,
             pending_probes:         Vec::new(),
             pending_extracts:       Vec::new(),
             pending_audio_cleanup:  Vec::new(),

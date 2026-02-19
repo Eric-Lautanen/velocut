@@ -2,6 +2,7 @@
 use super::EditorModule;
 use velocut_core::state::{ProjectState, AspectRatio};
 use velocut_core::commands::EditorCommand;
+use velocut_core::helpers::time::format_time;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER};
 use egui::{Ui, Color32, Sense, Rect, Pos2, Stroke, RichText, Vec2};
@@ -271,14 +272,10 @@ impl EditorModule for PreviewModule {
             x += SEP;
 
             // ── Timecode ──────────────────────────────────────────────────
-            let t      = state.current_time;
-            let mins   = (t / 60.0) as u32;
-            let secs   = (t % 60.0) as u32;
-            let frames = ((t * 30.0) as u32) % 30;
             painter.text(
                 Pos2::new(x, cy),
                 egui::Align2::LEFT_CENTER,
-                format!("{mins:02}:{secs:02}:{frames:02}"),
+                format_time(state.current_time),
                 egui::FontId::monospace(12.0),
                 ACCENT);
             x += 66.0 + SEP;
