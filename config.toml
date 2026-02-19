@@ -2,6 +2,8 @@
 rustflags = [
   "-L", "/mingw64/lib",
 
+  "-Wl,--start-group",
+
   # --- Video codecs ---
   "-lvpx",
   "-ldav1d",
@@ -71,10 +73,12 @@ rustflags = [
   "-lbz2",
   "-llzma",
 
-  # --- Text / locale ---
-  "-lxml2",
+  # --- XML / charset ---
+  "-lstatic=xml2",
   "-liconv",
   "-lintl",
+
+  "-Wl,--end-group",
 
   # --- Windows system libs ---
   "-lstatic=winpthread",
@@ -104,5 +108,5 @@ rustflags = [
   # --- Compiler runtime (must be last) ---
   "-l:libgcc.a",
   "-l:libstdc++.a",
-  "-lonevpl"
+  "-lvpl"
 ]

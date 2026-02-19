@@ -1441,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-the-third"
 version = "4.0.0+ffmpeg-8.0"
-source = "git+https://github.com/eric-lautanen/velocut-ffmpeg-the-third.git?branch=master#2ef85fa629f38355967ae3266aeb0cebd30abef8"
+source = "git+https://github.com/eric-lautanen/velocut-ffmpeg-the-third.git?branch=master#0989bea0f09097d787a438263bb946ebb26661c9"
 dependencies = [
  "bindgen 0.69.5",
  "cc",
@@ -1454,7 +1454,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-the-third"
 version = "4.0.1+ffmpeg-8.0"
-source = "git+https://github.com/eric-lautanen/velocut-ffmpeg-the-third.git?branch=master#2ef85fa629f38355967ae3266aeb0cebd30abef8"
+source = "git+https://github.com/eric-lautanen/velocut-ffmpeg-the-third.git?branch=master#0989bea0f09097d787a438263bb946ebb26661c9"
 dependencies = [
  "bitflags 2.11.0",
  "ffmpeg-sys-the-third",
