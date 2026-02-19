@@ -19,7 +19,6 @@ serde_json        = { workspace = true }
 uuid              = { workspace = true }
 rfd               = { workspace = true }
 tempfile          = { workspace = true }
-ffmpeg-sidecar    = { workspace = true }
 ffmpeg-the-third  = { workspace = true }
 anyhow            = { workspace = true }
 crossbeam-channel = { workspace = true }

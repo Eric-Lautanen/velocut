@@ -22,8 +22,7 @@ serde_json        = "1.0"
 uuid              = { version = "1.10", features = ["v4", "serde"] }
 rfd               = "0.14"
 tempfile          = "3.10"
-ffmpeg-sidecar    = "2.0"
-ffmpeg-the-third  = "4"
+ffmpeg-the-third = { git = "https://github.com/eric-lautanen/velocut-ffmpeg-the-third.git", branch = "master", features = ["static"] }
 anyhow            = "1.0"
 crossbeam-channel = "0.5"
 parking_lot       = "0.12"

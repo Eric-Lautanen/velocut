@@ -46,6 +46,7 @@ use crossbeam_channel::Sender;
 use uuid::Uuid;
 
 use ffmpeg_the_third as ffmpeg;
+use ffmpeg::packet::Mut as PacketMut;
 use ffmpeg::codec::{self, Id as CodecId};
 use ffmpeg::encoder;
 use ffmpeg::format::{Pixel, Sample, input as open_input, output as open_output};
@@ -231,6 +232,15 @@ impl AudioEncState {
         octx:  &mut ffmpeg::format::context::Output,
         flush: bool,
     ) -> Result<(), String> {
+        // Warn if the FIFO is growing unusually deep — indicates audio is outrunning
+        // video consumption (e.g. audio packets pushing well past clip_end).
+        if !flush && self.fifo.len() > 2 * self.frame_size {
+            eprintln!(
+                "[encode] audio FIFO overrun: {} samples buffered (threshold={}); \
+                 audio may be running ahead of video",
+                self.fifo.len(), 2 * self.frame_size
+            );
+        }
         while self.fifo.len() >= self.frame_size
             || (flush && self.fifo.len() > 0)
         {
@@ -395,6 +405,10 @@ fn run_encode(
 
     // ── Per-clip encode loop ──────────────────────────────────────────────────
     let mut output_frame_idx: i64 = 0;
+    // Shared DTS monotonicity guard — persists across all encode_clip calls and
+    // into the final encoder flush so B-frame reorder packets are clamped
+    // consistently even at clip boundaries and at the very end.
+    let mut last_video_dts: i64 = i64::MIN;
     // How many seconds to skip at the START of the next clip (set when an
     // outgoing crossfade blends the incoming clip's head, so encode_clip
     // doesn't re-encode those frames).
@@ -443,6 +457,7 @@ fn run_encode(
             frame_tb,
             &cancel,
             tx,
+            &mut last_video_dts,
         )?;
 
         // ── Transition hook ───────────────────────────────────────────────────
@@ -494,8 +509,65 @@ fn run_encode(
     while video_encoder.receive_packet(&mut pkt).is_ok() {
         pkt.set_stream(0);
         pkt.rescale_ts(frame_tb, ost_video_tb);
+        let raw_dts = pkt.dts().unwrap_or(0);
+        let raw_pts = pkt.pts().unwrap_or(raw_dts);
+        let dts_s   = raw_dts as f64 * f64::from(ost_video_tb);
+        let pts_s   = raw_pts as f64 * f64::from(ost_video_tb);
+        eprintln!("[encode] encoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+        if last_video_dts != i64::MIN {
+            let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
+            if dts_s < prev_s || dts_s - prev_s > 0.1 {
+                let clamped = raw_pts - 1;
+                eprintln!(
+                    "[encode] encoder-flush DTS jump ({prev_s:.4}s → {dts_s:.4}s); \
+                     clamping DTS {raw_dts} → {clamped}"
+                );
+                unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+            }
+        }
+        last_video_dts = pkt.dts().unwrap_or(raw_dts);
         pkt.write_interleaved(&mut octx)
             .map_err(|e| format!("write flush video packet: {e}"))?;
+        // Track the highest PTS seen so output_frame_idx reflects the true
+        // video duration including all B-frame lookahead frames.  The audio
+        // trim below uses this value, so it must be updated here.
+        output_frame_idx = output_frame_idx.max(raw_pts + 1);
+    }
+
+    // ── Trim audio to video boundary ──────────────────────────────────────────
+    // The demuxer loop in encode_clip continues reading audio packets until
+    // file EOF — not until clip_end.  On the last clip this pushes potentially
+    // 1–2 s of extra PCM into the FIFO that has no corresponding video frames.
+    // drain_fifo(flush=true) below would write all of it, making the audio
+    // stream longer than the video stream.  Container duration = max(audio,
+    // video), so the player waits for video that never arrives → tail freeze.
+    //
+    // Trim the FIFO right now so that (out_sample_idx + fifo.len) does not
+    // exceed the exact sample count that matches the last video frame.
+    {
+        let target_audio_samples =
+            output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+        let total_audio =
+            audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+        let excess = (total_audio - target_audio_samples).max(0) as usize;
+        if excess > 0 {
+            eprintln!(
+                "[encode] trimming {} trailing audio samples ({:.3}s) — \
+                 audio ran past video end ({:.3}s)",
+                excess,
+                excess as f64 / AUDIO_RATE as f64,
+                output_frame_idx as f64 / spec.fps as f64,
+            );
+            let new_len = audio_state.fifo.left.len().saturating_sub(excess);
+            audio_state.fifo.left.truncate(new_len);
+            audio_state.fifo.right.truncate(new_len);
+        } else {
+            eprintln!(
+                "[encode] audio/video end aligned: video={:.3}s audio={:.3}s",
+                output_frame_idx as f64 / spec.fps as f64,
+                total_audio as f64 / AUDIO_RATE as f64,
+            );
+        }
     }
 
     // ── Flush audio FIFO then encoder ─────────────────────────────────────────
@@ -519,16 +591,17 @@ fn run_encode(
 ///
 /// Returns the next unused `out_frame_idx`.
 fn encode_clip(
-    clip:              &ClipSpec,
-    spec:              &EncodeSpec,
-    octx:              &mut ffmpeg::format::context::Output,
-    video_encoder:     &mut ffmpeg::encoder::video::Video,
-    audio_state:       &mut AudioEncState,
-    mut out_frame_idx: i64,
-    total_frames:      u64,
-    frame_tb:          Rational,
-    cancel:            &Arc<AtomicBool>,
-    tx:                &Sender<MediaResult>,
+    clip:               &ClipSpec,
+    spec:               &EncodeSpec,
+    octx:               &mut ffmpeg::format::context::Output,
+    video_encoder:      &mut ffmpeg::encoder::video::Video,
+    audio_state:        &mut AudioEncState,
+    mut out_frame_idx:  i64,
+    total_frames:       u64,
+    frame_tb:           Rational,
+    cancel:             &Arc<AtomicBool>,
+    tx:                 &Sender<MediaResult>,
+    last_video_dts:     &mut i64,
 ) -> Result<i64, String> {
     // ── Open input ────────────────────────────────────────────────────────────
     let mut ictx = open_input(&clip.path)
@@ -611,7 +684,29 @@ fn encode_clip(
 
     // ── Packet loop ───────────────────────────────────────────────────────────
     // packets() yields Result<(Stream, Packet), Error> — always destructure with ?.
-    'packet_loop: for result in ictx.packets() {
+    //
+    // IMPORTANT: we do NOT break the demuxer loop the moment a decoded frame
+    // hits clip_end.  H.264 B-frames are delivered in display (PTS) order, which
+    // differs from decode (DTS) order.  When the first frame with pts >= clip_end
+    // emerges from the decoder, its reorder buffer may still hold earlier-PTS
+    // B-frames that are waiting for a later reference packet.  Breaking the
+    // demuxer loop here deprives those frames of their reference data;
+    // send_eof then forces them out incomplete and libavcodec drops them —
+    // causing the last ~0.5-1 s of each clip to be missing, which manifests
+    // as a freeze at clip boundaries and at the very end of the export.
+    //
+    // Fix: `video_clip_done` stops *encoding* output once we've seen a frame
+    // at/past clip_end, but the demuxer loop continues so all in-flight
+    // B-frames can receive their reference packets.  The decoder is flushed
+    // properly by the send_eof block below.  Audio packets continue to drive
+    // the FIFO normally regardless of video_clip_done.
+    let mut video_clip_done = false;
+    // DTS monotonicity guard — passed in from run_encode so it persists across
+    // clips and into the final encoder flush.
+    // first_pts_logged is still local since it resets per clip.
+    let mut first_pts_logged = false;
+
+    for result in ictx.packets() {
         let (stream, packet) = result
             .map_err(|e| format!("read packet from '{}': {e}", clip.path.display()))?;
 
@@ -623,6 +718,12 @@ fn encode_clip(
 
         // ── Video packet ──────────────────────────────────────────────────────
         if sidx == video_stream_idx {
+            // Once video_clip_done is set we've already seen a frame past
+            // clip_end, meaning all in-window frames have their reference
+            // packets.  Skip feeding the decoder further to avoid unnecessary
+            // work — the send_eof flush below will drain anything remaining.
+            if video_clip_done { continue; }
+
             video_decoder.send_packet(&packet)
                 .map_err(|e| format!("send video packet to decoder: {e}"))?;
 
@@ -635,8 +736,24 @@ fn encode_clip(
                 // Skip pre-roll frames before the clip's trim in-point.
                 if frame_pts_secs < clip.source_offset - half_frame { continue; }
 
-                // Stop once we've passed the clip's out-point.
-                if frame_pts_secs >= clip_end { break 'packet_loop; }
+                // Log the first frame that passes the seek/pre-roll filter so we
+                // can verify the seek landed accurately.
+                if !first_pts_logged {
+                    eprintln!(
+                        "[encode] first decoded PTS after seek: {frame_pts_secs:.4}s \
+                         (expected source_offset={:.4}s, file='{}')",
+                        clip.source_offset, clip.path.display()
+                    );
+                    first_pts_logged = true;
+                }
+
+                // Past the out-point: stop encoding output and stop feeding
+                // the decoder, but do NOT break the demuxer loop so audio
+                // packets can still reach the FIFO.
+                if frame_pts_secs >= clip_end {
+                    video_clip_done = true;
+                    continue;
+                }
 
                 // Initialise scaler on the first valid frame so we know the
                 // actual input format. Use the pre-computed display dimensions
@@ -670,6 +787,31 @@ fn encode_clip(
                 while video_encoder.receive_packet(&mut pkt).is_ok() {
                     pkt.set_stream(0);
                     pkt.rescale_ts(frame_tb, ost_tb);
+
+                    // ── DTS jump guard ────────────────────────────────────────
+                    let raw_dts = pkt.dts().unwrap_or(0);
+                    let raw_pts = pkt.pts().unwrap_or(raw_dts);
+                    let dts_s   = raw_dts as f64 * f64::from(ost_tb);
+                    let pts_s   = raw_pts as f64 * f64::from(ost_tb);
+                    eprintln!("[encode] video pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+
+                    if *last_video_dts != i64::MIN {
+                        let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                        if dts_s < prev_s || dts_s - prev_s > 0.1 {
+                            // Non-monotonic or unreasonably large DTS jump —
+                            // clamp to PTS-1 so the muxer's interleaver accepts it.
+                            let clamped = raw_pts - 1;
+                            eprintln!(
+                                "[encode] DTS jump detected ({prev_s:.4}s → {dts_s:.4}s); \
+                                 clamping DTS {raw_dts} → {clamped}"
+                            );
+                            unsafe {
+                                (*pkt.as_mut_ptr()).dts = clamped;
+                            }
+                        }
+                    }
+                    *last_video_dts = pkt.dts().unwrap_or(raw_dts);
+
                     pkt.write_interleaved(octx)
                         .map_err(|e| format!("write video packet: {e}"))?;
                 }
@@ -750,8 +892,15 @@ fn encode_clip(
     }
 
     // ── Drain video decoder at clip end ───────────────────────────────────────
-    // Some codecs (e.g. H.264 with B-frames) hold frames internally; flush them.
-    let _ = video_decoder.send_eof();
+    // After the demuxer loop the decoder may still hold B-frames in its reorder
+    // buffer (frames whose reference packets arrived but which haven't been
+    // output yet).  send_eof flushes them.  Because the demuxer loop above
+    // continued past clip_end (via the video_clip_done flag) all reference
+    // packets were delivered, so these flushed frames are complete.
+    // Frames with pts >= clip_end are discarded here — they belong to a future
+    // GOP and must not pollute the output timeline.
+    video_decoder.send_eof()
+        .map_err(|e| format!("send EOF to video decoder '{}': {e}", clip.path.display()))?;
     let mut decoded = VideoFrame::empty();
     while video_decoder.receive_frame(&mut decoded).is_ok() {
         let pts_secs = decoded.pts()
@@ -767,15 +916,37 @@ fn encode_clip(
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
-                if video_encoder.send_frame(&yuv).is_ok() {
-                    let mut pkt = Packet::empty();
-                    while video_encoder.receive_packet(&mut pkt).is_ok() {
-                        pkt.set_stream(0);
-                        pkt.rescale_ts(frame_tb, ost_tb);
-                        let _ = pkt.write_interleaved(octx);
+                video_encoder.send_frame(&yuv)
+                    .map_err(|e| format!("send decoder-flush frame to encoder: {e}"))?;
+                let mut pkt = Packet::empty();
+                let mut frame_written = false;
+                while video_encoder.receive_packet(&mut pkt).is_ok() {
+                    pkt.set_stream(0);
+                    pkt.rescale_ts(frame_tb, ost_tb);
+                    let raw_dts = pkt.dts().unwrap_or(0);
+                    let raw_pts = pkt.pts().unwrap_or(raw_dts);
+                    let dts_s   = raw_dts as f64 * f64::from(ost_tb);
+                    let pts_s   = raw_pts as f64 * f64::from(ost_tb);
+                    eprintln!("[encode] decoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+                    if *last_video_dts != i64::MIN {
+                        let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                        if dts_s < prev_s || dts_s - prev_s > 0.1 {
+                            let clamped = raw_pts - 1;
+                            eprintln!(
+                                "[encode] decoder-flush DTS jump ({prev_s:.4}s → {dts_s:.4}s); \
+                                 clamping DTS {raw_dts} → {clamped}"
+                            );
+                            unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                        }
                     }
-                    out_frame_idx += 1;
+                    *last_video_dts = pkt.dts().unwrap_or(raw_dts);
+                    match pkt.write_interleaved(octx) {
+                        Ok(()) => { frame_written = true; }
+                        Err(e) => { eprintln!("[encode] decoder-flush write_interleaved FAILED (skipping frame): {e}"); }
+                    }
                 }
+                // Only advance the output timeline if at least one packet landed.
+                if frame_written { out_frame_idx += 1; }
             }
         }
     }
