@@ -13,7 +13,7 @@ rustflags = [
   "-lx264",
   "-lx265",
   "-lxvidcore",
-  "-lvid.stab",
+  "-lvidstab",
 
   # --- Image / container ---
   "-lwebpmux",
@@ -42,6 +42,7 @@ rustflags = [
   # --- Subtitle / graphics / font ---
   "-lass",
   "-lplacebo",
+  "-lshaderc_combined",
   "-lfribidi",
   "-lharfbuzz",
   "-lzimg",
@@ -68,13 +69,11 @@ rustflags = [
   "-lnettle",
   "-lgmp",
 
-  # --- Compression ---
+  # --- Compression / XML ---
   "-lz",
   "-lbz2",
   "-llzma",
-
-  # --- XML / charset ---
-  "-lstatic=xml2",
+  "-l:libxml2.a",
   "-liconv",
   "-lintl",
 
@@ -98,6 +97,7 @@ rustflags = [
   "-lcaca",
   "-lva_win32",
   "-lva",
+  "-lvpl",
   "-luser32",
   "-lgdi32",
   "-lwinmm",
@@ -107,6 +107,5 @@ rustflags = [
 
   # --- Compiler runtime (must be last) ---
   "-l:libgcc.a",
-  "-l:libstdc++.a",
-  "-lvpl"
+  "-l:libstdc++.a"
 ]
