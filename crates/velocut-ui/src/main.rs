@@ -15,7 +15,7 @@ fn main() -> eframe::Result {
         centered: true,
         viewport: egui::ViewportBuilder::default()
             .with_title("⚡ VeloCut")
-            .with_inner_size([1465.0, 925.0])
+            .with_inner_size([1465.0, 965.0])
             .with_min_inner_size([900.0, 600.0])
             .with_decorations(false)
             .with_resizable(true)

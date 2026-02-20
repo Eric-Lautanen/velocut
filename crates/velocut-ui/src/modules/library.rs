@@ -349,7 +349,7 @@ fn status_strip(ui: &mut Ui, state: &ProjectState, multi: &HashSet<Uuid>) {
                         );
                     } else if !multi.is_empty() || state.selected_library_clip.is_some() {
                         ui.label(
-                            RichText::new("⌫ delete  •  ⇧click range  •  ⌃click multi")
+                            RichText::new("🗑️ Delete • ✋ Click range • 👆 Click multi")
                                 .size(8.5)
                                 .color(Color32::from_rgb(72, 72, 88)),
                         );

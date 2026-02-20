@@ -209,7 +209,7 @@ impl EditorModule for ExportModule {
                                 );
                                 format!("⚠ {}s?", secs_left)
                             } else {
-                                "⊘ Reset".into()
+                                "🔄 Reset".into()
                             };
 
                             let (text_color, fill, border) = if in_confirm {
@@ -290,7 +290,7 @@ impl EditorModule for ExportModule {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
-                            RichText::new(format!("✓  Saved: {label}"))
+                            RichText::new(format!("🎉  Saved: {label}"))
                                 .size(11.0)
                                 .color(GREEN_DIM),
                         );
@@ -304,9 +304,9 @@ impl EditorModule for ExportModule {
             // ── Error / cancelled banner ──────────────────────────────────────
             if let Some(msg) = &state.encode_error {
                 let display = if msg == "cancelled" {
-                    "✕ Render cancelled".to_string()
+                    "💥 Render cancelled".to_string()
                 } else {
-                    format!("✕ Error: {msg}")
+                    format!("💥 Error: {msg}")
                 };
                 egui::Frame::new()
                     .fill(Color32::from_rgb(60, 25, 25))
@@ -377,7 +377,7 @@ impl ExportModule {
                 // Cancel button — full width, neutral styling (this is a normal
                 // user action, not an error state).
                 let cancel_btn = egui::Button::new(
-                    RichText::new("◼  Stop Render").size(11.0).color(DARK_TEXT_DIM),
+                    RichText::new("✋  Stop Render").size(11.0).color(DARK_TEXT_DIM),
                 )
                 .stroke(Stroke::new(1.0, DARK_BORDER))
                 .fill(DARK_BG_2)
