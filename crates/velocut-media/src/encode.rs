@@ -76,6 +76,8 @@ pub struct ClipSpec {
     pub source_offset: f64,
     /// Duration in seconds to include from this clip.
     pub duration:      f64,
+    /// Linear gain applied to decoded audio before encoding (1.0 = unity).
+    pub volume:        f32,
 }
 
 /// Complete description of an encode job.
@@ -156,17 +158,22 @@ impl AudioFifo {
     /// The frame must be in FLTP format (float planar); stereo or mono.
     /// Mono frames are duplicated to both output channels.
     fn push(&mut self, frame: &AudioFrame) {
+        self.push_scaled(frame, 1.0);
+    }
+
+    /// Like `push`, but multiplies every sample by `volume` before buffering.
+    /// Volume is a linear gain: 1.0 = unity, 0.0 = silence, 2.0 = +6 dB.
+    fn push_scaled(&mut self, frame: &AudioFrame, volume: f32) {
         let n = frame.samples();
         if n == 0 { return; }
         unsafe {
             let l_bytes = frame.data(0);
             let l_f32 = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
-            self.left.extend_from_slice(l_f32);
+            self.left.extend(l_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
 
-            // For stereo frames use plane 1; mono → duplicate plane 0.
             let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
             let r_f32 = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
-            self.right.extend_from_slice(r_f32);
+            self.right.extend(r_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
         }
     }
 
@@ -444,6 +451,7 @@ fn run_encode(
             path:          clip.path.clone(),
             source_offset: clip.source_offset + skip,
             duration:      (clip.duration - skip - crossfade_secs).max(0.0),
+            volume:        clip.volume,
         };
 
         output_frame_idx = encode_clip(
@@ -469,12 +477,14 @@ fn run_encode(
                 path:          clip.path.clone(),
                 source_offset: effective.source_offset + effective.duration,
                 duration:      crossfade_secs,
+                volume:        clip.volume,
             };
             // Head: first `crossfade_secs` of the next clip.
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
                 source_offset: next_clip.source_offset,
                 duration:      crossfade_secs,
+                volume:        next_clip.volume,
             };
 
             output_frame_idx = apply_crossfade(
@@ -508,6 +518,12 @@ fn run_encode(
     let mut pkt = Packet::empty();
     while video_encoder.receive_packet(&mut pkt).is_ok() {
         pkt.set_stream(0);
+        // Capture PTS in frame_tb units (frame-count) BEFORE rescale_ts.
+        // After rescale_ts the packet PTS is in ost_video_tb units (e.g. 1/12800),
+        // which is orders of magnitude larger than the frame index.  Using the
+        // post-rescale value for output_frame_idx would make target_audio_samples
+        // astronomically large, completely defeating the audio-trim block below.
+        let frame_pts = pkt.pts().unwrap_or(pkt.dts().unwrap_or(0));
         pkt.rescale_ts(frame_tb, ost_video_tb);
         let raw_dts = pkt.dts().unwrap_or(0);
         let raw_pts = pkt.pts().unwrap_or(raw_dts);
@@ -516,11 +532,11 @@ fn run_encode(
         eprintln!("[encode] encoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
         if last_video_dts != i64::MIN {
             let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
-            if dts_s < prev_s || dts_s - prev_s > 0.1 {
-                let clamped = raw_pts - 1;
+            if dts_s < prev_s {
+                let clamped = last_video_dts + 1;
                 eprintln!(
-                    "[encode] encoder-flush DTS jump ({prev_s:.4}s → {dts_s:.4}s); \
-                     clamping DTS {raw_dts} → {clamped}"
+                    "[encode] encoder-flush non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
+                     clamping {raw_dts} → {clamped}"
                 );
                 unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
             }
@@ -531,7 +547,9 @@ fn run_encode(
         // Track the highest PTS seen so output_frame_idx reflects the true
         // video duration including all B-frame lookahead frames.  The audio
         // trim below uses this value, so it must be updated here.
-        output_frame_idx = output_frame_idx.max(raw_pts + 1);
+        // Use frame_pts (pre-rescale, in frame_tb / frame-count units) so
+        // the frame index stays comparable to the fps-based audio calculation.
+        output_frame_idx = output_frame_idx.max(frame_pts + 1);
     }
 
     // ── Trim audio to video boundary ──────────────────────────────────────────
@@ -545,6 +563,15 @@ fn run_encode(
     // Trim the FIFO right now so that (out_sample_idx + fifo.len) does not
     // exceed the exact sample count that matches the last video frame.
     {
+        // Subtract one AAC frame_size from the target.
+        //
+        // After the FIFO trim, drain_fifo(flush=true) zero-pads the remaining
+        // partial frame to exactly frame_size (1024 samples = 23 ms) before
+        // sending it to the encoder.  Without this adjustment the padded tail
+        // always pushes audio end ~23 ms past the last video frame, which some
+        // players render as a 1-2 frame hold.  Trimming one extra frame_size
+        // ensures the final padded AAC frame lands at or just before the last
+        // video frame rather than after it.
         let target_audio_samples =
             output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
         let total_audio =
@@ -700,6 +727,9 @@ fn encode_clip(
     // B-frames can receive their reference packets.  The decoder is flushed
     // properly by the send_eof block below.  Audio packets continue to drive
     // the FIFO normally regardless of video_clip_done.
+    // Capture output frame index at start of this clip for fps-conversion mapping.
+    let clip_start_frame_idx = out_frame_idx;
+
     let mut video_clip_done = false;
     // DTS monotonicity guard — passed in from run_encode so it persists across
     // clips and into the final encoder flush.
@@ -718,14 +748,19 @@ fn encode_clip(
 
         // ── Video packet ──────────────────────────────────────────────────────
         if sidx == video_stream_idx {
-            // Once video_clip_done is set we've already seen a frame past
-            // clip_end, meaning all in-window frames have their reference
-            // packets.  Skip feeding the decoder further to avoid unnecessary
-            // work — the send_eof flush below will drain anything remaining.
-            if video_clip_done { continue; }
-
+            // ALWAYS feed the decoder every packet, even after video_clip_done.
+            // B-frames near clip_end (PTS) may depend on I/P packets that arrive
+            // after clip_end in DTS order.  Stopping send_packet early starves
+            // the decoder of those reference packets and silently drops frames.
             video_decoder.send_packet(&packet)
                 .map_err(|e| format!("send video packet to decoder: {e}"))?;
+
+            if video_clip_done {
+                // Drain decoder output to prevent EAGAIN on next send_packet.
+                let mut _discard = VideoFrame::empty();
+                while video_decoder.receive_frame(&mut _discard).is_ok() {}
+                continue;
+            }
 
             let mut decoded = VideoFrame::empty();
             while video_decoder.receive_frame(&mut decoded).is_ok() {
@@ -770,60 +805,65 @@ fn encode_clip(
                 sc.run(&decoded, &mut yuv)
                     .map_err(|e| format!("scale video frame: {e}"))?;
 
-                yuv.set_pts(Some(out_frame_idx));
-                yuv.set_kind(decoded.kind());
-                // swscale inherits the source SAR onto the output frame; override
-                // to 1:1 so players don't letterbox. No safe setter exists in
-                // ffmpeg-the-third 4 — write the AVFrame field directly.
+                // swscale inherits source SAR; override to 1:1.
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
 
-                video_encoder.send_frame(&yuv)
-                    .map_err(|e| format!("send video frame to encoder: {e}"))?;
+                // ── Frame-rate conversion ─────────────────────────────────────
+                // Map source timestamp to output frame slot.  When source fps <
+                // output fps (e.g. 24→30) a source frame covers multiple output
+                // slots; duplicate it to fill them.  When source fps > output fps,
+                // the slot is already covered; skip.
+                let src_rel_secs = (frame_pts_secs - clip.source_offset).max(0.0);
+                let target_out_pts = clip_start_frame_idx
+                    + (src_rel_secs * spec.fps as f64).round() as i64;
 
-                let mut pkt = Packet::empty();
-                while video_encoder.receive_packet(&mut pkt).is_ok() {
-                    pkt.set_stream(0);
-                    pkt.rescale_ts(frame_tb, ost_tb);
+                if target_out_pts >= out_frame_idx {
+                    loop {
+                        yuv.set_pts(Some(out_frame_idx));
 
-                    // ── DTS jump guard ────────────────────────────────────────
-                    let raw_dts = pkt.dts().unwrap_or(0);
-                    let raw_pts = pkt.pts().unwrap_or(raw_dts);
-                    let dts_s   = raw_dts as f64 * f64::from(ost_tb);
-                    let pts_s   = raw_pts as f64 * f64::from(ost_tb);
-                    eprintln!("[encode] video pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+                        video_encoder.send_frame(&yuv)
+                            .map_err(|e| format!("send video frame to encoder: {e}"))?;
 
-                    if *last_video_dts != i64::MIN {
-                        let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
-                        if dts_s < prev_s || dts_s - prev_s > 0.1 {
-                            // Non-monotonic or unreasonably large DTS jump —
-                            // clamp to PTS-1 so the muxer's interleaver accepts it.
-                            let clamped = raw_pts - 1;
-                            eprintln!(
-                                "[encode] DTS jump detected ({prev_s:.4}s → {dts_s:.4}s); \
-                                 clamping DTS {raw_dts} → {clamped}"
-                            );
-                            unsafe {
-                                (*pkt.as_mut_ptr()).dts = clamped;
+                        let mut pkt = Packet::empty();
+                        while video_encoder.receive_packet(&mut pkt).is_ok() {
+                            pkt.set_stream(0);
+                            pkt.rescale_ts(frame_tb, ost_tb);
+                            let raw_dts = pkt.dts().unwrap_or(0);
+                            let raw_pts = pkt.pts().unwrap_or(raw_dts);
+                            let dts_s   = raw_dts as f64 * f64::from(ost_tb);
+                            let pts_s   = raw_pts as f64 * f64::from(ost_tb);
+                            eprintln!("[encode] video pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+                            if *last_video_dts != i64::MIN {
+                                let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                                if dts_s < prev_s {
+                                    let clamped = *last_video_dts + 1;
+                                    eprintln!(
+                                        "[encode] non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
+                                         clamping {raw_dts} → {clamped}"
+                                    );
+                                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                                }
                             }
+                            *last_video_dts = pkt.dts().unwrap_or(raw_dts);
+                            pkt.write_interleaved(octx)
+                                .map_err(|e| format!("write video packet: {e}"))?;
                         }
+
+                        out_frame_idx += 1;
+
+                        if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+                            let _ = tx.send(MediaResult::EncodeProgress {
+                                job_id:       spec.job_id,
+                                frame:        out_frame_idx as u64,
+                                total_frames,
+                            });
+                        }
+
+                        if out_frame_idx > target_out_pts { break; }
                     }
-                    *last_video_dts = pkt.dts().unwrap_or(raw_dts);
-
-                    pkt.write_interleaved(octx)
-                        .map_err(|e| format!("write video packet: {e}"))?;
-                }
-
-                out_frame_idx += 1;
-
-                if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
-                    let _ = tx.send(MediaResult::EncodeProgress {
-                        job_id:       spec.job_id,
-                        frame:        out_frame_idx as u64,
-                        total_frames,
-                    });
                 }
             }
         }
@@ -845,11 +885,20 @@ fn encode_clip(
                     // audio frames that span the exact trim boundary.
                     if pts_secs < clip.source_offset - 0.05 { continue; }
 
-                    // Audio is NOT cut at clip_end here — the video loop controls
-                    // the break. Letting audio slightly over-run into the FIFO is
-                    // intentional: the carry-over is consumed at the start of the
-                    // next clip (or flushed at the very end), maintaining a
-                    // continuous, gap-free audio timeline.
+                    // Hard-cut audio at clip_end.
+                    //
+                    // drain_fifo() is called eagerly on every decoded audio frame,
+                    // so any audio past clip_end gets encoded and written to the
+                    // output file immediately — before the post-encode trim block
+                    // in run_encode even runs.  For a source file that extends 2 s
+                    // past clip_end (~88 k samples), drain_fifo would write ~86
+                    // full AAC frames that can never be un-written; the trim block
+                    // can only remove the ≤1023 leftover FIFO samples.
+                    //
+                    // A partial encoder frame (≤1023 samples) naturally stays in
+                    // the FIFO and carries over into the next clip — that is the
+                    // only carry-over needed for a seamless audio timeline.
+                    if pts_secs >= clip_end { continue; }
 
                     // Resample to FLTP stereo 44100 if the source differs in any way.
                     // The resampler is created lazily on the first audio frame so we
@@ -877,10 +926,10 @@ fn encode_clip(
 
                         let mut resampled = AudioFrame::empty();
                         if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                            audio_state.fifo.push(&resampled);
+                            audio_state.fifo.push_scaled(&resampled, clip.volume as f32);
                         }
                     } else {
-                        audio_state.fifo.push(&raw);
+                        audio_state.fifo.push_scaled(&raw, clip.volume as f32);
                     }
 
                     // Drain full frames from the FIFO immediately so we don't
@@ -911,42 +960,47 @@ fn encode_clip(
         if let Some(sc) = &mut video_scaler {
             let mut yuv = VideoFrame::empty();
             if sc.run(&decoded, &mut yuv).is_ok() {
-                yuv.set_pts(Some(out_frame_idx));
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
-                video_encoder.send_frame(&yuv)
-                    .map_err(|e| format!("send decoder-flush frame to encoder: {e}"))?;
-                let mut pkt = Packet::empty();
-                let mut frame_written = false;
-                while video_encoder.receive_packet(&mut pkt).is_ok() {
-                    pkt.set_stream(0);
-                    pkt.rescale_ts(frame_tb, ost_tb);
-                    let raw_dts = pkt.dts().unwrap_or(0);
-                    let raw_pts = pkt.pts().unwrap_or(raw_dts);
-                    let dts_s   = raw_dts as f64 * f64::from(ost_tb);
-                    let pts_s   = raw_pts as f64 * f64::from(ost_tb);
-                    eprintln!("[encode] decoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
-                    if *last_video_dts != i64::MIN {
-                        let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
-                        if dts_s < prev_s || dts_s - prev_s > 0.1 {
-                            let clamped = raw_pts - 1;
-                            eprintln!(
-                                "[encode] decoder-flush DTS jump ({prev_s:.4}s → {dts_s:.4}s); \
-                                 clamping DTS {raw_dts} → {clamped}"
-                            );
-                            unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                // Same fps-conversion logic as the main packet loop.
+                let src_rel_secs = (pts_secs - clip.source_offset).max(0.0);
+                let target_out_pts = clip_start_frame_idx
+                    + (src_rel_secs * spec.fps as f64).round() as i64;
+                if target_out_pts >= out_frame_idx {
+                    loop {
+                        yuv.set_pts(Some(out_frame_idx));
+                        video_encoder.send_frame(&yuv)
+                            .map_err(|e| format!("send decoder-flush frame to encoder: {e}"))?;
+                        let mut pkt = Packet::empty();
+                        while video_encoder.receive_packet(&mut pkt).is_ok() {
+                            pkt.set_stream(0);
+                            pkt.rescale_ts(frame_tb, ost_tb);
+                            let raw_dts = pkt.dts().unwrap_or(0);
+                            let raw_pts = pkt.pts().unwrap_or(raw_dts);
+                            let dts_s   = raw_dts as f64 * f64::from(ost_tb);
+                            let pts_s   = raw_pts as f64 * f64::from(ost_tb);
+                            eprintln!("[encode] decoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
+                            if *last_video_dts != i64::MIN {
+                                let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                                if dts_s < prev_s {
+                                    let clamped = *last_video_dts + 1;
+                                    eprintln!(
+                                        "[encode] decoder-flush non-monotonic DTS \
+                                         ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
+                                    );
+                                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                                }
+                            }
+                            *last_video_dts = pkt.dts().unwrap_or(raw_dts);
+                            pkt.write_interleaved(octx)
+                                .map_err(|e| format!("decoder-flush write video packet: {e}"))?;
                         }
-                    }
-                    *last_video_dts = pkt.dts().unwrap_or(raw_dts);
-                    match pkt.write_interleaved(octx) {
-                        Ok(()) => { frame_written = true; }
-                        Err(e) => { eprintln!("[encode] decoder-flush write_interleaved FAILED (skipping frame): {e}"); }
+                        out_frame_idx += 1;
+                        if out_frame_idx > target_out_pts { break; }
                     }
                 }
-                // Only advance the output timeline if at least one packet landed.
-                if frame_written { out_frame_idx += 1; }
             }
         }
     }
@@ -956,6 +1010,13 @@ fn encode_clip(
         let _ = adec.send_eof();
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
+            // Same clip_end ceiling as the packet loop — decoder-buffered frames
+            // can also extend past clip_end if the source file continues.
+            let pts_secs = raw.pts()
+                .map(|pts| pts as f64 * f64::from(in_audio_tb))
+                .unwrap_or(0.0);
+            if pts_secs >= clip_end { break; }
+
             // Same resample path as the packet loop above.
             let target_fmt = Sample::F32(SampleType::Planar);
             let raw_channels = raw.ch_layout().channels();
@@ -967,11 +1028,11 @@ fn encode_clip(
                 if let Some(rs) = &mut audio_resampler {
                     let mut resampled = AudioFrame::empty();
                     if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                        audio_state.fifo.push(&resampled);
+                        audio_state.fifo.push_scaled(&resampled, clip.volume as f32);
                     }
                 }
             } else {
-                audio_state.fifo.push(&raw);
+                audio_state.fifo.push_scaled(&raw, clip.volume as f32);
             }
         }
         audio_state.drain_fifo(octx, false)?;

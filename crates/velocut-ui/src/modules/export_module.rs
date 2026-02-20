@@ -186,6 +186,19 @@ impl EditorModule for ExportModule {
                 let label = path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+                // Auto-dismiss after 5 seconds.
+                let t = ui.input(|i| i.time);
+                ui.memory_mut(|mem| {
+                    let key = egui::Id::new("encode_done_time");
+                    let start = mem.data.get_temp_mut_or_insert_with(key, || t);
+                    if t - *start > 5.0 {
+                        cmd.push(EditorCommand::ClearEncodeStatus);
+                        mem.data.remove::<f64>(key);
+                    }
+                });
+                ui.ctx().request_repaint();
+
                 egui::Frame::new()
                     .fill(Color32::from_rgb(30, 60, 40))
                     .stroke(Stroke::new(1.0, GREEN_DIM))
@@ -194,15 +207,19 @@ impl EditorModule for ExportModule {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
-                            RichText::new(format!("✓ Saved: {label}"))
+                            RichText::new(format!("✓  Saved: {label}"))
                                 .size(11.0)
                                 .color(GREEN_DIM),
                         );
                         if ui.small_button("Dismiss").clicked() {
                             cmd.push(EditorCommand::ClearEncodeStatus);
+                            ui.memory_mut(|mem| mem.data.remove::<f64>(egui::Id::new("encode_done_time")));
                         }
                     });
                 ui.add_space(8.0);
+            } else {
+                // Clear the timer if the banner is gone (e.g. dismissed by other means).
+                ui.memory_mut(|mem| mem.data.remove::<f64>(egui::Id::new("encode_done_time")));
             }
 
             // ── Error / cancelled banner ──────────────────────────────────────
@@ -259,7 +276,7 @@ impl ExportModule {
                 let pct            = (fraction * 100.0) as u32;
 
                 ui.label(
-                    RichText::new(format!("Encoding… {pct}% ({frame} / {total} frames)"))
+                    RichText::new(format!("Rendering  {pct}%  ({frame} / {total} frames)"))
                         .size(11.0)
                         .color(DARK_TEXT_DIM),
                 );
@@ -281,12 +298,13 @@ impl ExportModule {
 
                 ui.add_space(8.0);
 
-                // Cancel button — full width, danger-coloured.
+                // Cancel button — full width, neutral styling (this is a normal
+                // user action, not an error state).
                 let cancel_btn = egui::Button::new(
-                    RichText::new("✕ Cancel").size(11.0).color(RED_DIM),
+                    RichText::new("◼  Stop Render").size(11.0).color(DARK_TEXT_DIM),
                 )
-                .stroke(Stroke::new(1.0, RED_DIM))
-                .fill(Color32::from_rgb(50, 20, 20))
+                .stroke(Stroke::new(1.0, DARK_BORDER))
+                .fill(DARK_BG_2)
                 .min_size(egui::vec2(ui.available_width(), 26.0));
 
                 if ui.add(cancel_btn).clicked() {
@@ -314,12 +332,20 @@ impl ExportModule {
         // ── Filename ──────────────────────────────────────────────────────────
         ui.label(RichText::new("Output Name").size(11.0).color(DARK_TEXT_DIM));
         ui.add_space(2.0);
-        ui.add_enabled(
+        let name_resp = ui.add_enabled(
             !is_encoding,
             egui::TextEdit::singleline(&mut self.filename)
                 .desired_width(f32::INFINITY)
                 .hint_text("filename…"),
         );
+        // Consume Enter so Windows doesn't play the system beep when the user
+        // confirms the field. The TextEdit handles the key internally but
+        // doesn't mark it consumed in egui's event queue.
+        if name_resp.has_focus() {
+            ui.input_mut(|i| i.events.retain(|e| {
+                !matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, .. })
+            }));
+        }
 
         ui.add_space(10.0);
 

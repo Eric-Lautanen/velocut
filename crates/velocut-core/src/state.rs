@@ -53,7 +53,22 @@ pub struct TimelineClip {
     pub duration:      f64,
     pub track_row:     usize,
     pub source_offset: f64,
+    /// Per-clip gain multiplier (0.0–2.0, default 1.0). Applied on top of
+    /// the global volume in audio_module. Serialized so project saves retain gains.
+    #[serde(default = "default_clip_volume")]
+    pub volume:         f32,
+    /// ID of the paired clip created by Extract Audio Track. Set on both the
+    /// muted video clip and the extracted audio clip so they can be found
+    /// relative to each other for display and deletion.
+    #[serde(default)]
+    pub linked_clip_id: Option<Uuid>,
+    /// True when this video clip's audio has been extracted to a separate
+    /// audio track. audio_module skips these clips for audio playback.
+    #[serde(default)]
+    pub audio_muted:    bool,
 }
+
+fn default_clip_volume() -> f32 { 1.0 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectState {
@@ -104,6 +119,16 @@ pub struct ProjectState {
     /// The string "cancelled" is the sentinel for a user-initiated cancel.
     #[serde(skip)]
     pub encode_error:    Option<String>,
+
+    // ── Undo / Redo lengths (runtime-only) ───────────────────────────────────
+    /// Number of snapshots on the undo stack. Written by app.rs::sync_undo_len()
+    /// each time the stacks change. Read by timeline.rs to enable/disable buttons
+    /// without changing the EditorModule trait signature.
+    #[serde(skip)]
+    pub undo_len: usize,
+    /// Number of snapshots on the redo stack.
+    #[serde(skip)]
+    pub redo_len: usize,
 }
 
 fn default_volume() -> f32 { 1.0 }
@@ -131,6 +156,8 @@ impl Default for ProjectState {
             encode_progress:        None,
             encode_done:            None,
             encode_error:           None,
+            undo_len:               0,
+            redo_len:               0,
         }
     }
 }
@@ -195,15 +222,31 @@ impl ProjectState {
     }
 
     /// Place a library clip on the timeline.
+    /// `preferred_row` is the track row the user targeted (from DnD hover y).
+    /// Enforces type safety: video clips land on even rows (V1=0, V2=2),
+    /// audio clips land on odd rows (A1=1, A2=3). The preferred row is
+    /// corrected to the nearest valid row if the user drops on the wrong type.
     /// Snaps to 0 if dropped within 0.5 s of the start.
     /// Snaps to just after the previous clip on the same track if within 1 s gap.
-    pub fn add_to_timeline(&mut self, media_id: Uuid, at_time: f64) {
+    pub fn add_to_timeline(&mut self, media_id: Uuid, at_time: f64, preferred_row: usize) {
         let lib_clip = match self.library.iter().find(|c| c.id == media_id) {
             Some(c) => c.clone(),
             None    => return,
         };
 
-        let row = if lib_clip.clip_type == ClipType::Audio { 1 } else { 0 };
+        // ── Track enforcement ─────────────────────────────────────────────
+        // Video → even rows only (0, 2); Audio → odd rows only (1, 3).
+        let row = match lib_clip.clip_type {
+            ClipType::Video => {
+                let r = if preferred_row % 2 == 0 { preferred_row } else { preferred_row.saturating_sub(1) };
+                r.min(2)
+            }
+            ClipType::Audio => {
+                let r = if preferred_row % 2 == 1 { preferred_row } else { preferred_row + 1 };
+                r.min(3)
+            }
+        };
+
         let duration = lib_clip.duration.max(1.0);
 
         // ── Snapping ───────────────────────────────────────────────────────
@@ -229,11 +272,51 @@ impl ProjectState {
         self.timeline.push(TimelineClip {
             id: Uuid::new_v4(),
             media_id,
-            start_time:    snapped,
+            start_time:     snapped,
             duration,
-            track_row:     row,
-            source_offset: 0.0,
+            track_row:      row,
+            source_offset:  0.0,
+            volume:         1.0,
+            linked_clip_id: None,
+            audio_muted:    false,
         });
+    }
+
+    /// Extracts the audio from a video timeline clip onto the A track directly
+    /// below it. Creates a linked audio clip, mutes the original video clip's
+    /// audio, and returns the new audio clip's UUID.
+    /// Returns None if the clip doesn't exist or isn't a video clip.
+    pub fn extract_audio_track(&mut self, clip_id: Uuid) -> Option<Uuid> {
+        let clip_idx = self.timeline.iter().position(|c| c.id == clip_id)?;
+        let clip = self.timeline[clip_idx].clone();
+
+        // Only makes sense for video clips on a V row.
+        let lib = self.library.iter().find(|l| l.id == clip.media_id)?;
+        if lib.clip_type != ClipType::Video { return None; }
+        if clip.audio_muted { return None; } // already extracted
+
+        // Audio row is always one below the video row: V1(0)→A1(1), V2(2)→A2(3)
+        let audio_row = (clip.track_row + 1).min(3);
+
+        let audio_id = Uuid::new_v4();
+        let audio_clip = TimelineClip {
+            id:             audio_id,
+            media_id:       clip.media_id,
+            start_time:     clip.start_time,
+            duration:       clip.duration,
+            track_row:      audio_row,
+            source_offset:  clip.source_offset,
+            volume:         1.0,
+            linked_clip_id: Some(clip_id),
+            audio_muted:    false,
+        };
+
+        // Mute audio on the video clip and link it to the new audio clip.
+        self.timeline[clip_idx].audio_muted    = true;
+        self.timeline[clip_idx].linked_clip_id = Some(audio_id);
+
+        self.timeline.push(audio_clip);
+        Some(audio_id)
     }
 
     pub fn delete_selected(&mut self) {

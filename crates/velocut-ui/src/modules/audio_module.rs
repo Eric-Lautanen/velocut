@@ -46,13 +46,23 @@ impl AudioModule {
 
         let t = state.current_time;
 
-        // Find active clip — check both track 0 (video with embedded audio)
-        // and track 1 (dedicated audio track).
-        let active_clip = state.timeline.iter().find(|c| {
-            (c.track_row == 0 || c.track_row == 1)
-                && c.start_time <= t
-                && t < c.start_time + c.duration
-        });
+        // Search priority:
+        // 1. Dedicated audio clips on A rows (1, 3) — these are extracted audio tracks.
+        // 2. Video clips on V rows (0, 2) whose audio hasn't been extracted yet.
+        // This ensures that after ExtractAudioTrack, the A-row clip plays and the
+        // muted V-row clip stays silent.
+        let active_clip = state.timeline.iter()
+            .find(|c| {
+                matches!(c.track_row, 1 | 3)
+                    && c.start_time <= t
+                    && t < c.start_time + c.duration
+            })
+            .or_else(|| state.timeline.iter().find(|c| {
+                matches!(c.track_row, 0 | 2)
+                    && !c.audio_muted
+                    && c.start_time <= t
+                    && t < c.start_time + c.duration
+            }));
 
         if let Some(clip) = active_clip {
             if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
@@ -94,7 +104,7 @@ impl AudioModule {
                                         let _ = sink.try_seek(
                                             std::time::Duration::from_secs_f64(seek_t));
                                         sink.set_volume(
-                                            if state.muted { 0.0 } else { state.volume });
+                                            if state.muted { 0.0 } else { state.volume * clip.volume });
                                         sink.play();
                                         eprintln!("[audio] sink created seek_t={seek_t:.3} vol={}", state.volume);
                                         ctx.audio_sinks.insert(clip.id, sink);
@@ -107,7 +117,7 @@ impl AudioModule {
                     } else {
                         // Sync volume/mute without rebuilding the sink.
                         if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                            sink.set_volume(if state.muted { 0.0 } else { state.volume });
+                            sink.set_volume(if state.muted { 0.0 } else { state.volume * clip.volume });
                         }
                     }
                 }

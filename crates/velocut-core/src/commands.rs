@@ -25,13 +25,28 @@ pub enum EditorCommand {
     SelectLibraryClip(Option<Uuid>),
 
     // ── Timeline ─────────────────────────────────────────────────────────────
-    AddToTimeline { media_id: Uuid, at_time: f64 },
+    AddToTimeline { media_id: Uuid, at_time: f64, track_row: usize },
     DeleteTimelineClip(Uuid),
     SelectTimelineClip(Option<Uuid>),
     MoveTimelineClip { id: Uuid, new_start: f64 },
     TrimClipStart  { id: Uuid, new_source_offset: f64, new_duration: f64 },
     TrimClipEnd    { id: Uuid, new_duration: f64 },
     SplitClipAt(f64),
+    /// Extract the audio from a video timeline clip onto the A track below it.
+    /// Mutes audio on the source video clip and creates a linked audio clip.
+    ExtractAudioTrack(Uuid),
+    /// Set per-clip gain (0.0–2.0). Applied multiplicatively with global volume.
+    SetClipVolume { id: Uuid, volume: f32 },
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+    /// Snapshot the current ProjectState onto the undo stack and clear redo.
+    /// Emitted by timeline.rs immediately before any user-visible mutation
+    /// (button click, drag_started). Never emitted during per-frame drag updates.
+    PushUndoSnapshot,
+    /// Restore the most recent undo snapshot.
+    Undo,
+    /// Re-apply the most recently undone snapshot.
+    Redo,
 
     // ── Export ───────────────────────────────────────────────────────────────
     /// Emitted by ExportModule when the user clicks Render. `filename` is the

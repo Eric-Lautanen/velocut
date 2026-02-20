@@ -12,8 +12,9 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("⚡ VeloCut")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1465.0, 925.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_decorations(false),
         ..Default::default()
     };
 

@@ -1,5 +1,5 @@
 // src/app.rs (velocut-ui)
-use velocut_core::state::ProjectState;
+use velocut_core::state::{ProjectState, TimelineClip};
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
@@ -16,6 +16,7 @@ use crate::modules::{
     video_module::VideoModule,
 };
 use eframe::egui;
+use egui_desktop::{TitleBar, TitleBarOptions};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rfd::FileDialog;
@@ -24,6 +25,14 @@ use rfd::FileDialog;
 struct AppStorage {
     project: ProjectState,
 }
+
+// ── Undo / Redo ───────────────────────────────────────────────────────────────
+// Hard cap on undo history depth. Each entry is a full ProjectState clone —
+// dominated by Vec<TimelineClip> and Vec<LibraryClip>. At typical project sizes
+// (< 200 clips) each snapshot is well under 1 MB, so 50 entries ≈ ≤ 50 MB worst
+// case. If memory pressure ever becomes a concern, lower this constant; no other
+// code needs to change.
+const MAX_UNDO_DEPTH: usize = 50;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -41,6 +50,15 @@ pub struct VeloCutApp {
     video:        VideoModule,
     /// Commands emitted by modules each frame, processed after the UI pass
     pending_cmds: Vec<EditorCommand>,
+
+    // ── Undo / Redo stacks ────────────────────────────────────────────────────
+    // Snapshots of ProjectState pushed before any user-visible mutation.
+    // Only serialisable, user-meaningful state is snapshotted (library +
+    // timeline + transitions). Runtime-only fields (encode progress, temp
+    // audio paths, playback position) are restored from the live state after
+    // each undo/redo so they are unaffected by history navigation.
+    undo_stack: Vec<ProjectState>,
+    redo_stack: Vec<ProjectState>,
 }
 
 impl VeloCutApp {
@@ -79,11 +97,90 @@ impl VeloCutApp {
             audio:        AudioModule::new(),
             video:        VideoModule::new(),
             pending_cmds: Vec::new(),
+            undo_stack:   Vec::new(),
+            redo_stack:   Vec::new(),
         }
     }
 
+    // ── Undo / Redo helpers ───────────────────────────────────────────────────
+
+    /// Push the current state onto the undo stack and clear the redo stack.
+    /// Called in response to `EditorCommand::PushUndoSnapshot`. Enforces the
+    /// depth cap by discarding the oldest entry when over limit.
+    fn push_undo_snapshot(&mut self) {
+        if self.undo_stack.len() >= MAX_UNDO_DEPTH {
+            self.undo_stack.remove(0); // drop oldest — O(N) but infrequent
+        }
+        self.undo_stack.push(self.state.clone());
+        self.redo_stack.clear();
+        self.sync_undo_len();
+    }
+
+    /// Restore the most recent undo snapshot. Preserves runtime-only fields
+    /// (encode progress, pending cleanup, playback time) from the live state
+    /// so history navigation never interrupts an ongoing encode or playback.
+    fn apply_undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            let before = self.state.clone();
+            self.redo_stack.push(before);
+            self.restore_snapshot(snapshot);
+        }
+    }
+
+    fn apply_redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            let before = self.state.clone();
+            self.undo_stack.push(before);
+            self.restore_snapshot(snapshot);
+        }
+    }
+
+    /// Replace `self.state` with `snapshot` while keeping runtime-only fields
+    /// from the current live state intact.
+    fn restore_snapshot(&mut self, mut snapshot: ProjectState) {
+        // Preserve runtime-only fields that must not be rewound by undo/redo.
+        snapshot.current_time          = self.state.current_time;
+        snapshot.is_playing            = self.state.is_playing;
+        snapshot.volume                = self.state.volume;
+        snapshot.muted                 = self.state.muted;
+        snapshot.encode_job            = self.state.encode_job;
+        snapshot.encode_progress       = self.state.encode_progress.clone();
+        snapshot.encode_done           = self.state.encode_done.clone();
+        snapshot.encode_error          = self.state.encode_error.clone();
+        // Drain pending queues from live state into the snapshot so they aren't lost.
+        snapshot.pending_probes        = std::mem::take(&mut self.state.pending_probes);
+        snapshot.pending_extracts      = std::mem::take(&mut self.state.pending_extracts);
+        snapshot.pending_audio_cleanup = std::mem::take(&mut self.state.pending_audio_cleanup);
+        snapshot.pending_save_pick     = self.state.pending_save_pick.take();
+        snapshot.save_status           = self.state.save_status.take();
+
+        self.state = snapshot;
+        self.sync_undo_len();
+    }
+
+    /// Write undo/redo stack depths back into ProjectState so the timeline
+    /// module can read them for button enable/disable without needing extra
+    /// parameters threaded through the EditorModule trait.
+    fn sync_undo_len(&mut self) {
+        self.state.undo_len = self.undo_stack.len();
+        self.state.redo_len = self.redo_stack.len();
+    }
+
+    // ── Command processing ────────────────────────────────────────────────────
+
     fn process_command(&mut self, cmd: EditorCommand) {
         match cmd {
+            // ── Undo / Redo ──────────────────────────────────────────────────
+            EditorCommand::PushUndoSnapshot => {
+                self.push_undo_snapshot();
+            }
+            EditorCommand::Undo => {
+                self.apply_undo();
+            }
+            EditorCommand::Redo => {
+                self.apply_redo();
+            }
+
             // ── Playback ─────────────────────────────────────────────────────
             EditorCommand::Play => {
                 let total = self.state.total_duration();
@@ -132,13 +229,32 @@ impl VeloCutApp {
             }
 
             // ── Timeline ─────────────────────────────────────────────────────
-            EditorCommand::AddToTimeline { media_id, at_time } => {
-                self.state.add_to_timeline(media_id, at_time);
+            EditorCommand::AddToTimeline { media_id, at_time, track_row } => {
+                self.state.add_to_timeline(media_id, at_time, track_row);
             }
             EditorCommand::DeleteTimelineClip(id) => {
+                // If this clip is linked to a partner (extract audio pair),
+                // un-mute the partner so it doesn't silently stay muted.
+                if let Some(partner_id) = self.state.timeline.iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.linked_clip_id)
+                {
+                    if let Some(partner) = self.state.timeline.iter_mut().find(|c| c.id == partner_id) {
+                        partner.linked_clip_id = None;
+                        partner.audio_muted    = false;
+                    }
+                }
                 self.state.timeline.retain(|c| c.id != id);
                 if self.state.selected_timeline_clip == Some(id) {
                     self.state.selected_timeline_clip = None;
+                }
+            }
+            EditorCommand::ExtractAudioTrack(clip_id) => {
+                self.state.extract_audio_track(clip_id);
+            }
+            EditorCommand::SetClipVolume { id, volume } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.volume = volume.clamp(0.0, 2.0);
                 }
             }
             EditorCommand::SelectTimelineClip(id) => {
@@ -149,8 +265,39 @@ impl VeloCutApp {
                     tc.start_time = new_start;
                 }
             }
-            EditorCommand::SplitClipAt(_t) => {
-                // TODO: implement split
+            EditorCommand::SplitClipAt(t) => {
+                // Find a clip that contains t with enough room on each side to be
+                // worth splitting (> 2 frames from either edge at 30fps).
+                let min_dur = 2.0 / 30.0;
+                if let Some(clip) = self.state.timeline.iter()
+                    .find(|c| t > c.start_time + min_dur
+                           && t < c.start_time + c.duration - min_dur)
+                    .cloned()
+                {
+                    let split_offset = t - clip.start_time; // seconds into clip
+
+                    // Shorten the original clip to become the first half.
+                    if let Some(c) = self.state.timeline.iter_mut().find(|c| c.id == clip.id) {
+                        c.duration = split_offset;
+                    }
+
+                    // Push the second half as a new clip immediately after.
+                    self.state.timeline.push(TimelineClip {
+                        id:             Uuid::new_v4(),
+                        media_id:       clip.media_id,
+                        start_time:     t,
+                        duration:       clip.duration - split_offset,
+                        source_offset:  clip.source_offset + split_offset,
+                        track_row:      clip.track_row,
+                        volume:         clip.volume,
+                        linked_clip_id: None,
+                        audio_muted:    clip.audio_muted,
+                    });
+                    // Any transition keyed on clip.id (original → its successor)
+                    // remains valid — the badge system renders from clip positions,
+                    // so the badge will now appear between new_clip and the old
+                    // successor. No transition cleanup needed.
+                }
             }
             EditorCommand::TrimClipStart { id, new_source_offset, new_duration } => {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
@@ -278,6 +425,7 @@ impl VeloCutApp {
                         path:          lc.path.clone(),
                         source_offset: tc.source_offset,
                         duration:      tc.duration,
+                        volume:        tc.volume,
                     })
             })
             .collect();
@@ -414,36 +562,35 @@ impl eframe::App for VeloCutApp {
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
 
-        egui::TopBottomPanel::top("top_panel")
-            .exact_height(36.0)
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚡ VeloCut")
-                            .strong().size(15.0).color(crate::theme::ACCENT),
-                    );
-                    ui.separator();
-                    ui.label(egui::RichText::new("Drop video files to import").size(12.0).weak());
-                });
-            });
+        const BOLT_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><polygon points="9,1 4,9 8,9 7,15 12,7 8,7" fill="rgb(255,160,50)"/></svg>"#;
+        TitleBar::new(
+            TitleBarOptions::new()
+                .with_title("VeloCut")
+                .with_background_color(crate::theme::DARK_BG_1)
+                .with_hover_color(crate::theme::DARK_BG_4)
+                .with_close_hover_color(egui::Color32::from_rgb(232, 17, 35))
+                .with_title_color(crate::theme::ACCENT)
+                .with_title_font_size(15.0)
+                .with_app_icon(BOLT_ICON, "bolt.svg"),
+        )
+        .show(ctx);
 
         egui::TopBottomPanel::bottom("timeline_panel")
-            .resizable(true)
-            .min_height(160.0)
-            .default_height(220.0)
+            .resizable(false)
+            .exact_height(340.0)
             .show(ctx, |ui| {
                 self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
         egui::SidePanel::left("library_panel")
             .resizable(true)
-            .default_width(220.0)
-            .min_width(160.0)
+            .min_width(240.0)
+            .default_width(240.0)
             .show(ctx, |ui| {
                 self.library.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
-        egui::SidePanel::right("inspector_panel")
+        egui::SidePanel::right("export_panel")
             .resizable(true)
             .default_width(220.0)
             .min_width(160.0)

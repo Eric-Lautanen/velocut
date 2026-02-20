@@ -27,3 +27,4 @@ ureq              = { workspace = true }
 rodio             = { workspace = true }
 png               = { workspace = true }
 cpal              = { workspace = true }
+egui-desktop      = { workspace = true }
