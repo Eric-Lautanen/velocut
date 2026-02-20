@@ -44,6 +44,21 @@ impl AudioModule {
         }
         ctx.playback.audio_was_playing = true;
 
+        // Evict sinks for clip IDs that no longer exist in the timeline.
+        // This handles undo/redo during active playback: after an undo the clip
+        // that owned the sink may be gone, and its rodio thread would keep
+        // playing phantom audio indefinitely without this guard.
+        let timeline_ids: std::collections::HashSet<uuid::Uuid> =
+            state.timeline.iter().map(|c| c.id).collect();
+        let stale: Vec<uuid::Uuid> = ctx.audio_sinks.keys()
+            .filter(|id| !timeline_ids.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            ctx.audio_sinks.remove(&id);
+            self.exhausted.remove(&id);
+        }
+
         let t = state.current_time;
 
         // Search priority:
@@ -84,10 +99,11 @@ impl AudioModule {
                         }
                     }
 
-                    // Rebuild sink if: missing or a different clip became active.
-                    let needs_sink = !ctx.audio_sinks.contains_key(&clip.id)
-                        || (!ctx.audio_sinks.is_empty()
-                            && !ctx.audio_sinks.contains_key(&clip.id));
+                    // Rebuild sink if this clip has no active sink yet.
+                    // Covers both the fresh-start case (empty map) and the
+                    // clip-change case (map has a different clip's sink, which
+                    // the clear() below will remove before creating the new one).
+                    let needs_sink = !ctx.audio_sinks.contains_key(&clip.id);
 
                     if needs_sink {
                         ctx.audio_sinks.clear();

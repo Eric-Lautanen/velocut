@@ -522,11 +522,14 @@ impl EditorModule for TimelineModule {
                                 if is_selected { ACCENT } else { DARK_BORDER }),
                             egui::StrokeKind::Outside);
 
-                        // Name label
+                        // Name label — capped to half the clip width so it never
+                        // overflows into the duration badge or the right-hand clip.
                         if width > 30.0 {
-                            let label_pos = clip_rect.min + Vec2::new(6.0, 8.0);
-                            painter.text(label_pos, Align2::LEFT_TOP, media_name,
-                                FontId::proportional(11.0),
+                            let label_font = FontId::proportional(11.0);
+                            let label_text = fit_label(media_name, width * 0.5);
+                            let label_pos  = clip_rect.min + Vec2::new(6.0, 8.0);
+                            painter.text(label_pos, Align2::LEFT_TOP, label_text,
+                                label_font,
                                 Color32::from_rgba_unmultiplied(255, 255, 255, 220));
                         }
 
@@ -1017,7 +1020,7 @@ impl EditorModule for TimelineModule {
                 let mut vol_db = vol_to_db(current_vol);
 
                 // Position popup centered above the speaker icon, above the clip.
-                let popup_w  = 54.0_f32;
+                let popup_w  = 64.0_f32;
                 let popup_h  = 150.0_f32;
                 let popup_pos = Pos2::new(
                     anchor.x - popup_w * 0.5,
@@ -1042,20 +1045,29 @@ impl EditorModule for TimelineModule {
                                 color: Color32::from_black_alpha(100),
                             })
                             .show(ui, |ui| {
-                                ui.set_min_width(popup_w - 16.0);
+                                // Fix the inner width so the popup never resizes as the dB
+                                // label text changes length (which causes the box to jitter).
+                                let inner_w = popup_w - 16.0; // 16 = inner_margin * 2
+                                ui.set_min_width(inner_w);
+                                ui.set_max_width(inner_w);
 
-                                // dB readout at top
+                                // dB readout at top — rendered in a fixed-size slot so its
+                                // varying text width can't push the container around.
                                 let db_label = if vol_db <= -59.0 {
                                     "-∞ dB".to_string()
                                 } else {
                                     format!("{:+.1} dB", vol_db)
                                 };
-                                ui.label(
-                                    RichText::new(&db_label)
-                                        .size(9.0)
-                                        .monospace()
-                                        .color(ACCENT),
-                                );
+                                ui.allocate_ui(Vec2::new(inner_w, 13.0), |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            RichText::new(&db_label)
+                                                .size(9.0)
+                                                .monospace()
+                                                .color(ACCENT),
+                                        );
+                                    });
+                                });
                                 ui.add_space(4.0);
 
                                 // Vertical slider in dB space.
@@ -1129,4 +1141,22 @@ fn ruler_step(zoom: f32) -> f64 {
     else if zoom >= 80.0  { 1.0 }
     else if zoom >= 30.0  { 5.0 }
     else { 10.0 }
+}
+/// Truncates `text` to fit within `max_px` using a per-character width
+/// heuristic (11px proportional ≈ 6.5 px/char average). Appends "…" when
+/// truncated. Avoids egui font measurement, which requires `&mut Fonts`.
+fn fit_label(text: &str, max_px: f32) -> String {
+    const AVG_CHAR_PX: f32 = 6.5;
+    const ELLIPSIS: &str = "…";
+    let max_chars = (max_px / AVG_CHAR_PX).max(0.0) as usize;
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    // Reserve one slot for the ellipsis character itself.
+    let keep = max_chars.saturating_sub(1);
+    text.chars().take(keep).collect::<String>() + ELLIPSIS
 }

@@ -211,10 +211,6 @@ impl EditorModule for ExportModule {
                                 .size(11.0)
                                 .color(GREEN_DIM),
                         );
-                        if ui.small_button("Dismiss").clicked() {
-                            cmd.push(EditorCommand::ClearEncodeStatus);
-                            ui.memory_mut(|mem| mem.data.remove::<f64>(egui::Id::new("encode_done_time")));
-                        }
                     });
                 ui.add_space(8.0);
             } else {
@@ -237,9 +233,6 @@ impl EditorModule for ExportModule {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(&display).size(11.0).color(RED_DIM));
-                        if ui.small_button("Dismiss").clicked() {
-                            cmd.push(EditorCommand::ClearEncodeStatus);
-                        }
                     });
                 ui.add_space(8.0);
             }

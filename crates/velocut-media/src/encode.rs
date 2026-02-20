@@ -78,6 +78,14 @@ pub struct ClipSpec {
     pub duration:      f64,
     /// Linear gain applied to decoded audio before encoding (1.0 = unity).
     pub volume:        f32,
+    /// When true, no audio is decoded or pushed to the FIFO for this clip.
+    ///
+    /// Set by `begin_render()` for video-row clips whose audio has been
+    /// extracted to a separate A-row clip (`audio_muted = true`). The A-row
+    /// clip is included as a separate `ClipSpec` with `skip_audio = false`
+    /// covering the same time range so the FIFO receives the correct PCM.
+    /// See `begin_render()` in `app.rs` for the pairing logic.
+    pub skip_audio:    bool,
 }
 
 /// Complete description of an encode job.
@@ -452,6 +460,7 @@ fn run_encode(
             source_offset: clip.source_offset + skip,
             duration:      (clip.duration - skip - crossfade_secs).max(0.0),
             volume:        clip.volume,
+            skip_audio:    clip.skip_audio,
         };
 
         output_frame_idx = encode_clip(
@@ -473,11 +482,13 @@ fn run_encode(
             let next_clip = &spec.clips[clip_idx + 1];
 
             // Tail: last `crossfade_secs` of the current clip (just after encode_clip stopped).
+            // skip_audio = false: the crossfade audio blend needs PCM from both clips.
             let tail_spec = ClipSpec {
                 path:          clip.path.clone(),
                 source_offset: effective.source_offset + effective.duration,
                 duration:      crossfade_secs,
                 volume:        clip.volume,
+                skip_audio:    false,
             };
             // Head: first `crossfade_secs` of the next clip.
             let head_spec = ClipSpec {
@@ -485,6 +496,7 @@ fn run_encode(
                 source_offset: next_clip.source_offset,
                 duration:      crossfade_secs,
                 volume:        next_clip.volume,
+                skip_audio:    false,
             };
 
             output_frame_idx = apply_crossfade(
@@ -661,17 +673,23 @@ fn encode_clip(
     let mut audio_decoder: Option<ffmpeg::decoder::audio::Audio> = None;
     let mut in_audio_tb = Rational::new(1, AUDIO_RATE);
 
-    if let Some(asi) = audio_stream_idx {
-        let ast = ictx.stream(asi).unwrap();
-        in_audio_tb = ast.time_base();
-        // Soft-fail: a corrupt/unsupported audio stream should not abort the
-        // entire encode; video will still be processed correctly.
-        match codec::context::Context::from_parameters(ast.parameters()) {
-            Ok(ctx) => match ctx.decoder().audio() {
-                Ok(dec) => { audio_decoder = Some(dec); }
-                Err(e)  => { eprintln!("[encode] audio decoder open failed for '{}': {e}", clip.path.display()); }
-            },
-            Err(e) => { eprintln!("[encode] audio decoder params failed for '{}': {e}", clip.path.display()); }
+    // Only open the audio decoder when this clip contributes audio.
+    // skip_audio is set by begin_render() for video-row clips whose audio has
+    // been extracted to a paired A-row ClipSpec — opening the decoder here
+    // would push duplicate PCM into the FIFO alongside the A-row clip's audio.
+    if !clip.skip_audio {
+        if let Some(asi) = audio_stream_idx {
+            let ast = ictx.stream(asi).unwrap();
+            in_audio_tb = ast.time_base();
+            // Soft-fail: a corrupt/unsupported audio stream should not abort the
+            // entire encode; video will still be processed correctly.
+            match codec::context::Context::from_parameters(ast.parameters()) {
+                Ok(ctx) => match ctx.decoder().audio() {
+                    Ok(dec) => { audio_decoder = Some(dec); }
+                    Err(e)  => { eprintln!("[encode] audio decoder open failed for '{}': {e}", clip.path.display()); }
+                },
+                Err(e) => { eprintln!("[encode] audio decoder params failed for '{}': {e}", clip.path.display()); }
+            }
         }
     }
 

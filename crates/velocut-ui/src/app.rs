@@ -154,6 +154,20 @@ impl VeloCutApp {
         snapshot.pending_save_pick     = self.state.pending_save_pick.take();
         snapshot.save_status           = self.state.save_status.take();
 
+        // Re-queue probes for any library clips whose waveform_peaks are empty
+        // in the restored snapshot. This happens when the snapshot was taken while
+        // a probe was still in flight (peaks not yet returned from the worker).
+        // Without this, undoing ExtractAudioTrack before the first probe completes
+        // leaves the video clip with no waveform even though audio_muted is cleared.
+        for lib_clip in &snapshot.library {
+            if lib_clip.waveform_peaks.is_empty() {
+                let already_queued = snapshot.pending_probes.iter().any(|(id, _)| *id == lib_clip.id);
+                if !already_queued {
+                    snapshot.pending_probes.push((lib_clip.id, lib_clip.path.clone()));
+                }
+            }
+        }
+
         self.state = snapshot;
         self.sync_undo_len();
     }
@@ -418,14 +432,38 @@ impl VeloCutApp {
 
         let clip_specs: Vec<ClipSpec> = timeline
             .iter()
+            .filter(|tc| {
+                // Exclude extracted audio clips (A-row clips linked to a V-row partner).
+                // Their audio contribution is encoded via the V-row clip below, using
+                // the A-row clip's volume. Including them separately would write
+                // duplicate video frames AND duplicate audio into the output file.
+                let is_extracted_audio = tc.track_row % 2 == 1 && tc.linked_clip_id.is_some();
+                !is_extracted_audio
+            })
             .filter_map(|tc| {
                 self.state.library.iter()
                     .find(|lc| lc.id == tc.media_id)
-                    .map(|lc| ClipSpec {
-                        path:          lc.path.clone(),
-                        source_offset: tc.source_offset,
-                        duration:      tc.duration,
-                        volume:        tc.volume,
+                    .map(|lc| {
+                        // When a V-row clip's audio was extracted to the A track below
+                        // it, the user may have independently adjusted the A-row clip's
+                        // volume. Use that volume so the export reflects those changes.
+                        // The source file and offset are identical, so no path change
+                        // is needed — only the gain differs.
+                        let effective_volume = if tc.audio_muted {
+                            tc.linked_clip_id
+                                .and_then(|aid| self.state.timeline.iter().find(|c| c.id == aid))
+                                .map(|ac| ac.volume)
+                                .unwrap_or(tc.volume)
+                        } else {
+                            tc.volume
+                        };
+                        ClipSpec {
+                            path:          lc.path.clone(),
+                            source_offset: tc.source_offset,
+                            duration:      tc.duration,
+                            volume:        effective_volume,
+                            skip_audio:    false,
+                        }
                     })
             })
             .collect();
