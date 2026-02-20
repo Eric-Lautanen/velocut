@@ -268,7 +268,7 @@ impl EditorModule for TimelineModule {
                                 );
                             } else {
                                 ui.label(
-                                    egui::RichText::new("Space=Play  Del=Remove  ←/→=Frame  S=Split  Ctrl+Z=Undo")
+                                    egui::RichText::new("Space=Play  Del=Remove  ⬅️➡️=Frame  S=Split  Ctrl+Z=Undo")
                                         .size(9.0).color(egui::Color32::from_gray(80))
                                 );
                             }
@@ -910,7 +910,7 @@ impl EditorModule for TimelineModule {
                                 // Header
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("⇌  Transition")
+                                        RichText::new("↔️  Transition")
                                             .size(12.0)
                                             .strong()
                                             .color(ACCENT),
@@ -935,7 +935,7 @@ impl EditorModule for TimelineModule {
                                     .min_size(egui::vec2(80.0, 26.0));
 
                                     let fade_btn = egui::Button::new(
-                                        RichText::new("⇌  Dissolve")
+                                        RichText::new("🌫️  Dissolve")
                                             .size(11.0)
                                             .color(if fade_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
                                     )

@@ -305,7 +305,7 @@ fn header_bar(ui: &mut Ui, cmd: &mut Vec<EditorCommand>) {
                         .extra_letter_spacing(1.5),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let btn = egui::Button::new(RichText::new("＋ Import").size(11.0))
+                    let btn = egui::Button::new(RichText::new("📥 Import").size(11.0))
                         .corner_radius(egui::CornerRadius::same(4))
                         .fill(DARK_BG_4);
                     if ui.add(btn).clicked() {

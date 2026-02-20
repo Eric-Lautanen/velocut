@@ -16,7 +16,7 @@ use crate::modules::{
     video_module::VideoModule,
 };
 use eframe::egui;
-use egui_desktop::{TitleBar, TitleBarOptions};
+use egui_desktop::{TitleBar, TitleBarOptions, render_resize_handles};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rfd::FileDialog;
@@ -612,6 +612,8 @@ impl eframe::App for VeloCutApp {
                 .with_app_icon(BOLT_ICON, "bolt.svg"),
         )
         .show(ctx);
+
+        render_resize_handles(ctx);
 
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(false)
