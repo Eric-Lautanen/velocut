@@ -26,7 +26,7 @@ use uuid::Uuid;
 // At 640×360 RGBA each frame is ~900 KB; 128 frames ≈ 115 MB.
 // This constant is checked on every frame_bucket_cache insert.
 // Change it here to tune the scrub cache size without touching eviction logic.
-const MAX_FRAME_CACHE_BYTES: usize = 192 * 1024 * 1024; // 192 MB
+const MAX_FRAME_CACHE_BYTES: usize = 256 * 1024 * 1024; // 192 MB
 
 // ── CacheContext ──────────────────────────────────────────────────────────────
 // Owns all GPU-resident texture caches and the memory ceiling that governs them.

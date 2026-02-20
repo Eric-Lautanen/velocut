@@ -257,6 +257,11 @@ impl EditorModule for LibraryModule {
                                 cmd.push(EditorCommand::SelectLibraryClip(next));
                             }
                         } else {
+                            // Anchor clip is tracked outside multi_selection — pull it in
+                            // before moving the anchor, otherwise it visually drops out.
+                            if let Some(anchor) = state.selected_library_clip {
+                                self.multi_selection.insert(anchor);
+                            }
                             self.multi_selection.insert(id);
                             // Keep anchor on the last toggled-in clip
                             cmd.push(EditorCommand::SelectLibraryClip(Some(id)));

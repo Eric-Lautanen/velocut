@@ -195,10 +195,23 @@ impl CropScaler {
                 _ => (0, 0), // unknown packed/HBD format — skip horizontal crop
             };
 
+            // Advance data pointers into the crop rect.
+            //
+            // The SwsContext was built with (crop_w × crop_h) as source dims.
+            // sws_scale's srcSliceY is an offset INTO those declared dims, so
+            // passing srcSliceY=crop_y makes (crop_y + crop_h) > crop_h → EINVAL.
+            // Instead, pre-advance data pointers to row crop_y and pass srcSliceY=0,
+            // which is consistent with the declared source dimensions.
+            //
+            // UV planes are half-height in YUV420P so their row offset is halved.
+            let ls = &(*sf).linesize;
+            let y_row_off  = self.crop_y as usize * ls[0] as usize;
+            let uv_row_off = (self.crop_y as usize / 2) * ls[1] as usize;
+
             let src_planes: [*const u8; 4] = [
-                (*sf).data[0].add(off_y),
-                if (*sf).data[1].is_null() { std::ptr::null() } else { (*sf).data[1].add(off_uv) },
-                if (*sf).data[2].is_null() { std::ptr::null() } else { (*sf).data[2].add(off_uv) },
+                (*sf).data[0].add(off_y + y_row_off),
+                if (*sf).data[1].is_null() { std::ptr::null() } else { (*sf).data[1].add(off_uv + uv_row_off) },
+                if (*sf).data[2].is_null() { std::ptr::null() } else { (*sf).data[2].add(off_uv + uv_row_off) },
                 std::ptr::null(),
             ];
 
@@ -206,7 +219,7 @@ impl CropScaler {
                 self.ctx.as_mut_ptr(),
                 src_planes.as_ptr() as _,
                 (*sf).linesize.as_ptr(),
-                self.crop_y as _,
+                0,                // srcSliceY=0: pointer is already at crop_y
                 self.crop_h as _,
                 (*df).data.as_mut_ptr() as _,
                 (*df).linesize.as_mut_ptr(),
@@ -442,9 +455,22 @@ fn run_encode(
     video_enc.set_frame_rate(Some(Rational::new(spec.fps as i32, 1)));
     video_enc.set_bit_rate(0); // CRF controls quality; bit_rate 0 signals VBR
 
+    // MP4 requires SPS/PPS in the avcC box (AVCC format). Setting GLOBAL_HEADER
+    // tells libx264 to populate extradata during open so avcodec_parameters_from_context
+    // copies it into codecpar before the muxer writes the file header.
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        video_enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("crf",    "18");
     opts.set("preset", "fast");
+    // Force a keyframe every second so scrubbing stays responsive after import.
+    // libx264 default is keyint=250 (~8s at 30fps); camera files and NLE-ready
+    // exports typically use 1-2s. The scrub thread seeks to the nearest keyframe
+    // then burns through — a 250-frame GOP makes that 8x slower than a 30-frame
+    // GOP for every seek, which is the primary cause of choppy scrub on exports.
+    opts.set("g", &spec.fps.to_string());
 
     let mut video_encoder = video_enc.open_as_with(h264, opts)
         .map_err(|e| format!("open H.264 encoder: {e}"))?;
@@ -491,14 +517,16 @@ fn run_encode(
     audio_enc.set_format(Sample::F32(SampleType::Planar));
     audio_enc.set_bit_rate(128_000);
 
+    // Same GLOBAL_HEADER requirement as the video encoder above.
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        audio_enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
     let audio_encoder = audio_enc.open_as_with(aac, ffmpeg::Dictionary::new())
         .map_err(|e| format!("open AAC encoder: {e}"))?;
 
     // Guard against a codec that returns 0 (shouldn't happen with AAC but be safe).
     let audio_frame_size = (audio_encoder.frame_size() as usize).max(1024);
-
-    // Retrieve the muxer-assigned timebase for stream 1 before writing the header.
-    let ost_audio_tb = octx.stream(1).unwrap().time_base();
 
     unsafe {
         let ret = ffmpeg::ffi::avcodec_parameters_from_context(
@@ -514,6 +542,11 @@ fn run_encode(
     ffmpeg::format::context::output::dump(&octx, 0, Some(&spec.output.to_string_lossy()));
     octx.write_header()
         .map_err(|e| format!("write output header: {e}"))?;
+
+    // Fetch the muxer-assigned timebase for stream 1 AFTER write_header — the MP4
+    // muxer may normalize stream timebases during avformat_write_header, so any
+    // value read before that call can be stale and cause audio drift.
+    let ost_audio_tb = octx.stream(1).unwrap().time_base();
 
     let mut audio_state = AudioEncState {
         encoder:        audio_encoder,
@@ -1080,7 +1113,7 @@ fn encode_clip(
         if pts_secs >= clip_end { break; }
 
         if let Some(sc) = &mut video_scaler {
-            let mut yuv = VideoFrame::empty();
+            let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             if sc.run(&decoded, &mut yuv).is_ok() {
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =

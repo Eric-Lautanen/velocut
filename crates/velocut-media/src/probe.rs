@@ -98,13 +98,17 @@ pub fn probe_video_size_and_thumbnail(
     let thumb_h: u32 = ((thumb_w as f64 * raw_h as f64 / raw_w.max(1) as f64) as u32)
         .max(2) & !1; // must be even
 
-    let mut scaler = match SwsContext::get(
-        decoder.format(), decoder.width(), decoder.height(),
-        Pixel::RGBA, thumb_w, thumb_h, Flags::BILINEAR,
-    ) {
-        Ok(s)  => s,
-        Err(e) => { eprintln!("[media] thumbnail scaler: {e}"); return; }
-    };
+    // Build the scaler lazily on the first decoded frame using the frame's actual
+    // format and coded dimensions. Building it upfront from decoder.format() /
+    // decoder.width() / decoder.height() is unreliable for two reasons:
+    //   • For Annex-B H.264 (no extradata), decoder.format() is AV_PIX_FMT_NONE
+    //     before any packets are fed, causing SwsContext::get to fail immediately.
+    //   • For AVCC H.264 (GLOBAL_HEADER / extradata present), the decoder reports
+    //     coded dimensions (e.g. 1088) rather than display dimensions (e.g. 1080),
+    //     producing a scaler that maps the wrong source rect and corrupts the thumbnail.
+    // Using the live decoded frame sidesteps both issues — same lazy pattern used
+    // in encode.rs CropScaler and decode.rs LiveDecoder.
+    let mut scaler: Option<SwsContext> = None;
 
     let mut found = false;
     'outer: for (stream, packet) in ictx.packets().flatten() {
@@ -112,8 +116,18 @@ pub fn probe_video_size_and_thumbnail(
         if decoder.send_packet(&packet).is_err() { continue; }
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            let sc = match scaler {
+                Some(ref mut s) => s,
+                None => match SwsContext::get(
+                    decoded.format(), decoded.width(), decoded.height(),
+                    Pixel::RGBA, thumb_w, thumb_h, Flags::BILINEAR,
+                ) {
+                    Ok(s)  => { scaler = Some(s); scaler.as_mut().unwrap() }
+                    Err(e) => { eprintln!("[media] thumbnail scaler: {e}"); continue; }
+                },
+            };
             let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
-            if scaler.run(&decoded, &mut rgb_frame).is_err() { continue; }
+            if sc.run(&decoded, &mut rgb_frame).is_err() { continue; }
             // Destripe: copy only visible pixels, not stride padding
             let stride = rgb_frame.stride(0);
             let raw    = rgb_frame.data(0);
