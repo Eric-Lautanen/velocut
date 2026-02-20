@@ -696,6 +696,11 @@ impl eframe::App for VeloCutApp {
             self.preview.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
         });
 
+        // ── Render modal overlay ──────────────────────────────────────────────
+        // Must be called after all panels so the scrim and card paint above
+        // the entire UI. show_render_modal is a no-op while encode_job is None.
+        self.export.show_render_modal(ctx, &self.state, &mut self.pending_cmds);
+
         // ── Process commands emitted by modules this frame ────────────────────
         let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
         for cmd in cmds {

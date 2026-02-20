@@ -36,7 +36,7 @@ use velocut_core::commands::EditorCommand;
 use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
-use egui::{Color32, Margin, RichText, Stroke, Ui};
+use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
 
 // ── Colour palette extensions (local to this module) ─────────────────────────
 
@@ -255,72 +255,7 @@ impl EditorModule for ExportModule {
             ui.separator();
             ui.add_space(6.0);
 
-            // ── Encode-in-progress overlay ────────────────────────────────────
-
-            if is_encoding {
-                self.show_progress_ui(ui, state, cmd);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-            }
-
-            // ── Done banner ───────────────────────────────────────────────────
-            if let Some(path) = &state.encode_done {
-                let label = path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-
-                // Auto-dismiss after 5 seconds.
-                let t = ui.input(|i| i.time);
-                ui.memory_mut(|mem| {
-                    let key = egui::Id::new("encode_done_time");
-                    let start = mem.data.get_temp_mut_or_insert_with(key, || t);
-                    if t - *start > 5.0 {
-                        cmd.push(EditorCommand::ClearEncodeStatus);
-                        mem.data.remove::<f64>(key);
-                    }
-                });
-                ui.ctx().request_repaint();
-
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(30, 60, 40))
-                    .stroke(Stroke::new(1.0, GREEN_DIM))
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .inner_margin(Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(format!("🎉  Saved: {label}"))
-                                .size(11.0)
-                                .color(GREEN_DIM),
-                        );
-                    });
-                ui.add_space(8.0);
-            } else {
-                // Clear the timer if the banner is gone (e.g. dismissed by other means).
-                ui.memory_mut(|mem| mem.data.remove::<f64>(egui::Id::new("encode_done_time")));
-            }
-
-            // ── Error / cancelled banner ──────────────────────────────────────
-            if let Some(msg) = &state.encode_error {
-                let display = if msg == "cancelled" {
-                    "💥 Render cancelled".to_string()
-                } else {
-                    format!("💥 Error: {msg}")
-                };
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(60, 25, 25))
-                    .stroke(Stroke::new(1.0, RED_DIM))
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .inner_margin(Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new(&display).size(11.0).color(RED_DIM));
-                    });
-                ui.add_space(8.0);
-            }
-
-            // ── Settings (always visible) ─────────────────────────────────────
+            // Encode status is shown in the full-screen render modal.
             ui.vertical(|ui| {
                 ui.add_space(4.0);
                 self.show_settings_ui(ui, state, cmd, is_encoding);
@@ -332,63 +267,235 @@ impl EditorModule for ExportModule {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 impl ExportModule {
-    /// Progress bar + cancel button shown while encoding.
-    fn show_progress_ui(
+    /// Full-screen modal overlay for all render status (encoding / done / error).
+    ///
+    /// Call this from app.rs::update() *after* all panels so it paints on top.
+    /// No-op when encode_job is None. Fixed card size — no layout jumping.
+    ///
+    /// Layer order (bottom → top):
+    ///   panels  →  scrim (Foreground painter, drawn first)
+    ///           →  card  (Area::Foreground, same order, drawn after — wins)
+    pub fn show_render_modal(
         &self,
-        ui:    &mut Ui,
+        ctx:   &Context,
         state: &ProjectState,
         cmd:   &mut Vec<EditorCommand>,
     ) {
+        if state.encode_job.is_none() {
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+
+        // ── Scrim ─────────────────────────────────────────────────────────────
+        // 0.5 opacity black over the entire window, painted on the Foreground
+        // layer before the card Area so the card renders on top.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("render_modal_scrim"),
+        ));
+        painter.rect_filled(screen, 0.0, Color32::from_black_alpha(128));
+
+        // ── Card geometry — fixed, never changes ──────────────────────────────
+        const CARD_W: f32 = 440.0;
+        const CARD_H: f32 = 270.0;
+        const PAD:    f32 = 28.0;
+
+        let card_rect = egui::Rect::from_center_size(
+            screen.center(),
+            egui::vec2(CARD_W, CARD_H),
+        );
+        let inner_rect = card_rect.shrink(PAD);
+
+        // Decide border colour from current state.
+        let is_done  = state.encode_done.is_some();
+        let is_error = state.encode_error.is_some();
+        let border_col = if is_done {
+            GREEN_DIM
+        } else if is_error {
+            RED_DIM
+        } else {
+            TRACK_FG
+        };
+
+        // ── Card content Area ─────────────────────────────────────────────────
+        // The card background is painted first *inside* the Area so it is
+        // guaranteed to be in the same layer as the widgets and behind them.
+        // A separate painter layer for the background risks compositing on top.
+        egui::Area::new(egui::Id::new("render_modal_content"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(card_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(card_rect.size());
+                ui.set_max_size(card_rect.size());
+
+                // Paint card background first — same layer as widgets so it's
+                // always behind them. 0.7 opacity dark fill, sharp edges.
+                ui.painter().rect(
+                    card_rect,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(10, 10, 16, 179),
+                    Stroke::new(1.0, border_col),
+                    egui::StrokeKind::Inside,
+                );
+
+                // Inset content by PAD so widgets sit inside the card border.
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(inner_rect),
+                );
+
+                if is_done {
+                    self.modal_done(&mut child, state, cmd);
+                } else if is_error {
+                    self.modal_error(&mut child, state, cmd);
+                } else {
+                    self.modal_encoding(&mut child, state, cmd);
+                    ctx.request_repaint();
+                }
+            });
+
+        // ── Click-outside-to-close (done / error only) ────────────────────────
+        if is_done || is_error {
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_click() && i.pointer.interact_pos()
+                    .map(|p| !card_rect.contains(p))
+                    .unwrap_or(false)
+            });
+            if clicked_outside {
+                cmd.push(EditorCommand::ClearEncodeStatus);
+            }
+        }
+    }
+
+    // ── Modal state content ───────────────────────────────────────────────────
+
+    fn modal_encoding(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
+        let (frame, total) = state.encode_progress.unwrap_or((0, 1));
+        let fraction = (frame as f32 / total as f32).clamp(0.0, 1.0);
+        let pct      = (fraction * 100.0) as u32;
+
+        // Title
+        ui.label(RichText::new("Rendering…").size(13.0).strong().color(Color32::WHITE));
+        ui.add_space(14.0);
+
+        // Percentage readout
+        ui.label(
+            RichText::new(format!("{pct}%"))
+                .size(46.0)
+                .strong()
+                .color(TRACK_FG),
+        );
+        ui.add_space(10.0);
+
+        // Progress bar — same raw-painter approach as the original
+        let (bar_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 8.0),
+            egui::Sense::hover(),
+        );
+        let p = ui.painter();
+        p.rect_filled(bar_rect, 4.0, TRACK_BG);
+        if fraction > 0.0 {
+            let mut fill = bar_rect;
+            fill.max.x = bar_rect.min.x + bar_rect.width() * fraction;
+            p.rect_filled(fill, 4.0, TRACK_FG);
+        }
+        ui.add_space(6.0);
+
+        // Frame counter
+        ui.label(
+            RichText::new(format!("frame {frame}  /  {total}"))
+                .size(10.0)
+                .color(DARK_TEXT_DIM),
+        );
+        ui.add_space(14.0);
+
+        // Cancel — full width, neutral (same as original)
+        let cancel_btn = egui::Button::new(
+            RichText::new("✋  Stop Render").size(11.0).color(DARK_TEXT_DIM),
+        )
+        .stroke(Stroke::new(1.0, DARK_BORDER))
+        .fill(DARK_BG_2)
+        .min_size(egui::vec2(ui.available_width(), 28.0));
+
+        if ui.add(cancel_btn).clicked() {
+            if let Some(job_id) = state.encode_job {
+                cmd.push(EditorCommand::CancelEncode(job_id));
+            }
+        }
+    }
+
+    fn modal_done(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
+        let label = state.encode_done.as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        ui.label(RichText::new("Export complete").size(13.0).strong().color(Color32::WHITE));
+        ui.add_space(14.0);
+
+        // Success frame — same colours as original done banner
         egui::Frame::new()
-            .fill(DARK_BG_3)
-            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .fill(Color32::from_rgb(30, 60, 40))
+            .stroke(Stroke::new(1.0, GREEN_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-
-                let (frame, total) = state.encode_progress.unwrap_or((0, 1));
-                let fraction       = (frame as f32 / total as f32).clamp(0.0, 1.0);
-                let pct            = (fraction * 100.0) as u32;
-
                 ui.label(
-                    RichText::new(format!("Rendering  {pct}%  ({frame} / {total} frames)"))
+                    RichText::new(format!("🎉  Saved: {label}"))
                         .size(11.0)
-                        .color(DARK_TEXT_DIM),
+                        .color(GREEN_DIM),
                 );
-                ui.add_space(6.0);
-
-                // Draw the progress bar with raw painter calls so we can style it
-                // to match the dark theme without egui's default blue.
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 8.0),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, TRACK_BG);
-                if fraction > 0.0 {
-                    let mut filled = rect;
-                    filled.max.x = rect.min.x + rect.width() * fraction;
-                    painter.rect_filled(filled, 4.0, TRACK_FG);
-                }
-
-                ui.add_space(8.0);
-
-                // Cancel button — full width, neutral styling (this is a normal
-                // user action, not an error state).
-                let cancel_btn = egui::Button::new(
-                    RichText::new("✋  Stop Render").size(11.0).color(DARK_TEXT_DIM),
-                )
-                .stroke(Stroke::new(1.0, DARK_BORDER))
-                .fill(DARK_BG_2)
-                .min_size(egui::vec2(ui.available_width(), 26.0));
-
-                if ui.add(cancel_btn).clicked() {
-                    if let Some(job_id) = state.encode_job {
-                        cmd.push(EditorCommand::CancelEncode(job_id));
-                    }
-                }
             });
+
+        ui.add_space(14.0);
+
+        let dismiss = egui::Button::new(
+            RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM),
+        )
+        .stroke(Stroke::new(1.0, DARK_BORDER))
+        .fill(DARK_BG_2)
+        .min_size(egui::vec2(ui.available_width(), 28.0));
+
+        if ui.add(dismiss).clicked() {
+            cmd.push(EditorCommand::ClearEncodeStatus);
+        }
+    }
+
+    fn modal_error(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
+        let msg = state.encode_error.as_deref().unwrap_or("");
+        let display = if msg == "cancelled" {
+            "💥  Render cancelled".to_string()
+        } else {
+            format!("💥  Error: {msg}")
+        };
+
+        ui.label(RichText::new("Render stopped").size(13.0).strong().color(Color32::WHITE));
+        ui.add_space(14.0);
+
+        // Error frame — same colours as original error banner
+        egui::Frame::new()
+            .fill(Color32::from_rgb(60, 25, 25))
+            .stroke(Stroke::new(1.0, RED_DIM))
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(&display).size(11.0).color(RED_DIM));
+            });
+
+        ui.add_space(14.0);
+
+        let dismiss = egui::Button::new(
+            RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM),
+        )
+        .stroke(Stroke::new(1.0, DARK_BORDER))
+        .fill(DARK_BG_2)
+        .min_size(egui::vec2(ui.available_width(), 28.0));
+
+        if ui.add(dismiss).clicked() {
+            cmd.push(EditorCommand::ClearEncodeStatus);
+        }
     }
 
     /// Filename / aspect ratio / quality / fps / stats / render button.
