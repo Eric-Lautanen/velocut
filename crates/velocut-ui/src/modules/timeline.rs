@@ -159,7 +159,7 @@ impl EditorModule for TimelineModule {
                         ui.group(|ui| {
                             if ui.add_enabled(
                                 state.selected_timeline_clip.is_some(),
-                                tool_btn("🗑 Delete"),
+                                tool_btn("🗑️"),
                             ).clicked() {
                                 if let Some(id) = state.selected_timeline_clip {
                                     cmd.push(EditorCommand::PushUndoSnapshot);
@@ -174,7 +174,7 @@ impl EditorModule for TimelineModule {
                             let extract_enabled = state.selected_timeline_clip.is_some()
                                 && clip_query::selected_clip_library_entry(state).is_some();
 
-                            if ui.add_enabled(extract_enabled, tool_btn("⏮ First Frame"))
+                            if ui.add_enabled(extract_enabled, tool_btn("🖼️"))
                                 .on_hover_text("Extract first frame of selected clip as PNG")
                                 .on_disabled_hover_text("Select a timeline clip first")
                                 .clicked()
@@ -189,7 +189,7 @@ impl EditorModule for TimelineModule {
                                 }
                             }
 
-                            if ui.add_enabled(extract_enabled, playhead_btn("🎯 This Frame"))
+                            if ui.add_enabled(extract_enabled, playhead_btn("🎯"))
                                 .on_hover_text("Export the exact frame under the playhead as PNG")
                                 .on_disabled_hover_text("Select a timeline clip first")
                                 .clicked()
@@ -202,7 +202,7 @@ impl EditorModule for TimelineModule {
                                 }
                             }
 
-                            if ui.add_enabled(extract_enabled, tool_btn("⏭ Last Frame"))
+                            if ui.add_enabled(extract_enabled, tool_btn("🖼️"))
                                 .on_hover_text("Extract last frame of selected clip as PNG")
                                 .on_disabled_hover_text("Select a timeline clip first")
                                 .clicked()
@@ -233,7 +233,7 @@ impl EditorModule for TimelineModule {
                                 })
                                 .unwrap_or(false);
 
-                            if ui.add_enabled(extract_enabled, tool_btn("🎵 Extract Audio"))
+                            if ui.add_enabled(extract_enabled, tool_btn("🎵"))
                                 .on_hover_text("Extract audio to track below  [splits video/audio]")
                                 .on_disabled_hover_text("Select a video clip that hasn't been extracted yet")
                                 .clicked()
@@ -248,14 +248,14 @@ impl EditorModule for TimelineModule {
                             let can_undo = state.undo_len > 0;
                             let can_redo = state.redo_len > 0;
 
-                            if ui.add_enabled(can_undo, tool_btn("↩ Undo"))
+                            if ui.add_enabled(can_undo, tool_btn("↩️"))
                                 .on_hover_text("Undo  [Ctrl+Z]")
                                 .on_disabled_hover_text("Nothing to undo")
                                 .clicked()
                             {
                                 cmd.push(EditorCommand::Undo);
                             }
-                            if ui.add_enabled(can_redo, tool_btn("↪ Redo"))
+                            if ui.add_enabled(can_redo, tool_btn("↪️"))
                                 .on_hover_text("Redo  [Ctrl+Y]")
                                 .on_disabled_hover_text("Nothing to redo")
                                 .clicked()
@@ -273,7 +273,7 @@ impl EditorModule for TimelineModule {
                                     && state.current_time < c.start_time + c.duration - min_dur
                             });
                             ui.group(|ui| {
-                                if ui.add_enabled(can_split, action_btn("✂ Split"))
+                                if ui.add_enabled(can_split, action_btn("✂️"))
                                     .on_hover_text("Split clip at playhead  [S]")
                                     .clicked()
                                 {
