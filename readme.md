@@ -10,6 +10,9 @@
 ![egui](https://img.shields.io/badge/UI-egui%200.33-purple?style=flat-square)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-static-red?style=flat-square)
 <img src="assets/screenshot.png" alt="Velocut" width="80%">
+
+[Download v0.1.1 (Windows)](https://github.com/Eric-Lautanen/velocut/releases/latest)
+
 </div>
 
 ---
