@@ -134,15 +134,20 @@ pub struct ExportModule {
     /// Stored as `Option` so we can show a "Match Project" default and switch
     /// back to automatic if the project ratio changes.
     export_aspect: Option<AspectRatio>,
+    /// Timestamp of when the first "Reset" click happened.
+    /// `None` = normal state.  `Some(t)` = waiting for confirmation within 5 s.
+    /// Auto-expires — checked and cleared on every render frame.
+    clear_confirm_at: Option<std::time::Instant>,
 }
 
 impl Default for ExportModule {
     fn default() -> Self {
         Self {
-            filename:      "sequence_01".into(),
-            quality:       QualityPreset::FHD1080,
-            fps:           30,
-            export_aspect: None, // follows project
+            filename:         "sequence_01".into(),
+            quality:          QualityPreset::FHD1080,
+            fps:              30,
+            export_aspect:    None, // follows project
+            clear_confirm_at: None,
         }
     }
 }
@@ -158,21 +163,99 @@ impl EditorModule for ExportModule {
         cmd:          &mut Vec<EditorCommand>,
     ) {
         ui.vertical(|ui| {
+            // Compute encode state early — needed by both the header reset button
+            // (to disable it while rendering) and the progress overlay below.
+            let is_encoding = state.encode_job.is_some()
+                && state.encode_done.is_none()
+                && state.encode_error.is_none();
+
             // ── Header ────────────────────────────────────────────────────────
             egui::Frame::new()
                 .fill(DARK_BG_2)
                 .inner_margin(Margin { left: 8, right: 8, top: 6, bottom: 6 })
                 .show(ui, |ui| {
-                    ui.label(RichText::new("🚀 Export").size(12.0).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🚀 Export").size(12.0).strong());
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // ── Two-stage "Reset Everything" button ───────────
+                            // Grok-style confirm: first click arms the timer;
+                            // second click within 5 s fires ClearProject; after
+                            // 5 s the button resets with no action taken.
+                            // Disabled while an encode is running.
+
+                            // Cancel any pending confirm if an encode starts so
+                            // the user can't accidentally wipe mid-render.
+                            if is_encoding {
+                                self.clear_confirm_at = None;
+                            }
+                            // Auto-expire the confirmation window.
+                            if let Some(started) = self.clear_confirm_at {
+                                if started.elapsed().as_secs_f32() >= 5.0 {
+                                    self.clear_confirm_at = None;
+                                }
+                            }
+
+                            let in_confirm = self.clear_confirm_at.is_some();
+
+                            let btn_label: String = if in_confirm {
+                                let secs_left = (5.0_f32
+                                    - self.clear_confirm_at.unwrap()
+                                        .elapsed().as_secs_f32())
+                                    .ceil() as u32;
+                                // Drive the countdown without relying on input events.
+                                ui.ctx().request_repaint_after(
+                                    std::time::Duration::from_millis(250),
+                                );
+                                format!("⚠ {}s?", secs_left)
+                            } else {
+                                "⊘ Reset".into()
+                            };
+
+                            let (text_color, fill, border) = if in_confirm {
+                                (
+                                    Color32::from_rgb(255, 160, 50),
+                                    Color32::from_rgb(55, 38, 10),
+                                    Color32::from_rgb(180, 110, 25),
+                                )
+                            } else {
+                                (DARK_TEXT_DIM, DARK_BG_3, DARK_BORDER)
+                            };
+
+                            let reset_btn = egui::Button::new(
+                                RichText::new(&btn_label).size(10.0).color(text_color),
+                            )
+                            .fill(fill)
+                            .stroke(Stroke::new(1.0, border))
+                            .min_size(egui::vec2(62.0, 20.0));
+
+                            let hover_tip = if in_confirm {
+                                "Click again to erase all clips, library, and temp files — cannot be undone"
+                            } else if is_encoding {
+                                "Stop the render before resetting"
+                            } else {
+                                "Reset: clear all clips, library entries, and temp files"
+                            };
+
+                            if ui.add_enabled(!is_encoding, reset_btn)
+                                .on_hover_text(hover_tip)
+                                .clicked()
+                            {
+                                if in_confirm {
+                                    cmd.push(EditorCommand::ClearProject);
+                                    self.clear_confirm_at = None;
+                                } else {
+                                    self.clear_confirm_at = Some(std::time::Instant::now());
+                                }
+                            }
+                        });
+                    });
                 });
 
             ui.separator();
             ui.add_space(6.0);
 
             // ── Encode-in-progress overlay ────────────────────────────────────
-            let is_encoding = state.encode_job.is_some()
-                && state.encode_done.is_none()
-                && state.encode_error.is_none();
 
             if is_encoding {
                 self.show_progress_ui(ui, state, cmd);

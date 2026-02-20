@@ -89,6 +89,36 @@ pub fn selected_clip_library_entry(state: &ProjectState) -> Option<&LibraryClip>
     selected_timeline_clip(state).and_then(|tc| library_entry_for(state, tc))
 }
 
+// ── Extracted audio helpers ───────────────────────────────────────────────────
+
+/// Returns `true` when `clip` is an extracted-audio clip — a video-source clip
+/// that has been placed on an audio track row via `ExtractAudioTrack`.
+///
+/// Canonical definition: odd track row AND has a linked partner clip.
+/// Use this everywhere instead of inlining the predicate — both
+/// `timeline.rs` and `begin_render()` in `app.rs` previously held their own
+/// copies, which risks silent drift if one is updated and the other is not.
+#[inline]
+pub fn is_extracted_audio_clip(clip: &TimelineClip) -> bool {
+    clip.track_row % 2 == 1 && clip.linked_clip_id.is_some()
+}
+
+/// Return the A-row extracted-audio clip linked to `video_clip`, if any.
+///
+/// The V↔A link is stored as `video_clip.linked_clip_id → audio_clip.id`.
+/// Returns `None` if the video clip has no linked audio partner or if the
+/// linked id is not found in `state.timeline` (e.g. removed by undo).
+///
+/// Used in `begin_render()` to look up the A-row volume when the V-row clip
+/// has `audio_muted = true`, and anywhere else the V↔A relationship is traversed.
+#[inline]
+pub fn linked_audio_clip<'s>(
+    state:      &'s ProjectState,
+    video_clip: &TimelineClip,
+) -> Option<&'s TimelineClip> {
+    video_clip.linked_clip_id.and_then(|aid| timeline_clip(state, aid))
+}
+
 // ── Playhead helpers ──────────────────────────────────────────────────────────
 
 /// Resolve the source-file timestamp that corresponds to `state.current_time`

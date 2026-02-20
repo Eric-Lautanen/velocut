@@ -75,4 +75,11 @@ pub enum EditorCommand {
     ClearSaveStatus,
     SaveFrameToDisk { path: PathBuf, timestamp: f64 },
     RequestSaveFramePicker { path: PathBuf, timestamp: f64 },
+
+    // ── Project reset ─────────────────────────────────────────────────────────
+    /// Full app reset: wipe library, timeline, transitions, all temp WAV files,
+    /// all GPU texture caches, playback state, and undo/redo history.
+    /// Equivalent to "start a new project" without restarting the process.
+    /// app.rs::process_command handles the ordered teardown sequence.
+    ClearProject,
 }

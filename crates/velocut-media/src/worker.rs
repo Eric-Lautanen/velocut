@@ -312,21 +312,26 @@ impl MediaWorker {
         // everything remaining in the channel after the send is guaranteed to be
         // from the previous session.  The old order (drain then send) had a window
         // where the pb thread pushed a stale frame after the drain but before the
-        // Start was processed, which could slip through the wrong_clip / too_old
-        // guards when the same asset was reused across two clips.
+        // Start was processed.
         let _ = self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect });
         while self.pb_rx.try_recv().is_ok() {}
     }
 
     /// Stop the dedicated playback pipeline.
     pub fn stop_playback(&self) {
-        // pb_tx has capacity 4 and normally carries at most one in-flight command.
-        // try_send is used (not send) because this runs on the UI thread and we
-        // must never block it.  A full channel here is a logic error — log loudly
-        // so it surfaces in testing rather than silently leaving the pb thread running.
+        // try_send (not send) — must never block the UI thread.
+        // Log loudly if the channel is full so the failure surfaces in testing
+        // rather than silently leaving the pb thread running.
         if self.pb_tx.try_send(PlaybackCmd::Stop).is_err() {
             eprintln!("[pb] stop_playback: command channel full — Stop dropped. This is a bug.");
         }
+        // Drain any buffered frames so their RGBA allocations (~30 MB at 640×360
+        // for a full 32-frame channel) are freed immediately rather than held until
+        // the next start_playback call.
+        // Previously this mattered only on explicit stop. With the SetPlayhead fix,
+        // stop_playback is called on every intra-clip seek during playback, making
+        // prompt drainage more important.
+        while self.pb_rx.try_recv().is_ok() {}
     }
 
     pub fn extract_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64, dest: PathBuf) {

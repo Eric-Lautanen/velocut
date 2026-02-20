@@ -11,6 +11,7 @@ use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
 use velocut_core::media_types::PlaybackFrame;
 use crate::context::AppContext;
+use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
 use super::EditorModule;
 use eframe::egui;
@@ -46,10 +47,7 @@ impl VideoModule {
         egui_ctx: &egui::Context,
     ) {
         // Find clip under playhead — we need both pb_local_t and media_id.
-        let current_clip = state.timeline.iter().find(|c| {
-            state.current_time >= c.start_time
-                && state.current_time < c.start_time + c.duration
-        });
+        let current_clip = clip_query::clip_at_time(state, state.current_time);
         let current_media_id = current_clip.map(|c| c.media_id);
         let pb_local_t: Option<f64> = current_clip
             .map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
@@ -148,6 +146,11 @@ impl VideoModule {
                     egui::TextureOptions::LINEAR,
                 );
                 ctx.cache.frame_cache.insert(f.id, tex);
+                // request_repaint() here is correct and non-redundant: playback
+                // frames arrive from a background thread, not from a user input
+                // event, so egui's automatic input-driven repaint does not fire.
+                // Without this call the promoted frame would sit in frame_cache
+                // but the display wouldn't refresh until the next input event.
                 egui_ctx.request_repaint();
                 // Pre-pull next frame so it's ready for the next tick.
                 if let Ok(next) = ctx.media_worker.pb_rx.try_recv() {
@@ -164,10 +167,9 @@ impl VideoModule {
         let just_stopped = !state.is_playing && ctx.playback.prev_playing;
         ctx.playback.prev_playing = state.is_playing;
 
-        let current_clip = state.timeline.iter().find(|c| {
-            state.current_time >= c.start_time
-                && state.current_time < c.start_time + c.duration
-        }).cloned();
+        // clip_at_time is the shared helper — same predicate as poll_playback above,
+        // single source of truth, no risk of the two copies drifting.
+        let current_clip = clip_query::clip_at_time(state, state.current_time).cloned();
 
         // ── Playback mode ─────────────────────────────────────────────────────
         if state.is_playing {

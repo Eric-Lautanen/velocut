@@ -26,6 +26,17 @@ pub struct TimelineModule {
     /// click-outside-to-close check so the opening click doesn't immediately
     /// close the popup it just spawned.
     vol_popup_just_opened: bool,
+
+    /// Last timeline position (seconds) for which a scrub decode was emitted.
+    ///
+    /// Used to deduplicate `SetPlayhead` commands during ruler and playhead-handle
+    /// drags.  At low zoom levels many pixels of mouse movement map to sub-frame
+    /// time deltas, firing redundant decode wakes and RGBA allocations.  We skip
+    /// the emit when `|new_t - last_t| < 1/30 s` (one frame at 30 fps).
+    ///
+    /// Reset to a negative sentinel on construction.  Updated whenever a
+    /// `SetPlayhead` is actually pushed so the filter stays tight.
+    last_scrub_emitted_time: f64,
 }
 
 impl TimelineModule {
@@ -35,6 +46,7 @@ impl TimelineModule {
             transition_popup_just_opened: false,
             vol_popup:                    None,
             vol_popup_just_opened:        false,
+            last_scrub_emitted_time:      f64::NEG_INFINITY,
         }
     }
 }
@@ -212,12 +224,10 @@ impl EditorModule for TimelineModule {
                         // extracted yet. Mutes the video clip's audio and drops
                         // a linked audio clip on the A track below it.
                         ui.group(|ui| {
-                            let extract_enabled = state.selected_timeline_clip
-                                .and_then(|id| state.timeline.iter().find(|c| c.id == id))
+                            let extract_enabled = clip_query::selected_timeline_clip(state)
                                 .map(|tc| {
                                     !tc.audio_muted
-                                        && state.library.iter()
-                                            .find(|l| l.id == tc.media_id)
+                                        && clip_query::library_entry_for(state, tc)
                                             .map(|l| l.clip_type == velocut_core::state::ClipType::Video)
                                             .unwrap_or(false)
                                 })
@@ -362,11 +372,21 @@ impl EditorModule for TimelineModule {
                     let ruler_resp = ui.interact(ruler_rect, Id::new("timeline_ruler"), Sense::click_and_drag());
                     if ruler_resp.clicked() || ruler_resp.dragged() {
                         if let Some(ptr) = ruler_resp.interact_pointer_pos() {
-                            let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t         = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t_clamped = t.min(state.total_duration().max(0.0));
                             if ruler_resp.drag_started() || ruler_resp.clicked() {
+                                // Click or drag-start: always emit so the user gets instant response.
                                 cmd.push(EditorCommand::Pause);
+                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
+                                self.last_scrub_emitted_time = t_clamped;
+                            } else if (t_clamped - self.last_scrub_emitted_time).abs() >= 1.0 / 30.0 {
+                                // Mid-drag: only emit when the cursor has moved at least one frame's
+                                // worth of time.  At low zoom many pixels map to the same 1/30 s bucket
+                                // — skipping them avoids flooding the decode thread with wakes that each
+                                // allocate a full RGBA buffer and thrash the bucket cache.
+                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
+                                self.last_scrub_emitted_time = t_clamped;
                             }
-                            cmd.push(EditorCommand::SetPlayhead(t.min(state.total_duration().max(0.0))));
                         }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     } else if ruler_resp.hovered() {
@@ -471,8 +491,7 @@ impl EditorModule for TimelineModule {
                         // A clip whose library entry is Video but which sits on an audio
                         // track row is an extracted-audio clip.  Give it audio rendering so
                         // it looks like an audio clip (green, waveform-only, no thumbnail).
-                        let is_extracted_audio_clip = clip_type == ClipType::Video
-                            && clip.track_row % 2 == 1;
+                        let is_extracted_audio_clip = clip_query::is_extracted_audio_clip(clip);
                         let render_type = if is_extracted_audio_clip {
                             ClipType::Audio
                         } else {
@@ -880,11 +899,18 @@ impl EditorModule for TimelineModule {
                     );
                     if handle_resp.dragged() {
                         if let Some(ptr) = handle_resp.interact_pointer_pos() {
-                            let t = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t         = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t_clamped = t.min(state.total_duration().max(0.0));
                             if handle_resp.drag_started() {
+                                // Drag start: always emit so the handle feels immediately responsive.
                                 cmd.push(EditorCommand::Pause);
+                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
+                                self.last_scrub_emitted_time = t_clamped;
+                            } else if (t_clamped - self.last_scrub_emitted_time).abs() >= 1.0 / 30.0 {
+                                // Same dedup as ruler: skip sub-frame deltas during drag.
+                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
+                                self.last_scrub_emitted_time = t_clamped;
                             }
-                            cmd.push(EditorCommand::SetPlayhead(t.min(state.total_duration().max(0.0))));
                         }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     } else if handle_resp.hovered() {

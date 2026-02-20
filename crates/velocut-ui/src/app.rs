@@ -6,6 +6,7 @@ use velocut_media::audio::cleanup_audio_temp;
 use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionType};
 use crate::context::AppContext;
 use crate::theme::configure_style;
+use crate::helpers::clip_query;
 use crate::modules::{
     EditorModule,  // must be in scope for .ui() calls on concrete module types
     timeline::TimelineModule,
@@ -215,19 +216,6 @@ impl VeloCutApp {
                 self.context.audio_sinks.clear();
                 self.context.playback.audio_was_playing = false;
                 self.context.cache.pending_pb_frame = None;
-                // If playing, restart the pb pipeline at the new position.
-                // tick() only calls start_playback on just_started || clip_changed,
-                // so an intra-clip seek while playing never triggers a restart —
-                // the pb thread keeps decoding from the old position.
-                // Setting prev_playing = false makes tick() see just_started = true
-                // on the very next frame and issue a fresh start_playback call.
-                // stop_playback() first so the pb thread drops its decoder and the
-                // drain in start_playback sees a clean channel.
-                if self.state.is_playing {
-                    self.context.media_worker.stop_playback();
-                    self.context.playback.playback_media_id = None;
-                    self.context.playback.prev_playing = false;
-                }
             }
             EditorCommand::SetVolume(v) => {
                 self.state.volume = v;
@@ -354,6 +342,54 @@ impl VeloCutApp {
                 self.state.encode_done     = None;
                 self.state.encode_error    = None;
             }
+
+            // ── Project reset ─────────────────────────────────────────────────
+            EditorCommand::ClearProject => {
+                // ── Step 1: queue temp WAV deletions before wiping the library.
+                // Once library is cleared there's no way to recover the paths.
+                for clip in &self.state.library {
+                    if let Some(apath) = &clip.audio_path {
+                        self.state.pending_audio_cleanup.push(apath.clone());
+                    }
+                }
+
+                // ── Step 2: stop the playback thread and drain its channel.
+                // Must happen before touching ProjectState — the decode loop
+                // holds clip references and races if state changes under it.
+                self.context.media_worker.stop_playback();
+
+                // ── Step 3: drop audio sinks before clearing state.
+                // rodio decode threads reference the WAV path; dropping sinks
+                // first lets them finish cleanly before the path becomes invalid.
+                self.context.audio_sinks.clear();
+
+                // ── Step 4: evict all GPU textures and reset the byte budget.
+                self.context.cache.clear_all();
+
+                // ── Step 5: reset scrub / playback tracking.
+                self.context.playback.reset();
+
+                // ── Step 6: wipe serialisable project data.
+                self.state.library.clear();
+                self.state.timeline.clear();
+                self.state.transitions.clear();
+                self.state.selected_timeline_clip = None;
+                self.state.selected_library_clip  = None;
+                self.state.current_time           = 0.0;
+                self.state.is_playing             = false;
+
+                // ── Step 7: zero encode state (may have been mid-encode).
+                self.state.encode_job      = None;
+                self.state.encode_progress = None;
+                self.state.encode_done     = None;
+                self.state.encode_error    = None;
+
+                // ── Step 8: clear undo/redo — there is nothing meaningful to
+                // undo after a full wipe and stale snapshots waste memory.
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.sync_undo_len();
+            }
             EditorCommand::SetCrossfadeDuration(secs) => {
                 // Batch operation: set crossfade on every touching adjacent pair,
                 // or clear all transitions if secs == 0.
@@ -450,8 +486,7 @@ impl VeloCutApp {
                 // Their audio contribution is encoded via the V-row clip below, using
                 // the A-row clip's volume. Including them separately would write
                 // duplicate video frames AND duplicate audio into the output file.
-                let is_extracted_audio = tc.track_row % 2 == 1 && tc.linked_clip_id.is_some();
-                !is_extracted_audio
+                !clip_query::is_extracted_audio_clip(tc)
             })
             .filter_map(|tc| {
                 self.state.library.iter()
@@ -463,8 +498,7 @@ impl VeloCutApp {
                         // The source file and offset are identical, so no path change
                         // is needed — only the gain differs.
                         let effective_volume = if tc.audio_muted {
-                            tc.linked_clip_id
-                                .and_then(|aid| self.state.timeline.iter().find(|c| c.id == aid))
+                            clip_query::linked_audio_clip(&self.state, tc)
                                 .map(|ac| ac.volume)
                                 .unwrap_or(tc.volume)
                         } else {

@@ -117,6 +117,19 @@ impl CacheContext {
         self.frame_cache_bytes += frame_bytes;
         tex
     }
+
+    /// Evict every cached texture and reset the byte budget to zero.
+    ///
+    /// Called by the `ClearProject` handler before wiping `ProjectState`.
+    /// Dropping TextureHandles releases the GPU allocations; clearing the
+    /// byte counter prevents a stale over-budget signal on the next insert.
+    pub fn clear_all(&mut self) {
+        self.thumbnail_cache.clear();
+        self.frame_cache.clear();
+        self.frame_bucket_cache.clear();
+        self.pending_pb_frame  = None;
+        self.frame_cache_bytes = 0;
+    }
 }
 
 // ── PlaybackContext ───────────────────────────────────────────────────────────
@@ -155,6 +168,19 @@ impl PlaybackContext {
             prev_playing:      false,
             audio_was_playing: false,
         }
+    }
+
+    /// Reset all tracking state to its initial values.
+    ///
+    /// Called by the `ClearProject` handler so the scrub / playback pipeline
+    /// starts clean after a wipe without needing to reconstruct the struct.
+    pub fn reset(&mut self) {
+        self.last_frame_req    = None;
+        self.scrub_coarse_req  = None;
+        self.scrub_last_moved  = None;
+        self.playback_media_id = None;
+        self.prev_playing      = false;
+        self.audio_was_playing = false;
     }
 }
 

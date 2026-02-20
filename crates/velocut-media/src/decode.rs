@@ -67,24 +67,27 @@ impl LiveDecoder {
         let video_idx = ictx.streams().best(Type::Video)
             .ok_or_else(|| anyhow::anyhow!("no video stream"))?.index();
 
-        let (tb_num, tb_den, seek_ts, raw_w, raw_h) = {
+        // Build the codec context inside the stream-borrow block.
+        // Context::from_parameters copies AVCodecParameters into a new
+        // AVCodecContext, so dec_ctx is fully owned — the stream borrow is
+        // released when the block ends and ictx is free for seeking.
+        // This eliminates the previous second input() open that existed solely
+        // as a borrow-checker workaround.
+        let (tb_num, tb_den, seek_ts, dec_ctx) = {
             let stream = ictx.stream(video_idx).unwrap();
             let tb = stream.time_base();
             let seek_ts = (timestamp * tb.denominator() as f64 / tb.numerator() as f64) as i64;
-            let (w, h) = unsafe {
-                let p = stream.parameters().as_ptr();
-                ((*p).width as u32, (*p).height as u32)
-            };
-            (tb.numerator(), tb.denominator(), seek_ts, w, h)
+            let dec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+            (tb.numerator(), tb.denominator(), seek_ts, dec_ctx)
         };
 
         let _ = ictx.seek(seek_ts, ..=seek_ts);
 
-        // Second context for decoder params (avoids borrow conflict with ictx).
-        let ictx2   = input(path)?;
-        let stream2 = ictx2.stream(video_idx).unwrap();
-        let dec_ctx = ffmpeg::codec::context::Context::from_parameters(stream2.parameters())?;
+        // Build decoder — width/height come from here, replacing the previous
+        // unsafe raw-pointer read from stream.parameters().as_ptr().
         let decoder = dec_ctx.decoder().video()?;
+        let raw_w = decoder.width().max(2);
+        let raw_h = decoder.height().max(2);
 
         let (out_w, out_h) = if aspect <= 0.0 {
             (raw_w.max(2), raw_h.max(2))
@@ -271,23 +274,21 @@ pub fn decode_frame(
 ) -> Result<()> {
     let mut ictx = input(path)?;
 
-    let video_stream_idx = ictx.streams().best(Type::Video)
-        .ok_or_else(|| anyhow::anyhow!("no video stream"))?
-        .index();
-
-    let (seek_ts, tb_num, tb_den) = {
-        let stream = ictx.stream(video_stream_idx).unwrap();
-        let tb     = stream.time_base();
-        let ts     = (timestamp * tb.denominator() as f64 / tb.numerator() as f64) as i64;
-        (ts, tb.numerator() as f64, tb.denominator() as f64)
+    // Build codec context in the same block as the stream borrow.
+    // Context::from_parameters copies the parameters, so dec_ctx is fully
+    // owned after the block — ictx is free for seeking without a second open.
+    let (video_stream_idx, seek_ts, tb_num, tb_den, dec_ctx) = {
+        let stream = ictx.streams().best(Type::Video)
+            .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
+        let idx = stream.index();
+        let tb  = stream.time_base();
+        let ts  = (timestamp * tb.denominator() as f64 / tb.numerator() as f64) as i64;
+        let dec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        (idx, ts, tb.numerator() as f64, tb.denominator() as f64, dec_ctx)
     };
-    ictx.seek(seek_ts, ..=seek_ts)?;
 
-    // Second context for decoder construction (Parameters borrows from Stream/ictx).
-    let ictx2       = input(path)?;
-    let stream2     = ictx2.stream(video_stream_idx).ok_or_else(|| anyhow::anyhow!("stream gone"))?;
-    let decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream2.parameters())?;
-    let mut decoder = decoder_ctx.decoder().video()?;
+    ictx.seek(seek_ts, ..=seek_ts)?;
+    let mut decoder = dec_ctx.decoder().video()?;
 
     let (out_w, out_h) = if save_png || aspect <= 0.0 {
         (decoder.width(), decoder.height())
