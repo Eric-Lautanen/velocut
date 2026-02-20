@@ -10,31 +10,126 @@ use crate::context::AppContext;
 use crate::modules::ThumbnailCache;
 use super::EditorModule;
 use egui::Ui;
-use rodio::Decoder;
+use rodio::{Decoder, OutputStreamBuilder};
 use std::fs::File;
 use std::io::BufReader;
 use std::collections::{HashSet, HashMap};
 use std::time::Instant;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Diagnostic logging
+//
+// eprintln! is swallowed in Windows GUI-subsystem mode (no console attached
+// when the exe is double-clicked). Write to a temp file instead so we have
+// visibility in all launch modes without changing the subsystem.
+// File: %TEMP%\velocut_audio.log — append-only, created on first write.
+// ---------------------------------------------------------------------------
+fn audio_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("velocut_audio.log"))
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{timestamp}] {msg}");
+    }
+}
+
+/// Minimum elapsed time (seconds) after a sink is created before it may be
+/// marked exhausted via the empty() check.
+///
+/// Rationale: rodio fills its internal decode buffer asynchronously. In release
+/// builds the UI tick loop outruns the decode thread on the very first tick, so
+/// sink.empty() can return true for one or two frames immediately after creation,
+/// then go false once the buffer fills. Without this guard, that transient empty
+/// sets sink_has_played on tick N and exhausted on tick N+1, permanently
+/// silencing the clip after less than a second. 1.5s is conservative but safe —
+/// any legitimate WAV exhaustion happens near end-of-clip, well past this window.
+const MIN_PLAY_SECS: f64 = 1.5;
+
 pub struct AudioModule {
     /// Clips whose extracted WAV has played to completion.
     /// Without this, a sink that drains empty (WAV shorter than clip duration)
     /// triggers a full File::open + Decoder + Sink rebuild on every subsequent tick.
     exhausted: HashSet<Uuid>,
-    /// Tracks when each sink was created so we don't mark it exhausted before
-    /// rodio has had time to buffer the first frames (release builds run fast).
-    sink_started: HashMap<Uuid, Instant>,
+
+    /// Sinks observed non-empty at least once — only these can be marked exhausted.
+    sink_has_played: HashSet<Uuid>,
+
+    /// Wall-clock time each sink was created. Guards against false exhaustion:
+    /// in release builds, rodio's decode thread may not have buffered any samples
+    /// by the time the next tick runs, so sink.empty() can return true transiently
+    /// even though the clip has barely started. We refuse to mark a clip exhausted
+    /// until at least MIN_PLAY_SECS have elapsed since sink creation.
+    sink_created_at: HashMap<Uuid, Instant>,
+
+    /// Ticks remaining after stream creation before sinks are allowed.
+    ///
+    /// In Windows GUI-subsystem mode (double-click launch), WASAPI registers its
+    /// audio session asynchronously after OutputStreamBuilder succeeds. Creating a
+    /// Sink on the same tick as the stream causes the first clip to be silently
+    /// dropped. Waiting ~83ms (5 ticks at 60fps) gives WASAPI time to complete
+    /// session setup. Terminal / cargo-run launches are unaffected — the stream is
+    /// created on tick 1, long before the user presses play.
+    stream_warmup_ticks: u8,
 }
 
 impl AudioModule {
-    pub fn new() -> Self { Self { exhausted: HashSet::new(), sink_started: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            exhausted: HashSet::new(),
+            sink_has_played: HashSet::new(),
+            sink_created_at: HashMap::new(),
+            stream_warmup_ticks: 0,
+        }
+    }
+
+    /// Clear all per-sink tracking state. Called on stop and clip change.
+    fn clear_sink_state(&mut self) {
+        self.exhausted.clear();
+        self.sink_has_played.clear();
+        self.sink_created_at.clear();
+    }
+
+    /// Remove tracking state for a single clip ID. Called on stale-sink eviction.
+    fn remove_sink_state(&mut self, id: Uuid) {
+        self.exhausted.remove(&id);
+        self.sink_has_played.remove(&id);
+        self.sink_created_at.remove(&id);
+    }
 
     /// Called every frame after commands are processed.
     /// Manages rodio sinks: creates on play, clears on stop/seek.
     pub fn tick(&mut self, state: &ProjectState, ctx: &mut AppContext) {
-        // audio_stream must stay alive in AppContext for the device thread to run.
-        // We only need it here to call .mixer() — no borrow is stored.
+        // Lazy init: create the audio stream on the first tick rather than at
+        // AppContext::new() time. In Windows GUI-subsystem mode (double-click),
+        // WASAPI requires the Win32 message loop to be running first.
+        if ctx.audio_stream.is_none() {
+            match rodio::OutputStreamBuilder::open_default_stream() {
+                Ok(stream) => {
+                    audio_log("stream ready — starting warmup");
+                    ctx.audio_stream = Some(stream);
+                    // Give WASAPI time to complete async session registration
+                    // before we try to connect a sink. 5 ticks ≈ 83ms at 60fps.
+                    self.stream_warmup_ticks = 5;
+                }
+                Err(e) => {
+                    audio_log(&format!("stream init failed: {e}"));
+                }
+            }
+        }
+
+        // Don't touch sinks until the warmup window has passed.
+        if self.stream_warmup_ticks > 0 {
+            self.stream_warmup_ticks -= 1;
+            return;
+        }
+
         let Some(stream) = &ctx.audio_stream else { return };
 
         if !state.is_playing {
@@ -42,8 +137,7 @@ impl AudioModule {
             if ctx.playback.audio_was_playing {
                 ctx.playback.audio_was_playing = false;
                 ctx.audio_sinks.clear();
-                self.exhausted.clear();
-                self.sink_started.clear();
+                self.clear_sink_state();
             }
             return;
         }
@@ -53,16 +147,16 @@ impl AudioModule {
         // This handles undo/redo during active playback: after an undo the clip
         // that owned the sink may be gone, and its rodio thread would keep
         // playing phantom audio indefinitely without this guard.
-        let timeline_ids: std::collections::HashSet<uuid::Uuid> =
+        let timeline_ids: HashSet<Uuid> =
             state.timeline.iter().map(|c| c.id).collect();
-        let stale: Vec<uuid::Uuid> = ctx.audio_sinks.keys()
+        let stale: Vec<Uuid> = ctx.audio_sinks.keys()
             .filter(|id| !timeline_ids.contains(id))
             .copied()
             .collect();
         for id in stale {
+            audio_log(&format!("evicting stale sink for clip {id}"));
             ctx.audio_sinks.remove(&id);
-            self.exhausted.remove(&id);
-            self.sink_started.remove(&id);
+            self.remove_sink_state(id);
         }
 
         let t = state.current_time;
@@ -100,20 +194,38 @@ impl AudioModule {
                     return;
                 }
 
-                // Mark an existing sink as exhausted rather than rebuilding it.
-                // Guard with a 500ms minimum age — in release builds the loop runs
-                // so fast that rodio's internal buffer can appear empty for a few
-                // frames right after the sink is created, causing false exhaustion.
+                // Check whether an existing sink has finished playing.
+                // Three conditions must all be true before we mark a clip exhausted:
+                //   1. sink.empty()          — decoder has delivered all samples.
+                //   2. sink_has_played       — sink was non-empty at least once
+                //                              (confirmed it actually started).
+                //   3. elapsed >= MIN_PLAY_SECS — guards against transient empty()
+                //                              readings in the first few ticks after
+                //                              sink creation in release builds.
                 if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                    if sink.empty() {
-                        let age_ms = self.sink_started.get(&clip.id)
-                            .map(|t| t.elapsed().as_millis())
-                            .unwrap_or(0);
-                        if age_ms > 500 {
+                    let elapsed = self.sink_created_at.get(&clip.id)
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+
+                    if !sink.empty() {
+                        self.sink_has_played.insert(clip.id);
+                    } else if self.sink_has_played.contains(&clip.id) {
+                        if elapsed >= MIN_PLAY_SECS {
+                            audio_log(&format!(
+                                "clip {id} exhausted after {elapsed:.2}s",
+                                id = clip.id,
+                            ));
                             self.exhausted.insert(clip.id);
+                            return;
                         }
-                        return;
+                        // elapsed < MIN_PLAY_SECS: transient underrun in release
+                        // build — do not mark exhausted yet.
+                        audio_log(&format!(
+                            "clip {id} empty() at {elapsed:.3}s — ignoring (underrun guard)",
+                            id = clip.id,
+                        ));
                     }
+                    // else: newly created sink not yet buffered — leave it alone.
                 }
 
                 // Rebuild sink if this clip has no active sink yet.
@@ -124,8 +236,12 @@ impl AudioModule {
 
                 if needs_sink {
                     ctx.audio_sinks.clear();
-                    self.exhausted.clear();
-                    self.sink_started.clear(); // new clip, reset exhaustion tracking
+                    self.clear_sink_state();
+                    audio_log(&format!(
+                        "opening sink — clip={id} path={path:?} seek_t={seek_t:.3}",
+                        id = clip.id,
+                        path = apath,
+                    ));
                     match File::open(apath) {
                         Ok(file) => {
                             match Decoder::new(BufReader::new(file)) {
@@ -140,14 +256,17 @@ impl AudioModule {
                                     sink.set_volume(
                                         if state.muted { 0.0 } else { state.volume * clip.volume });
                                     sink.play();
-                                    eprintln!("[audio] sink created seek_t={seek_t:.3} vol={}", state.volume);
-                                    self.sink_started.insert(clip.id, Instant::now());
+                                    audio_log(&format!(
+                                        "sink created seek_t={seek_t:.3} vol={}",
+                                        state.volume,
+                                    ));
+                                    self.sink_created_at.insert(clip.id, Instant::now());
                                     ctx.audio_sinks.insert(clip.id, sink);
                                 }
-                                Err(e) => eprintln!("[audio] Decoder failed: {e}"),
+                                Err(e) => audio_log(&format!("Decoder failed: {e}")),
                             }
                         }
-                        Err(e) => eprintln!("[audio] File::open failed: {e}"),
+                        Err(e) => audio_log(&format!("File::open failed for {apath:?}: {e}")),
                     }
                 } else {
                     // Sync volume/mute without rebuilding the sink.
@@ -159,9 +278,9 @@ impl AudioModule {
         } else {
             // No clip under playhead — silence.
             if !ctx.audio_sinks.is_empty() {
+                audio_log("no active clip under playhead — clearing sinks");
                 ctx.audio_sinks.clear();
-                self.exhausted.clear();
-                self.sink_started.clear();
+                self.clear_sink_state();
             }
         }
     }

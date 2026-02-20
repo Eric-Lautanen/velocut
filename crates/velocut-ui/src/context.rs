@@ -176,15 +176,15 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(media_worker: MediaWorker) -> Self {
-        let audio_stream = rodio::OutputStreamBuilder::open_default_stream()
-            .map_err(|e| eprintln!("[audio] stream init failed: {e}"))
-            .ok();
-        eprintln!("[audio] stream ready: {}", audio_stream.is_some());
+        // audio_stream is initialized lazily on the first tick() call.
+        // Initializing here races with eframe/winit Win32 setup in GUI-subsystem
+        // (double-click) mode — WASAPI init fails silently, leaving audio broken
+        // for the entire session. By the time tick() runs, the message loop is live.
         Self {
             media_worker,
             cache:        CacheContext::new(),
             playback:     PlaybackContext::new(),
-            audio_stream,
+            audio_stream: None,
             audio_sinks:  HashMap::new(),
         }
     }
