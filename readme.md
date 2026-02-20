@@ -158,6 +158,10 @@ Any eviction that must take effect before the next render belongs in `poll_playb
 
 **Undo snapshots:** Full `ProjectState` clones, capped at 50 entries. Runtime-only fields (playback position, encode progress, pending queues) are preserved from the live state after each undo/redo. Clips with empty `waveform_peaks` after a restore are automatically re-queued for probing.
 
+## Acknowledgments
+
+VeloCut was 99.9% coded by [Claude](https://claude.ai) (Sonnet 4.5 / 4.6) — Anthropic's AI assistant — in collaboration with Eric Lautanen. A genuine human-AI co-authorship from architecture through implementation.
+
 ---
 
 ## License
