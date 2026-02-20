@@ -28,3 +28,6 @@ rodio             = { workspace = true }
 png               = { workspace = true }
 cpal              = { workspace = true }
 egui-desktop      = { workspace = true }
+
+[build-dependencies]
+winresource = { workspace = true }

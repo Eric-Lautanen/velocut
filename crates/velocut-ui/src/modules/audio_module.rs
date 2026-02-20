@@ -13,7 +13,8 @@ use egui::Ui;
 use rodio::Decoder;
 use std::fs::File;
 use std::io::BufReader;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::time::Instant;
 use uuid::Uuid;
 
 pub struct AudioModule {
@@ -21,10 +22,13 @@ pub struct AudioModule {
     /// Without this, a sink that drains empty (WAV shorter than clip duration)
     /// triggers a full File::open + Decoder + Sink rebuild on every subsequent tick.
     exhausted: HashSet<Uuid>,
+    /// Tracks when each sink was created so we don't mark it exhausted before
+    /// rodio has had time to buffer the first frames (release builds run fast).
+    sink_started: HashMap<Uuid, Instant>,
 }
 
 impl AudioModule {
-    pub fn new() -> Self { Self { exhausted: HashSet::new() } }
+    pub fn new() -> Self { Self { exhausted: HashSet::new(), sink_started: HashMap::new() } }
 
     /// Called every frame after commands are processed.
     /// Manages rodio sinks: creates on play, clears on stop/seek.
@@ -39,6 +43,7 @@ impl AudioModule {
                 ctx.playback.audio_was_playing = false;
                 ctx.audio_sinks.clear();
                 self.exhausted.clear();
+                self.sink_started.clear();
             }
             return;
         }
@@ -57,6 +62,7 @@ impl AudioModule {
         for id in stale {
             ctx.audio_sinks.remove(&id);
             self.exhausted.remove(&id);
+            self.sink_started.remove(&id);
         }
 
         let t = state.current_time;
@@ -95,9 +101,17 @@ impl AudioModule {
                 }
 
                 // Mark an existing sink as exhausted rather than rebuilding it.
+                // Guard with a 500ms minimum age — in release builds the loop runs
+                // so fast that rodio's internal buffer can appear empty for a few
+                // frames right after the sink is created, causing false exhaustion.
                 if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
                     if sink.empty() {
-                        self.exhausted.insert(clip.id);
+                        let age_ms = self.sink_started.get(&clip.id)
+                            .map(|t| t.elapsed().as_millis())
+                            .unwrap_or(0);
+                        if age_ms > 500 {
+                            self.exhausted.insert(clip.id);
+                        }
                         return;
                     }
                 }
@@ -110,7 +124,8 @@ impl AudioModule {
 
                 if needs_sink {
                     ctx.audio_sinks.clear();
-                    self.exhausted.clear(); // new clip, reset exhaustion tracking
+                    self.exhausted.clear();
+                    self.sink_started.clear(); // new clip, reset exhaustion tracking
                     match File::open(apath) {
                         Ok(file) => {
                             match Decoder::new(BufReader::new(file)) {
@@ -126,6 +141,7 @@ impl AudioModule {
                                         if state.muted { 0.0 } else { state.volume * clip.volume });
                                     sink.play();
                                     eprintln!("[audio] sink created seek_t={seek_t:.3} vol={}", state.volume);
+                                    self.sink_started.insert(clip.id, Instant::now());
                                     ctx.audio_sinks.insert(clip.id, sink);
                                 }
                                 Err(e) => eprintln!("[audio] Decoder failed: {e}"),
@@ -145,6 +161,7 @@ impl AudioModule {
             if !ctx.audio_sinks.is_empty() {
                 ctx.audio_sinks.clear();
                 self.exhausted.clear();
+                self.sink_started.clear();
             }
         }
     }
