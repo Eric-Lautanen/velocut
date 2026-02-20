@@ -21,6 +21,35 @@ const VOL_W:     f32 = 80.0;   // volume slider width
 //           ──────────────────────────────────────────── 314
 const CONTENT_W: f32 = 314.0;
 
+// ── UV crop helper ────────────────────────────────────────────────────────────
+
+/// Compute UV sample coordinates that center-crop a `tex_w × tex_h` texture to
+/// `target_ar` (width / height).  Returns `(0,0)→(1,1)` when ARs already match.
+///
+/// egui's `painter.image()` UV rect controls which portion of the texture is
+/// sampled — passing a sub-rect here is a zero-cost GPU crop with no scaling
+/// artefacts, and exactly mirrors the center-crop applied in `encode.rs`.
+fn crop_uv_rect(tex_w: f32, tex_h: f32, target_ar: f32) -> Rect {
+    if tex_h < 1.0 || tex_w < 1.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let src_ar = tex_w / tex_h;
+    if (src_ar - target_ar).abs() < 0.01 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    if src_ar > target_ar {
+        // Source wider — crop left and right.
+        let visible_w = tex_h * target_ar;
+        let u_margin  = (tex_w - visible_w) / (2.0 * tex_w);
+        Rect::from_min_max(Pos2::new(u_margin, 0.0), Pos2::new(1.0 - u_margin, 1.0))
+    } else {
+        // Source taller — crop top and bottom.
+        let visible_h = tex_w / target_ar;
+        let v_margin  = (tex_h - visible_h) / (2.0 * tex_h);
+        Rect::from_min_max(Pos2::new(0.0, v_margin), Pos2::new(1.0, 1.0 - v_margin))
+    }
+}
+
 pub struct PreviewModule {
     /// The live decoded frame for the current playhead position, set by app.rs
     /// each frame before ui() is called. When Some, it takes priority over the
@@ -128,9 +157,9 @@ impl EditorModule for PreviewModule {
                     let canvas_tex = self.held_frame.as_ref()
                         .or_else(|| thumb_cache.get(&media.id));
                     if let Some(tex) = canvas_tex {
-                        painter.image(tex.id(), canvas,
-                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                            Color32::WHITE);
+                        let [tw, th] = tex.size();
+                        let uv = crop_uv_rect(tw as f32, th as f32, ratio);
+                        painter.image(tex.id(), canvas, uv, Color32::WHITE);
                     } else {
                         // Thumbnail not yet loaded — name + spinner
                         painter.text(

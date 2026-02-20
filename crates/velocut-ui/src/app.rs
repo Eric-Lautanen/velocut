@@ -245,7 +245,34 @@ impl VeloCutApp {
 
             // ── Timeline ─────────────────────────────────────────────────────
             EditorCommand::AddToTimeline { media_id, at_time, track_row } => {
+                // Auto-set aspect ratio from the first clip placed on the timeline.
+                // Check emptiness *before* add_to_timeline mutates the vec.
+                let is_first_clip = self.state.timeline.is_empty();
                 self.state.add_to_timeline(media_id, at_time, track_row);
+                if is_first_clip {
+                    if let Some((width, height)) = self.state.library.iter()
+                        .find(|c| c.id == media_id)
+                        .and_then(|c| c.video_size)
+                    {
+                        if width > 0 && height > 0 {
+                            use velocut_core::state::AspectRatio;
+                            let r = width as f32 / height as f32;
+                            self.state.aspect_ratio =
+                                if      (r - 16.0/9.0).abs() < 0.05 { AspectRatio::SixteenNine   }
+                                else if (r - 9.0/16.0).abs() < 0.05 { AspectRatio::NineSixteen   }
+                                else if (r - 2.0/3.0 ).abs() < 0.05 { AspectRatio::TwoThree      }
+                                else if (r - 3.0/2.0 ).abs() < 0.05 { AspectRatio::ThreeTwo      }
+                                else if (r - 4.0/3.0 ).abs() < 0.05 { AspectRatio::FourThree     }
+                                else if (r - 1.0     ).abs() < 0.05 { AspectRatio::OneOne        }
+                                else if (r - 4.0/5.0 ).abs() < 0.05 { AspectRatio::FourFive      }
+                                else if (r - 21.0/9.0).abs() < 0.10 { AspectRatio::TwentyOneNine }
+                                else if (r - 2.39    ).abs() < 0.05 { AspectRatio::Anamorphic    }
+                                else if r > 1.0 { AspectRatio::SixteenNine }
+                                else            { AspectRatio::NineSixteen };
+                            eprintln!("[app] aspect ratio auto-set from first timeline clip {width}x{height}");
+                        }
+                    }
+                }
             }
             EditorCommand::DeleteTimelineClip(id) => {
                 // If this clip is linked to a partner (extract audio pair),

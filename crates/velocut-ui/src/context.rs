@@ -14,7 +14,7 @@
 
 use velocut_media::{MediaWorker, MediaResult};
 use velocut_core::media_types::PlaybackFrame;
-use velocut_core::state::{ProjectState, AspectRatio};
+use velocut_core::state::ProjectState;
 use crate::modules::ThumbnailCache;
 use eframe::egui;
 use rodio::{OutputStream, Sink};
@@ -281,26 +281,7 @@ impl AppContext {
                     if let Some(clip) = state.library.iter_mut().find(|c| c.id == id) {
                         clip.video_size = Some((width, height));
                     }
-                    // Auto-set aspect ratio from the first clip that reports a size.
-                    let is_first = state.library.iter()
-                        .filter(|c| c.video_size.is_some()).count() == 1;
-                    if is_first && width > 0 && height > 0 {
-                        let r = width as f32 / height as f32;
-                        state.aspect_ratio =
-                            if      (r - 16.0/9.0 ).abs() < 0.05 { AspectRatio::SixteenNine   }
-                            else if (r - 9.0/16.0 ).abs() < 0.05 { AspectRatio::NineSixteen   }
-                            else if (r - 2.0/3.0  ).abs() < 0.05 { AspectRatio::TwoThree      }
-                            else if (r - 3.0/2.0  ).abs() < 0.05 { AspectRatio::ThreeTwo      }
-                            else if (r - 4.0/3.0  ).abs() < 0.05 { AspectRatio::FourThree     }
-                            else if (r - 1.0      ).abs() < 0.05 { AspectRatio::OneOne        }
-                            else if (r - 4.0/5.0  ).abs() < 0.05 { AspectRatio::FourFive      }
-                            else if (r - 21.0/9.0 ).abs() < 0.10 { AspectRatio::TwentyOneNine }
-                            else if (r - 2.39     ).abs() < 0.05 { AspectRatio::Anamorphic    }
-                            else if r > 1.0 { AspectRatio::SixteenNine }
-                            else            { AspectRatio::NineSixteen };
-                        eprintln!("[app] aspect ratio auto-set from {width}x{height}");
-                        ctx.request_repaint();
-                    }
+                    // Aspect ratio auto-set moved to AddToTimeline (first clip placed).
                 }
 
                 MediaResult::FrameSaved { path } => {

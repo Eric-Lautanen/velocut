@@ -114,6 +114,112 @@ const PROGRESS_INTERVAL: u64 = 15;
 /// Output audio sample rate for all exports.
 const AUDIO_RATE: i32 = 44100;
 
+// ── Center-crop scaler ────────────────────────────────────────────────────────
+
+/// SwsContext wrapper that center-crops the source to the output aspect ratio
+/// before scaling — prevents squishing when source and output AR differ.
+///
+/// Crop rect is computed once at construction from `src_w/src_h` vs `out_w/out_h`.
+/// For matching ARs the crop rect is the full source frame (zero overhead).
+///
+/// The horizontal crop is applied by advancing per-plane data pointers; the
+/// vertical crop is passed as `srcSliceY / srcSliceH` to `sws_scale`. Both
+/// offsets are always rounded to even so YUV420P sub-sampling stays aligned.
+struct CropScaler {
+    ctx:    ScaleCtx,
+    /// Byte offset per Y-plane row (horizontal crop, advances data[0]).
+    crop_x: u32,
+    /// First source row handed to sws_scale as srcSliceY.
+    crop_y: u32,
+    /// Source row count handed to sws_scale as srcSliceH.
+    crop_h: u32,
+}
+
+impl CropScaler {
+    fn build(
+        src_fmt: Pixel,
+        src_w:   u32,
+        src_h:   u32,
+        out_w:   u32,
+        out_h:   u32,
+    ) -> Self {
+        let src_ar = src_w as f64 / src_h.max(1) as f64;
+        let out_ar = out_w as f64 / out_h.max(1) as f64;
+
+        // Crop rect that maps source pixels to the output AR (center crop).
+        // All edges rounded to even for YUV420P chroma alignment.
+        let (crop_x, crop_y, crop_w, crop_h) = if (src_ar - out_ar).abs() < 1e-4 {
+            (0, 0, src_w, src_h)
+        } else if src_ar > out_ar {
+            // Source wider — crop sides, keep full height.
+            let cw = ((src_h as f64 * out_ar).round() as u32).min(src_w) & !1;
+            let cx = ((src_w - cw) / 2) & !1;
+            (cx, 0u32, cw, src_h)
+        } else {
+            // Source taller — crop top/bottom, keep full width.
+            let ch = ((src_w as f64 / out_ar).round() as u32).min(src_h) & !1;
+            let cy = ((src_h - ch) / 2) & !1;
+            (0u32, cy, src_w, ch)
+        };
+
+        let ctx = ScaleCtx::get(
+            src_fmt, crop_w.max(2), crop_h.max(2),
+            Pixel::YUV420P, out_w, out_h,
+            ScaleFlags::BILINEAR,
+        ).expect("CropScaler: SwsContext");
+
+        Self { ctx, crop_x, crop_y, crop_h }
+    }
+
+    /// Scale `src` into `dst` with center-crop.
+    ///
+    /// `dst` must be pre-allocated (e.g. `VideoFrame::new(YUV420P, out_w, out_h)`).
+    /// Handles planar YUV formats (YUV420P / 422P / 444P and their J-range
+    /// variants) which cover effectively all H.264 / H.265 decoder output.
+    /// For other formats the horizontal crop is skipped; vertical crop still applies.
+    fn run(&mut self, src: &VideoFrame, dst: &mut VideoFrame) -> Result<(), String> {
+        unsafe {
+            let sf = src.as_ptr();
+            let df = dst.as_mut_ptr();
+
+            // Per-plane horizontal byte offsets for the crop.
+            let (off_y, off_uv): (usize, usize) = match src.format() {
+                Pixel::YUV420P | Pixel::YUVJ420P |
+                Pixel::YUV422P | Pixel::YUVJ422P => {
+                    (self.crop_x as usize, self.crop_x as usize / 2)
+                }
+                Pixel::YUV444P | Pixel::YUVJ444P => {
+                    let o = self.crop_x as usize;
+                    (o, o)
+                }
+                _ => (0, 0), // unknown packed/HBD format — skip horizontal crop
+            };
+
+            let src_planes: [*const u8; 4] = [
+                (*sf).data[0].add(off_y),
+                if (*sf).data[1].is_null() { std::ptr::null() } else { (*sf).data[1].add(off_uv) },
+                if (*sf).data[2].is_null() { std::ptr::null() } else { (*sf).data[2].add(off_uv) },
+                std::ptr::null(),
+            ];
+
+            let ret = ffmpeg::ffi::sws_scale(
+                self.ctx.as_mut_ptr(),
+                src_planes.as_ptr() as _,
+                (*sf).linesize.as_ptr(),
+                self.crop_y as _,
+                self.crop_h as _,
+                (*df).data.as_mut_ptr() as _,
+                (*df).linesize.as_mut_ptr(),
+            );
+
+            if ret <= 0 {
+                return Err(format!("CropScaler::run sws_scale returned {ret}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Encode `spec` to disk. Blocking — run this on a dedicated thread.
@@ -720,7 +826,7 @@ fn encode_clip(
     }
 
     // ── Format converters (deferred until first frame of each type) ───────────
-    let mut video_scaler:    Option<ScaleCtx>            = None;
+    let mut video_scaler:    Option<CropScaler>          = None;
     let mut audio_resampler: Option<resampling::Context> = None;
 
     let clip_end   = clip.source_offset + clip.duration;
@@ -808,20 +914,18 @@ fn encode_clip(
                     continue;
                 }
 
-                // Initialise scaler on the first valid frame so we know the
-                // actual input format. Use the pre-computed display dimensions
-                // (not decoded.width/height) to exclude macroblock padding rows.
+                // Initialise center-crop scaler on the first valid frame.
+                // Uses display dimensions (not coded) to exclude macroblock padding.
+                // When source AR matches output AR the crop rect is the full frame.
                 let sc = video_scaler.get_or_insert_with(|| {
-                    ScaleCtx::get(
+                    CropScaler::build(
                         decoded.format(), src_display_w, src_display_h,
-                        Pixel::YUV420P,   spec.width,    spec.height,
-                        ScaleFlags::BILINEAR,
-                    ).expect("create swscale context")
+                        spec.width, spec.height,
+                    )
                 });
 
-                let mut yuv = VideoFrame::empty();
-                sc.run(&decoded, &mut yuv)
-                    .map_err(|e| format!("scale video frame: {e}"))?;
+                let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
+                sc.run(&decoded, &mut yuv)?;
 
                 // swscale inherits source SAR; override to 1:1.
                 unsafe {
@@ -1100,7 +1204,7 @@ fn decode_clip_frames(
     // will skip pre-roll frames if the seek didn't land accurately.
     seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
 
-    let mut video_scaler: Option<ScaleCtx> = None;
+    let mut video_scaler: Option<CropScaler> = None;
     let clip_end   = clip.source_offset + clip.duration;
     let half_frame = 0.5 / spec.fps as f64;
     let w = spec.width  as usize;
@@ -1129,14 +1233,13 @@ fn decode_clip_frames(
             if pts_secs >= clip_end { break 'packet_loop; }
 
             let sc = video_scaler.get_or_insert_with(|| {
-                ScaleCtx::get(
+                CropScaler::build(
                     decoded.format(), src_display_w, src_display_h,
-                    Pixel::YUV420P, spec.width, spec.height,
-                    ScaleFlags::BILINEAR,
-                ).expect("crossfade scaler")
+                    spec.width, spec.height,
+                )
             });
 
-            let mut yuv = VideoFrame::empty();
+            let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             sc.run(&decoded, &mut yuv)
                 .map_err(|e| format!("crossfade scale: {e}"))?;
 
@@ -1154,7 +1257,7 @@ fn decode_clip_frames(
         if pts_secs >= clip_end { break; }
 
         if let Some(sc) = &mut video_scaler {
-            let mut yuv = VideoFrame::empty();
+            let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             if sc.run(&decoded, &mut yuv).is_ok() {
                 frames.push(extract_yuv(&yuv, w, h, uv_w, uv_h));
             }
