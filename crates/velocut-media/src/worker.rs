@@ -278,8 +278,8 @@ impl MediaWorker {
             probe_video_size_and_thumbnail(&path, id, dur, &tx);
 
             // Release the semaphore here — the in-process FFmpeg work (duration +
-            // thumbnail) is done. Waveform and audio use blocking CLI subprocesses
-            // that can run for seconds on long files. Holding the semaphore through
+            // thumbnail) is done. Waveform and audio decoding are also in-process
+            // but can run for seconds on long files. Holding the semaphore through
             // them starves thumbnail/duration results for clips imported afterward.
             drop(_guard);
 
@@ -307,14 +307,26 @@ impl MediaWorker {
 
     /// Start the dedicated playback pipeline at `ts` seconds into `path`.
     pub fn start_playback(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32) {
-        // Flush stale frames from previous playback session.
-        while self.pb_rx.try_recv().is_ok() {}
+        // Send Start BEFORE draining pb_rx.  The pb thread processes the Start
+        // command and resets its decoder before it can push any new frames, so
+        // everything remaining in the channel after the send is guaranteed to be
+        // from the previous session.  The old order (drain then send) had a window
+        // where the pb thread pushed a stale frame after the drain but before the
+        // Start was processed, which could slip through the wrong_clip / too_old
+        // guards when the same asset was reused across two clips.
         let _ = self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect });
+        while self.pb_rx.try_recv().is_ok() {}
     }
 
     /// Stop the dedicated playback pipeline.
     pub fn stop_playback(&self) {
-        let _ = self.pb_tx.try_send(PlaybackCmd::Stop);
+        // pb_tx has capacity 4 and normally carries at most one in-flight command.
+        // try_send is used (not send) because this runs on the UI thread and we
+        // must never block it.  A full channel here is a logic error — log loudly
+        // so it surfaces in testing rather than silently leaving the pb thread running.
+        if self.pb_tx.try_send(PlaybackCmd::Stop).is_err() {
+            eprintln!("[pb] stop_playback: command channel full — Stop dropped. This is a bug.");
+        }
     }
 
     pub fn extract_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64, dest: PathBuf) {

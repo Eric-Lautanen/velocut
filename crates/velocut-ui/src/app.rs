@@ -215,6 +215,19 @@ impl VeloCutApp {
                 self.context.audio_sinks.clear();
                 self.context.playback.audio_was_playing = false;
                 self.context.cache.pending_pb_frame = None;
+                // If playing, restart the pb pipeline at the new position.
+                // tick() only calls start_playback on just_started || clip_changed,
+                // so an intra-clip seek while playing never triggers a restart —
+                // the pb thread keeps decoding from the old position.
+                // Setting prev_playing = false makes tick() see just_started = true
+                // on the very next frame and issue a fresh start_playback call.
+                // stop_playback() first so the pb thread drops its decoder and the
+                // drain in start_playback sees a clean channel.
+                if self.state.is_playing {
+                    self.context.media_worker.stop_playback();
+                    self.context.playback.playback_media_id = None;
+                    self.context.playback.prev_playing = false;
+                }
             }
             EditorCommand::SetVolume(v) => {
                 self.state.volume = v;

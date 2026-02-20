@@ -46,9 +46,11 @@ pub struct CacheContext {
     pub pending_pb_frame: Option<PlaybackFrame>,
 
     /// Decoded frames keyed by (media_id, fine_bucket) — the scrub look-ahead store.
+    /// Value is (texture, byte_size) — the byte count is the exact RGBA size of that
+    /// frame so eviction subtracts the right amount regardless of source resolution.
     /// Eviction: when byte estimate exceeds MAX_FRAME_CACHE_BYTES, evict the 32
     /// entries furthest from the current playhead (not random, not LRU).
-    pub frame_bucket_cache: HashMap<(Uuid, u32), egui::TextureHandle>,
+    pub frame_bucket_cache: HashMap<(Uuid, u32), (egui::TextureHandle, usize)>,
 
     /// Approximate bytes currently held in frame_bucket_cache.
     /// Updated on insert and eviction.  Treated as an estimate (we don't track
@@ -93,7 +95,6 @@ impl CacheContext {
 
             // [Opt 4] O(N) partial select: puts the 32 furthest entries at keys[..32]
             // without fully sorting the remaining N-32 entries.
-            // `select_nth_unstable_by_key` is stable since Rust 1.64.
             if keys.len() > 32 {
                 keys.select_nth_unstable_by_key(
                     32,
@@ -103,14 +104,16 @@ impl CacheContext {
             keys.truncate(32);
 
             for k in &keys {
-                // Subtract evicted bytes. Approximate: assume all frames same size.
-                self.frame_cache_bytes =
-                    self.frame_cache_bytes.saturating_sub(frame_bytes);
-                self.frame_bucket_cache.remove(k);
+                // Subtract this entry's own byte count — not the incoming frame size.
+                // Mixed-resolution projects (e.g. 4K + 720p) would cause the budget
+                // estimate to drift if we assumed all entries are the same size.
+                if let Some((_, entry_bytes)) = self.frame_bucket_cache.remove(k) {
+                    self.frame_cache_bytes = self.frame_cache_bytes.saturating_sub(entry_bytes);
+                }
             }
         }
 
-        self.frame_bucket_cache.insert(key, tex.clone());
+        self.frame_bucket_cache.insert(key, (tex.clone(), frame_bytes));
         self.frame_cache_bytes += frame_bytes;
         tex
     }

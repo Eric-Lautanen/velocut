@@ -231,7 +231,8 @@ impl VideoModule {
             // Layer 1 (0ms): show nearest cached frame immediately.
             let found_nearby = (0..=8u32).find_map(|delta| {
                 let b = fine_bucket.saturating_sub(delta);
-                ctx.cache.frame_bucket_cache.get(&(clip.media_id, b)).cloned()
+                ctx.cache.frame_bucket_cache.get(&(clip.media_id, b))
+                    .map(|(tex, _)| tex.clone())
             });
             if let Some(cached) = found_nearby {
                 ctx.cache.frame_cache.insert(clip.media_id, cached);

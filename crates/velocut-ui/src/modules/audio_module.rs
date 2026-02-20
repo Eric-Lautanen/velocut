@@ -10,7 +10,7 @@ use crate::context::AppContext;
 use crate::modules::ThumbnailCache;
 use super::EditorModule;
 use egui::Ui;
-use rodio::{Decoder, OutputStreamBuilder};
+use rodio::Decoder;
 use std::fs::File;
 use std::io::BufReader;
 use std::collections::{HashSet, HashMap};
@@ -47,9 +47,9 @@ fn audio_log(msg: &str) {
 /// builds the UI tick loop outruns the decode thread on the very first tick, so
 /// sink.empty() can return true for one or two frames immediately after creation,
 /// then go false once the buffer fills. Without this guard, that transient empty
-/// sets sink_has_played on tick N and exhausted on tick N+1, permanently
-/// silencing the clip after less than a second. 1.5s is conservative but safe —
-/// any legitimate WAV exhaustion happens near end-of-clip, well past this window.
+/// fires exhausted within the first second. This value must comfortably exceed
+/// rodio's internal buffer fill time (~200ms) but stay below the shortest clip
+/// we'd ever want to silence correctly (~2s).
 const MIN_PLAY_SECS: f64 = 1.5;
 
 pub struct AudioModule {
@@ -61,11 +61,8 @@ pub struct AudioModule {
     /// Sinks observed non-empty at least once — only these can be marked exhausted.
     sink_has_played: HashSet<Uuid>,
 
-    /// Wall-clock time each sink was created. Guards against false exhaustion:
-    /// in release builds, rodio's decode thread may not have buffered any samples
-    /// by the time the next tick runs, so sink.empty() can return true transiently
-    /// even though the clip has barely started. We refuse to mark a clip exhausted
-    /// until at least MIN_PLAY_SECS have elapsed since sink creation.
+    /// Wall-clock time each sink was created. Guards against false exhaustion from
+    /// transient empty() readings in the first frames after sink creation.
     sink_created_at: HashMap<Uuid, Instant>,
 
     /// Ticks remaining after stream creation before sinks are allowed.
@@ -181,10 +178,34 @@ impl AudioModule {
 
         if let Some(clip) = active_clip {
             if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
-                // Prefer the pre-extracted WAV (audio_path). Fall back to the
-                // original media file so clips that have never had audio extracted
-                // (audio_path == None) still produce sound via rodio's symphonia decoder.
-                let apath = lib.audio_path.as_ref().unwrap_or(&lib.path);
+
+                // --- WAV guard ---------------------------------------------------
+                // Only play from a pre-extracted WAV, never from the raw source
+                // file directly. Raw MP4/AAC decoding via symphonia is unreliable:
+                // these containers have non-standard timescales that cause the
+                // symphonia decoder to stall partway through, producing a sink that
+                // goes empty after ~0.8s even though the clip is 6s long.
+                //
+                // The WAV is extracted by the media worker probe pipeline and its
+                // path lands in lib.audio_path within a second or two of import.
+                // If it hasn't arrived yet, skip this tick silently — the next tick
+                // will try again and the WAV will be ready soon.
+                //
+                // This also means we never need to handle the "symphonia gave up"
+                // failure mode at all.
+                // -----------------------------------------------------------------
+                let Some(apath) = lib.audio_path.as_ref() else {
+                    // WAV not ready yet — log once per clip (only when a sink would
+                    // otherwise have been created) to make the wait visible.
+                    if !ctx.audio_sinks.contains_key(&clip.id) {
+                        audio_log(&format!(
+                            "clip {id} waiting for WAV extraction (audio_path is None)",
+                            id = clip.id,
+                        ));
+                    }
+                    return;
+                };
+
                 let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
 
                 // If the sink for this clip already played to completion (WAV shorter
@@ -238,7 +259,7 @@ impl AudioModule {
                     ctx.audio_sinks.clear();
                     self.clear_sink_state();
                     audio_log(&format!(
-                        "opening sink — clip={id} path={path:?} seek_t={seek_t:.3}",
+                        "opening sink — clip={id} wav={path:?} seek_t={seek_t:.3}",
                         id = clip.id,
                         path = apath,
                     ));
@@ -263,10 +284,10 @@ impl AudioModule {
                                     self.sink_created_at.insert(clip.id, Instant::now());
                                     ctx.audio_sinks.insert(clip.id, sink);
                                 }
-                                Err(e) => audio_log(&format!("Decoder failed: {e}")),
+                                Err(e) => audio_log(&format!("Decoder failed for WAV {apath:?}: {e}")),
                             }
                         }
-                        Err(e) => audio_log(&format!("File::open failed for {apath:?}: {e}")),
+                        Err(e) => audio_log(&format!("File::open failed for WAV {apath:?}: {e}")),
                     }
                 } else {
                     // Sync volume/mute without rebuilding the sink.
