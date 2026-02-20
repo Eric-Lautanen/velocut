@@ -27,7 +27,7 @@ anyhow            = "1.0"
 crossbeam-channel = "0.5"
 parking_lot       = "0.12"
 ureq              = "3"
-rodio             = "0.21.1"
+rodio             = { version = "0.21.1", features = ["mp3", "mp4", "flac", "vorbis", "wav"] }
 png               = "0.18.1"
 cpal              = "0.15"
 egui-desktop      = "0.2.2"

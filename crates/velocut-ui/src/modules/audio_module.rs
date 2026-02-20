@@ -81,60 +81,62 @@ impl AudioModule {
 
         if let Some(clip) = active_clip {
             if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
-                if let Some(apath) = &lib.audio_path {
-                    let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
+                // Prefer the pre-extracted WAV (audio_path). Fall back to the
+                // original media file so clips that have never had audio extracted
+                // (audio_path == None) still produce sound via rodio's symphonia decoder.
+                let apath = lib.audio_path.as_ref().unwrap_or(&lib.path);
+                let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
 
-                    // If the sink for this clip already played to completion (WAV shorter
-                    // than clip duration), don't rebuild it on every tick — just stay silent
-                    // for the remainder of the clip.
-                    if self.exhausted.contains(&clip.id) {
+                // If the sink for this clip already played to completion (WAV shorter
+                // than clip duration), don't rebuild it on every tick — just stay silent
+                // for the remainder of the clip.
+                if self.exhausted.contains(&clip.id) {
+                    return;
+                }
+
+                // Mark an existing sink as exhausted rather than rebuilding it.
+                if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
+                    if sink.empty() {
+                        self.exhausted.insert(clip.id);
                         return;
                     }
+                }
 
-                    // Mark an existing sink as exhausted rather than rebuilding it.
-                    if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                        if sink.empty() {
-                            self.exhausted.insert(clip.id);
-                            return;
-                        }
-                    }
+                // Rebuild sink if this clip has no active sink yet.
+                // Covers both the fresh-start case (empty map) and the
+                // clip-change case (map has a different clip's sink, which
+                // the clear() below will remove before creating the new one).
+                let needs_sink = !ctx.audio_sinks.contains_key(&clip.id);
 
-                    // Rebuild sink if this clip has no active sink yet.
-                    // Covers both the fresh-start case (empty map) and the
-                    // clip-change case (map has a different clip's sink, which
-                    // the clear() below will remove before creating the new one).
-                    let needs_sink = !ctx.audio_sinks.contains_key(&clip.id);
-
-                    if needs_sink {
-                        ctx.audio_sinks.clear();
-                        self.exhausted.clear(); // new clip, reset exhaustion tracking
-                        match File::open(apath) {
-                            Ok(file) => {
-                                match Decoder::new(BufReader::new(file)) {
-                                    Ok(decoder) => {
-                                        // Per rodio 0.21 docs: connect_new takes &Mixer
-                                        // obtained from OutputStream::mixer().
-                                        // stream lives in AppContext so the device stays alive.
-                                        let sink = rodio::Sink::connect_new(&stream.mixer());
-                                        sink.append(decoder);
-                                        let _ = sink.try_seek(
-                                            std::time::Duration::from_secs_f64(seek_t));
-                                        sink.set_volume(
-                                            if state.muted { 0.0 } else { state.volume * clip.volume });
-                                        sink.play();
-                                        eprintln!("[audio] sink created seek_t={seek_t:.3} vol={}", state.volume);
-                                        ctx.audio_sinks.insert(clip.id, sink);
-                                    }
-                                    Err(e) => eprintln!("[audio] Decoder failed: {e}"),
+                if needs_sink {
+                    ctx.audio_sinks.clear();
+                    self.exhausted.clear(); // new clip, reset exhaustion tracking
+                    match File::open(apath) {
+                        Ok(file) => {
+                            match Decoder::new(BufReader::new(file)) {
+                                Ok(decoder) => {
+                                    // Per rodio 0.21 docs: connect_new takes &Mixer
+                                    // obtained from OutputStream::mixer().
+                                    // stream lives in AppContext so the device stays alive.
+                                    let sink = rodio::Sink::connect_new(&stream.mixer());
+                                    sink.append(decoder);
+                                    let _ = sink.try_seek(
+                                        std::time::Duration::from_secs_f64(seek_t));
+                                    sink.set_volume(
+                                        if state.muted { 0.0 } else { state.volume * clip.volume });
+                                    sink.play();
+                                    eprintln!("[audio] sink created seek_t={seek_t:.3} vol={}", state.volume);
+                                    ctx.audio_sinks.insert(clip.id, sink);
                                 }
+                                Err(e) => eprintln!("[audio] Decoder failed: {e}"),
                             }
-                            Err(e) => eprintln!("[audio] File::open failed: {e}"),
                         }
-                    } else {
-                        // Sync volume/mute without rebuilding the sink.
-                        if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                            sink.set_volume(if state.muted { 0.0 } else { state.volume * clip.volume });
-                        }
+                        Err(e) => eprintln!("[audio] File::open failed: {e}"),
+                    }
+                } else {
+                    // Sync volume/mute without rebuilding the sink.
+                    if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
+                        sink.set_volume(if state.muted { 0.0 } else { state.volume * clip.volume });
                     }
                 }
             }
