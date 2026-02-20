@@ -56,6 +56,15 @@ fn action_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
         .min_size(egui::vec2(0.0, 26.0))
 }
 
+/// Playhead-frame export button — amber tint to distinguish it from the
+/// neutral First/Last Frame buttons while staying in the same visual family.
+fn playhead_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
+    egui::Button::new(label)
+        .fill(Color32::from_rgb(75, 50, 8))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(210, 148, 38)))
+        .min_size(egui::vec2(0.0, 26.0))
+}
+
 impl EditorModule for TimelineModule {
     fn name(&self) -> &str { "Timeline" }
 
@@ -165,6 +174,19 @@ impl EditorModule for TimelineModule {
                                             timestamp: tc.source_offset,
                                         });
                                     }
+                                }
+                            }
+
+                            if ui.add_enabled(extract_enabled, playhead_btn("🎯 This Frame"))
+                                .on_hover_text("Export the exact frame under the playhead as PNG")
+                                .on_disabled_hover_text("Select a timeline clip first")
+                                .clicked()
+                            {
+                                if let Some((ts, lib)) = clip_query::playhead_source_timestamp(state) {
+                                    cmd.push(EditorCommand::RequestSaveFramePicker {
+                                        path: lib.path.clone(),
+                                        timestamp: ts,
+                                    });
                                 }
                             }
 

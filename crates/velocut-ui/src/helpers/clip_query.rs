@@ -88,3 +88,45 @@ pub fn library_entry_for<'s>(
 pub fn selected_clip_library_entry(state: &ProjectState) -> Option<&LibraryClip> {
     selected_timeline_clip(state).and_then(|tc| library_entry_for(state, tc))
 }
+
+// ── Playhead helpers ──────────────────────────────────────────────────────────
+
+/// Resolve the source-file timestamp that corresponds to `state.current_time`
+/// within the selected timeline clip, together with that clip's library entry.
+///
+/// Returns `None` when:
+/// - no timeline clip is selected, or
+/// - the selected clip's library entry is missing (source deleted), or
+/// - the playhead is outside the clip's timeline range (gap).
+///
+/// The timestamp is clamped so it always lands on a valid frame within the
+/// clip's trimmed range:
+///
+/// ```text
+/// ts = tc.source_offset
+///    + clamp(state.current_time − tc.start_time,  0.0,  tc.duration − one_frame)
+/// ```
+///
+/// This is the source-truth for "Export this frame" and anything else that
+/// needs to know which frame of the source file is currently visible.
+///
+/// # Example
+/// ```ignore
+/// if let Some((ts, lib)) = clip_query::playhead_source_timestamp(state) {
+///     cmd.push(EditorCommand::RequestSaveFramePicker {
+///         path: lib.path.clone(),
+///         timestamp: ts,
+///     });
+/// }
+/// ```
+pub fn playhead_source_timestamp(state: &ProjectState) -> Option<(f64, &LibraryClip)> {
+    const ONE_FRAME: f64 = 1.0 / 30.0;
+
+    let tc  = selected_timeline_clip(state)?;
+    let lib = library_entry_for(state, tc)?;
+
+    let offset = (state.current_time - tc.start_time)
+        .clamp(0.0, (tc.duration - ONE_FRAME).max(0.0));
+
+    Some((tc.source_offset + offset, lib))
+}
