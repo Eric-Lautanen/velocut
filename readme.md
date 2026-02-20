@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 ![egui](https://img.shields.io/badge/UI-egui%200.33-purple?style=flat-square)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-static-red?style=flat-square)
-
+<img src="assets/screenshot.png" alt="Velocut" width="80%">
 </div>
 
 ---
@@ -21,9 +21,7 @@ VeloCut is a native desktop video editor built entirely in Rust. It targets the 
 The UI is built with [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe). All media decoding and encoding is handled by a custom-forked [ffmpeg-the-third](https://github.com/eric-lautanen/velocut-ffmpeg-the-third) binding against a statically compiled FFmpeg.
 
 ---
-<div style="text-align: center;">
-  <img src="assets/screenshot.png" alt="Velocut" width="80%">
-</div>
+
 ## Features
 
 - **Multi-track timeline** — Four lanes (V1/A1/V2/A2) with drag-and-drop from the media library
