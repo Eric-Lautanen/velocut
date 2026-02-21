@@ -37,7 +37,7 @@ impl VideoTransition for Crossfade {
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {
-        TransitionType::Crossfade { duration_secs }
+        TransitionType::new(TransitionKind::Crossfade, duration_secs)
     }
 
     /// Blend two packed YUV420P buffers at `alpha` with smooth-step easing.
