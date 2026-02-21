@@ -13,7 +13,7 @@
 // replace the `apply()` body. Everything else (registration, call sites) is
 // handled by the registry in `mod.rs`.
 
-use crate::transitions::{TransitionKind, VideoTransition};
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{blend_byte, ease_in_out};
 
 /// Linear dissolve with smooth-step easing.
@@ -29,7 +29,7 @@ impl VideoTransition for Crossfade {
     }
 
     fn icon(&self) -> &'static str {
-        "🌫"
+        "🌫️"  // U+1F32B U+FE0F — variation selector required for emoji rendering
     }
 
     fn default_duration_secs(&self) -> f32 {
@@ -87,7 +87,6 @@ mod tests {
         let a = make_frame(100, 12);
         let b = make_frame(200, 12);
         let result = cf.apply(&a, &b, 4, 3, 0.0);
-        // ease_in_out(0.0) = 0.0 → should return frame_a values exactly
         assert!(result.iter().all(|&v| v == 100));
     }
 
@@ -97,7 +96,6 @@ mod tests {
         let a = make_frame(100, 12);
         let b = make_frame(200, 12);
         let result = cf.apply(&a, &b, 4, 3, 1.0);
-        // ease_in_out(1.0) = 1.0 → should return frame_b values exactly
         assert!(result.iter().all(|&v| v == 200));
     }
 
@@ -107,8 +105,7 @@ mod tests {
         let a = make_frame(0, 12);
         let b = make_frame(200, 12);
         let result = cf.apply(&a, &b, 4, 3, 0.5);
-        // ease_in_out(0.5) = 0.5 → midpoint blend
-        // blend_byte(0, 200, 0.5) = round(100.0) = 100
+        // ease_in_out(0.5) = 0.5 → blend_byte(0, 200, 0.5) = 100
         assert!(result.iter().all(|&v| v == 100));
     }
 

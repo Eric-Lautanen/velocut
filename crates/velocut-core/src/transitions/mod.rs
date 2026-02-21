@@ -2,67 +2,91 @@
 //
 // Transition system for VeloCut.
 //
-// Three layers live here:
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  HOW TO ADD A TRANSITION — one line, everything else is auto ║
+// ╚══════════════════════════════════════════════════════════════╝
 //
-//   1. Serialized project types — `TransitionType` and `TimelineTransition`
-//      are stored in ProjectState and written to disk. Their shape must stay
-//      backward-compatible. `ClipTransition` is encode-only (not serialized).
+//   1. Create `transitions/my_transition.rs`, impl `VideoTransition`
+//      (all 5 required methods: kind, label, icon, build, apply).
 //
-//   2. `VideoTransition` trait — the algorithm contract. Each transition is a
-//      zero-size (or config) struct that implements this trait. The `apply()`
-//      method receives packed YUV420P buffers and an alpha in [0.0, 1.0] and
-//      returns a blended packed buffer. No FFmpeg types cross this boundary —
-//      the media crate handles `extract_yuv` / `write_yuv` on both sides.
+//   2. Add ONE line to `declare_transitions!` below:
+//        my_transition::MyTransition,
 //
-//   3. Registry — a `HashMap<TransitionKind, Box<dyn VideoTransition>>` built
-//      once via `registry()`. Both `encode.rs` and `preview_module.rs` call
-//      into this rather than matching on `TransitionType` directly.
+//   Done. Badge, tooltip, popup button, duration slider, encode,
+//   and preview all pick it up automatically. No other changes needed.
 //
-// Adding a new transition:
-//   1. Add a variant to `TransitionKind` (discriminant, no data).
-//   2. Add a matching variant to `TransitionType` (carries runtime params like
-//      duration — these are serialized into the project file).
-//   3. Create `my_transition.rs` in this folder, impl `VideoTransition`.
-//   4. Add `mod my_transition;` below and one line to the `registry()` vec.
-//   Done — encode and preview pick it up automatically.
-
-mod crossfade;
-// mod wipe;  ← future: add mod declaration here
+// ── Architecture ─────────────────────────────────────────────────────────────
+//
+//   Layer 1 — Serialized types  (`TransitionKind`, `TransitionType`,
+//             `TimelineTransition`, `ClipTransition`)
+//             These are written to the project file. Never rename/remove
+//             existing variants without a migration path.
+//
+//   Layer 2 — `VideoTransition` trait
+//             Pure pixel algorithm. Receives packed YUV420P slices + alpha,
+//             returns blended packed slice. No FFmpeg types cross this boundary.
+//
+//   Layer 3 — Registry  (`registered()` for UI, `registry()` for encode)
+//             Built from `declare_transitions!`. UI iterates `registered()`;
+//             encode does O(1) lookup via `registry()`. Cut is never in either
+//             — callers short-circuit on `TransitionKind::Cut`.
 
 use std::collections::HashMap;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
+// ── Drop-in registration ──────────────────────────────────────────────────────
+//
+// To add a transition: append `module_name::StructName,` here.
+// To remove/disable: comment it out (serialized TransitionType variants must
+// stay in the enums below even if the impl is removed — deserialization safety).
+
+macro_rules! declare_transitions {
+    ( $( $module:ident :: $struct:ident ),* $(,)? ) => {
+        $( mod $module; )*
+
+        fn make_entries() -> Vec<Box<dyn VideoTransition>> {
+            vec![ $( Box::new($module::$struct) ),* ]
+        }
+    };
+}
+
+declare_transitions! {
+    crossfade::Crossfade,
+    // wipe::Wipe,
+}
+
 // ── Serialized project types ──────────────────────────────────────────────────
 
 /// Discriminant-only enum used as the registry key.
 ///
-/// Unlike `TransitionType`, this carries no runtime parameters — it identifies
-/// *which algorithm* to look up, not how that algorithm is configured for a
-/// particular clip boundary.
+/// Carries no runtime parameters — identifies *which algorithm* to look up,
+/// not how it is configured for a particular clip boundary. `Copy` so the
+/// registry can be keyed on it without cloning.
 ///
-/// Kept separate from `TransitionType` so the registry can be keyed on a
-/// `Copy` type without needing to pattern-match on data-carrying variants.
+/// Add a variant here whenever you add a transition to `declare_transitions!`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransitionKind {
     Cut,
     Crossfade,
-    // Wipe,  ← add here when adding a new transition
+    // Wipe,
 }
 
 /// Serialized transition variant stored in `ProjectState`.
 ///
-/// Carries runtime parameters (e.g. `duration_secs`) that configure the
-/// transition for a specific clip boundary. Serialized into the project file —
-/// never change existing variant shapes without a migration path.
+/// Carries runtime parameters (duration, direction, etc.) for a specific clip
+/// boundary. Written to the project file — **never rename or remove existing
+/// variants** without a migration path. Unused variants are harmless on disk.
+///
+/// Add a variant here whenever you add a transition to `declare_transitions!`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TransitionType {
     /// Hard cut — no blending, zero encode overhead.
     Cut,
-    /// Linear dissolve. Both clips are shortened by `duration_secs` so total
-    /// output duration is preserved.
+    /// Dissolve. Both clips overlap by `duration_secs`; total output duration
+    /// is preserved.
     Crossfade { duration_secs: f32 },
-    // Wipe { duration_secs: f32, direction: WipeDirection },  ← future
+    // Wipe { duration_secs: f32, direction: WipeDirection },
 }
 
 impl Default for TransitionType {
@@ -70,15 +94,15 @@ impl Default for TransitionType {
 }
 
 impl TransitionType {
-    /// Return the discriminant for registry lookup, stripping runtime params.
+    /// Strip runtime params, return the discriminant for registry lookup.
     pub fn kind(&self) -> TransitionKind {
         match self {
-            TransitionType::Cut                 => TransitionKind::Cut,
-            TransitionType::Crossfade { .. }    => TransitionKind::Crossfade,
+            TransitionType::Cut              => TransitionKind::Cut,
+            TransitionType::Crossfade { .. } => TransitionKind::Crossfade,
         }
     }
 
-    /// Duration of the transition in seconds, if applicable.
+    /// Duration of the overlap in seconds. Returns 0.0 for Cut.
     pub fn duration_secs(&self) -> f32 {
         match self {
             TransitionType::Cut                          => 0.0,
@@ -87,16 +111,18 @@ impl TransitionType {
     }
 }
 
-/// Stored in `ProjectState` — serialized with the project.
-/// Keyed by the TimelineClip UUID that precedes the transition so it survives
-/// clip reordering without becoming stale.
+/// Stored in `ProjectState`, serialized with the project.
+///
+/// Keyed by the UUID of the preceding `TimelineClip` so it survives clip
+/// reordering without going stale.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimelineTransition {
     pub after_clip_id: Uuid,
     pub kind: TransitionType,
 }
 
-/// Encode-only — built by `begin_render`, passed in `EncodeSpec`. Not serialized.
+/// Encode-only — built by `begin_render`, passed through `EncodeSpec`.
+/// Not serialized.
 #[derive(Clone, Debug)]
 pub struct ClipTransition {
     /// Index into the sorted clip Vec (0 = between clips[0] and clips[1]).
@@ -108,37 +134,52 @@ pub struct ClipTransition {
 
 /// Algorithm contract for all video transitions.
 ///
-/// Implementors are zero-size or config structs — they hold no per-clip state.
-/// Runtime parameters (duration, direction, etc.) come via the call site
-/// through `TransitionType`; the trait only receives the data it needs to blend.
+/// Implementors are zero-size (or config) structs — they hold no per-clip state.
+/// Runtime parameters arrive through `TransitionType` at the call site; the
+/// trait only receives what it needs to blend two frames.
 ///
 /// # Buffer contract
-/// Both `frame_a` and `frame_b` are packed YUV420P byte slices with layout:
-///   `[Y plane: w×h] ++ [U plane: (w/2)×(h/2)] ++ [V plane: (w/2)×(h/2)]`
-/// No stride padding. Use `velocut_media::helpers::yuv::extract_yuv` to produce
-/// them and `write_yuv` to write the result back into a VideoFrame.
+/// `frame_a` and `frame_b` are packed YUV420P byte slices:
+///   `[Y: w×h bytes][U: (w/2)×(h/2) bytes][V: (w/2)×(h/2) bytes]`
+/// No stride padding. Produce them with `velocut_media::helpers::yuv::extract_yuv`
+/// and write results back with `write_yuv`.
 ///
 /// # Alpha convention
-/// `alpha = 0.0` → 100% frame_a (outgoing clip)
-/// `alpha = 1.0` → 100% frame_b (incoming clip)
-/// The caller computes alpha from frame position and total frame count.
+/// `alpha = 0.0` → 100 % frame_a (outgoing clip)  
+/// `alpha = 1.0` → 100 % frame_b (incoming clip)  
+/// Caller computes alpha from frame index and total overlap frame count via
+/// `transitions::helpers::frame_alpha`.
 ///
-/// # Performance contract
-/// `apply()` is called once per frame. All inner loops must live *inside* the
-/// impl — do not make repeated trait calls from within a pixel loop.
+/// # Performance
+/// `apply()` is called once per blended frame. All inner loops must live
+/// *inside* the impl — never make repeated trait calls from a pixel loop.
 pub trait VideoTransition: Send + Sync {
-    /// Discriminant identifying this transition in the registry.
+    /// Discriminant for registry lookup. Must match the `TransitionKind`
+    /// variant declared alongside this transition.
     fn kind(&self) -> TransitionKind;
 
-    /// Human-readable label used in the UI picker.
+    /// Human-readable label shown in the UI picker (e.g. `"Dissolve"`).
     fn label(&self) -> &'static str;
 
-    /// Default duration in seconds shown in the UI when the user picks this transition.
+    /// Emoji badge shown on the timeline clip block when this transition is
+    /// active (e.g. `"🌫️"`). Keep it one glyph wide.
+    fn icon(&self) -> &'static str;
+
+    /// Default overlap duration in seconds pre-filled in the UI when the user
+    /// first selects this transition.
     fn default_duration_secs(&self) -> f32 { 0.5 }
 
-    /// Blend `frame_a` and `frame_b` at the given `alpha` and return the result.
+    /// Construct the serialized `TransitionType` for this transition.
     ///
-    /// `width` and `height` are the luma dimensions. UV dims are `(width/2, height/2)`.
+    /// Called by the UI when the user selects or adjusts a transition. The UI
+    /// **never** constructs `TransitionType` variants directly — always calls
+    /// this so the variant shape is encapsulated in the impl.
+    fn build(&self, duration_secs: f32) -> TransitionType;
+
+    /// Blend `frame_a` and `frame_b` at `alpha` and return the packed result.
+    ///
+    /// `width` / `height` are luma plane dimensions in pixels.
+    /// UV dims are `(width / 2, height / 2)`.
     fn apply(
         &self,
         frame_a: &[u8],
@@ -151,18 +192,18 @@ pub trait VideoTransition: Send + Sync {
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
-/// Return a map of all registered transitions keyed by `TransitionKind`.
+/// All registered transitions in stable display order.
 ///
-/// Called once by the encoder and once by the preview module — cheap to
-/// construct since all impls are zero-size structs. Consider caching with
-/// `std::sync::OnceLock` if profiling shows it in a hot path.
+/// Use for UI iteration (picker buttons, badge lookup). Cut is not included —
+/// it is always a hardcoded "remove transition" action in the UI.
+pub fn registered() -> Vec<Box<dyn VideoTransition>> {
+    make_entries()
+}
+
+/// All registered transitions keyed by `TransitionKind` for O(1) lookup.
 ///
-/// The `Cut` variant has no corresponding `VideoTransition` entry — callers
-/// should short-circuit on `TransitionKind::Cut` before hitting the registry.
+/// Use during encode and preview. Cut has no entry — short-circuit on
+/// `TransitionKind::Cut` before calling this.
 pub fn registry() -> HashMap<TransitionKind, Box<dyn VideoTransition>> {
-    let entries: Vec<Box<dyn VideoTransition>> = vec![
-        Box::new(crossfade::Crossfade),
-        // Box::new(wipe::Wipe),  ← add here
-    ];
-    entries.into_iter().map(|t| (t.kind(), t)).collect()
+    make_entries().into_iter().map(|t| (t.kind(), t)).collect()
 }
