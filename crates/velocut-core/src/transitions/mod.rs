@@ -78,6 +78,7 @@ macro_rules! declare_transitions {
 declare_transitions! {
     crossfade::Crossfade       => Crossfade,
     dip_to_black::DipToBlack   => DipToBlack,
+    iris::Iris                 => Iris,
     // wipe::Wipe               => Wipe,
 }
 
