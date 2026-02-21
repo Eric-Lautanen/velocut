@@ -643,7 +643,7 @@ impl ExportModule {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let transition_count = state.transitions.iter()
-                    .filter(|t| !matches!(t.kind, velocut_core::transitions::TransitionType::Cut))
+                    .filter(|t| t.kind.kind != velocut_core::transitions::TransitionKind::Cut)
                     .count();
                 if transition_count == 0 {
                     ui.label(

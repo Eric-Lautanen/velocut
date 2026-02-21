@@ -3,7 +3,7 @@ use velocut_core::state::{ProjectState, TimelineClip};
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
-use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionType};
+use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionKind, TransitionType};
 use crate::context::AppContext;
 use crate::theme::configure_style;
 use crate::helpers::clip_query;
@@ -436,7 +436,7 @@ impl VeloCutApp {
                         if gap.abs() > 0.1 { continue; }
                         self.state.transitions.push(TimelineTransition {
                             after_clip_id: a.id,
-                            kind: TransitionType::Crossfade { duration_secs: secs },
+                            kind: TransitionType::new(TransitionKind::Crossfade, secs),
                         });
                     }
                 }
@@ -446,7 +446,7 @@ impl VeloCutApp {
                     .find(|t| t.after_clip_id == after_clip_id)
                 {
                     t.kind = kind;
-                } else if kind != TransitionType::Cut {
+                } else if kind != TransitionType::cut() {
                     self.state.transitions.push(TimelineTransition { after_clip_id, kind });
                 }
             }

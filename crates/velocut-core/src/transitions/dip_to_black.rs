@@ -43,7 +43,7 @@ impl VideoTransition for DipToBlack {
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {
-        TransitionType::DipToBlack { duration_secs }
+        TransitionType::new(TransitionKind::DipToBlack, duration_secs)
     }
 
     /// Blend frame_a or frame_b toward black depending on which half of the

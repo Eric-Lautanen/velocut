@@ -61,7 +61,7 @@ use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
 
 use velocut_core::media_types::MediaResult;
-use velocut_core::transitions::{ClipTransition, TransitionType, TransitionKind, VideoTransition, registry};
+use velocut_core::transitions::{ClipTransition, TransitionKind, VideoTransition, registry};
 use crate::helpers::yuv::{extract_yuv, write_yuv};
 use crate::helpers::seek::seek_to_secs;
 
@@ -586,13 +586,13 @@ fn run_encode(
         let transition_entry = if clip_idx + 1 < spec.clips.len() {
             spec.transitions.iter()
                 .find(|t| t.after_clip_index == clip_idx)
-                .filter(|t| t.kind.kind() != TransitionKind::Cut)
+                .filter(|t| t.kind.kind != TransitionKind::Cut)
         } else {
             None
         };
 
         let transition_secs: f64 = transition_entry
-            .map(|t| t.kind.duration_secs() as f64)
+            .map(|t| t.kind.duration_secs as f64)
             .unwrap_or(0.0);
 
         // Build the effective ClipSpec for this clip:
@@ -643,7 +643,7 @@ fn run_encode(
                 skip_audio:    false,
             };
 
-            if let Some(transition_impl) = transition_registry.get(&entry.kind.kind()) {
+            if let Some(transition_impl) = transition_registry.get(&entry.kind.kind) {
                 output_frame_idx = apply_transition(
                     transition_impl.as_ref(),
                     &tail_spec,

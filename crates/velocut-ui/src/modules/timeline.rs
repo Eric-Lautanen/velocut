@@ -794,7 +794,7 @@ impl EditorModule for TimelineModule {
                             // Any non-Cut transition counts as "has transition"
                             // — checked against the registry so new transitions
                             // are automatically included without touching this code.
-                            let has_transition = matches!(current_kind, Some(k) if k.kind() != velocut_core::transitions::TransitionKind::Cut);
+                            let has_transition = matches!(current_kind, Some(k) if k.kind != velocut_core::transitions::TransitionKind::Cut);
                             let is_open = self.transition_popup.map(|(id, _)| id == clip_a.id).unwrap_or(false);
 
                             let badge_color = if is_open {
@@ -829,7 +829,7 @@ impl EditorModule for TimelineModule {
                             let icon = current_kind
                                 .and_then(|k| {
                                     let reg = velocut_core::transitions::registry();
-                                    reg.get(&k.kind()).map(|t| t.icon())
+                                    reg.get(&k.kind).map(|t| t.icon())
                                 })
                                 .unwrap_or("✂");
                             painter.text(
@@ -848,10 +848,10 @@ impl EditorModule for TimelineModule {
                             );
                             let badge_sense = badge_sense.on_hover_ui(|ui: &mut egui::Ui| {
                                 let tip = match current_kind {
-                                    Some(k) if k.kind() != velocut_core::transitions::TransitionKind::Cut => {
+                                    Some(k) if k.kind != velocut_core::transitions::TransitionKind::Cut => {
                                         let reg = velocut_core::transitions::registry();
-                                        let label = reg.get(&k.kind()).map(|t| t.label()).unwrap_or("Transition");
-                                        format!("{}  {:.2}s — click to edit", label, k.duration_secs())
+                                        let label = reg.get(&k.kind).map(|t| t.label()).unwrap_or("Transition");
+                                        format!("{}  {:.2}s — click to edit", label, k.duration_secs)
                                     }
                                     _ => "Cut — click to add transition".to_string(),
                                 };
@@ -937,7 +937,7 @@ impl EditorModule for TimelineModule {
                 let current_kind = state.transitions.iter()
                     .find(|t| t.after_clip_id == after_clip_id)
                     .map(|t| t.kind.clone())
-                    .unwrap_or(TransitionType::Cut);
+                    .unwrap_or(TransitionType::cut());
 
                 // Position the popup below and centered on the badge.
                 // Clamp to avoid going off-screen bottom.
@@ -979,7 +979,7 @@ impl EditorModule for TimelineModule {
                                 // Adding a new transition requires no changes here.
                                 ui.horizontal_wrapped(|ui| {
                                     // Cut is always the first option, hardcoded as "remove transition".
-                                    let cut_selected = matches!(current_kind, TransitionType::Cut);
+                                    let cut_selected = current_kind.kind == velocut_core::transitions::TransitionKind::Cut;
                                     let cut_btn = egui::Button::new(
                                         RichText::new("✂  Cut")
                                             .size(11.0)
@@ -994,7 +994,7 @@ impl EditorModule for TimelineModule {
 
                                     // One button per registered transition — no hardcoding.
                                     for entry in velocut_core::transitions::registered() {
-                                        let selected = current_kind.kind() == entry.kind();
+                                        let selected = current_kind.kind == entry.kind();
                                         let btn = egui::Button::new(
                                             RichText::new(format!("{}  {}", entry.icon(), entry.label()))
                                                 .size(11.0)
@@ -1006,8 +1006,8 @@ impl EditorModule for TimelineModule {
                                         if ui.add(btn).clicked() {
                                             // Preserve duration if switching between transitions,
                                             // fall back to the new transition's default.
-                                            let dur = if current_kind.duration_secs() > 0.0 {
-                                                current_kind.duration_secs()
+                                            let dur = if current_kind.duration_secs > 0.0 {
+                                                current_kind.duration_secs
                                             } else {
                                                 entry.default_duration_secs()
                                             };
@@ -1020,13 +1020,13 @@ impl EditorModule for TimelineModule {
                                 });
 
                                 // Duration slider — shown for any active non-Cut transition.
-                                if current_kind.kind() != velocut_core::transitions::TransitionKind::Cut {
+                                if current_kind.kind != velocut_core::transitions::TransitionKind::Cut {
                                     ui.add_space(8.0);
                                     ui.label(
                                         RichText::new("Duration").size(10.0).color(DARK_TEXT_DIM),
                                     );
                                     ui.add_space(2.0);
-                                    let mut dur = current_kind.duration_secs();
+                                    let mut dur = current_kind.duration_secs;
                                     let slider = egui::Slider::new(&mut dur, 0.1f32..=3.0)
                                         .step_by(0.05)
                                         .suffix("s")
@@ -1034,7 +1034,7 @@ impl EditorModule for TimelineModule {
                                     if ui.add(slider).changed() {
                                         // Re-build the same transition type with the new duration.
                                         let reg = velocut_core::transitions::registry();
-                                        if let Some(entry) = reg.get(&current_kind.kind()) {
+                                        if let Some(entry) = reg.get(&current_kind.kind) {
                                             cmd.push(EditorCommand::SetTransition {
                                                 after_clip_id,
                                                 kind: entry.build(dur),
