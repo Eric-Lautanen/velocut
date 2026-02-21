@@ -47,12 +47,13 @@ Key variants: `SetTransition { after_clip_id: Uuid, kind: TransitionType }`, `Re
 
 **`transitions/mod.rs`** — Three layers:
 1. **Serialized types**: `TransitionKind` (`Copy` enum, registry key: `Cut`, `Crossfade`; add new here + matching `TransitionType` variant), `TransitionType` (data enum: `Cut`, `Crossfade { duration_secs: f32 }` — **never rename/remove variants, they're on disk**), `TimelineTransition { after_clip_id, kind }` (in `ProjectState.transitions`), `ClipTransition { after_clip_index, kind }` (encode-only). `TransitionType::kind() -> TransitionKind`, `TransitionType::duration_secs() -> f32`.
-2. **`VideoTransition` trait**: `kind()`, `label() -> &'static str`, `icon() -> &'static str` (badge emoji), `default_duration_secs() -> f32`, `build(duration_secs) -> TransitionType` (**UI always calls this, never constructs `TransitionType` directly**), `apply(frame_a, frame_b, w, h, alpha) -> Vec<u8>` (packed YUV420P blend, once per frame, all inner loops inside impl).
-3. **Registry**: `make_entries()` = single add-point. `registered() -> Vec<Box<dyn VideoTransition>>` (stable-ordered, for UI). `registry() -> HashMap<TransitionKind, Box<dyn VideoTransition>>` (O(1), for encode/preview). `Cut` has no registry entry — callers short-circuit on `TransitionKind::Cut`.
+2. **`VideoTransition` trait**: `kind()`, `label() -> &'static str`, `icon() -> &'static str` (badge emoji — must include `U+FE0F` variation selector), `default_duration_secs() -> f32`, `build(duration_secs) -> TransitionType` (**UI always calls this, never constructs `TransitionType` directly**), `apply(frame_a: &[u8], frame_b: &[u8], width: u32, height: u32, alpha: f32) -> Vec<u8>` (packed YUV420P blend, once per frame, all inner loops inside impl).
+3. **Registry**: driven by `declare_transitions!` macro — **single add-point**. Expands each `module::Struct` entry into both the `mod` declaration and the `make_entries()` vec simultaneously. `registered() -> Vec<Box<dyn VideoTransition>>` (stable-ordered, for UI). `registry() -> HashMap<TransitionKind, Box<dyn VideoTransition>>` (O(1), for encode/preview). `Cut` has no registry entry — callers short-circuit on `TransitionKind::Cut`.
+`pub mod helpers` declared explicitly (not via macro — it's a utility module, not a transition).
 
-**`transitions/helpers.rs`** — Pure f32, no FFmpeg. Easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `linear`. `frame_alpha(i, n) -> f32` → `(i+1)/(n+1)` exclusive. `blend_byte(a, b, alpha) -> u8`. `clamp01`, `lerp`.
+**`transitions/helpers.rs`** — Pure f32, no FFmpeg. Easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `linear`, `ease_out_bounce`, `ease_in_bounce`, `ease_out_elastic`. `frame_alpha(i, n) -> f32` → `(i+1)/(n+1)` exclusive. `blend_byte(a, b, alpha) -> u8`. `clamp01`, `lerp`. Plane layout: `y_len(w,h)`, `uv_len(w,h)`, `u_offset(w,h)`, `v_offset(w,h)`, `split_planes(buf,w,h) -> (&Y,&U,&V)` (debug-asserts buffer size). Spatial: `norm_x(x,w)`, `norm_y(y,h)` (normalized pixel coords), `center_dist(nx,ny)` (distance from frame center, for iris wipes), `wipe_alpha(coord, edge, feather)` (hard or soft-edge wipe alpha from a single coordinate — core primitive for directional wipes).
 
-**`transitions/crossfade.rs`** — `Crossfade`: `label`="Dissolve", `icon`="🌫", `build(dur)`→`TransitionType::Crossfade{dur}`, `apply` uses `blend_byte(a,b,ease_in_out(alpha))`. Unit tests run without FFmpeg.
+**`transitions/crossfade.rs`** — `Crossfade`: `label`="Dissolve", `icon`="🌫️" (`U+1F32B U+FE0F` — variation selector required), `build(dur)`→`TransitionType::Crossfade{dur}`, `apply` uses `blend_byte(a,b,ease_in_out(alpha))`. Unit tests run without FFmpeg.
 
 ---
 
@@ -66,7 +67,7 @@ Setup: `Context::new_with_codec(h264)`, CRF 18 + preset fast + **`g=fps` (keyfra
 `CropScaler`: center-crop SwsContext, no letterbox. Built with `crop_w×crop_h` as source dims. `run()` pre-advances data ptrs to `crop_y` row (`crop_y*ls[0]` Y, `(crop_y/2)*ls[1]` UV) and passes `srcSliceY=0` — **never pass `crop_y` as `srcSliceY` → EINVAL** (only manifests portrait→landscape where `crop_y>0`).
 Transition dispatch: `registry()` built **once** before clip loop. Per-boundary: `TransitionType::kind()` for key, `duration_secs()` for overlap. `apply_transition(&dyn VideoTransition, ...)` calls `transition.apply()` with `frame_alpha(i,n)` — no blend math in `encode.rs`. Decoder-flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
 
-**`decode.rs`** — `LiveDecoder`: stateful per-clip, open+seek on construct. `next_frame()` playback, `advance_to(pts)` forward scrub (decode-only pre-target, scale once on hit ~4× faster), `burn_to_pts()` sync pre-roll. Owns `frame_buf: Vec<u8>` pre-alloc `out_w*out_h*4` (no per-frame alloc). `open(path, ts, aspect, cached_scaler)` — `cached_scaler: Option<(SwsContext, Pixel, u32, u32)>` reused if format+dims match. Pub fields: `decoder_fmt, decoder_w, decoder_h` (reuse key). **Output always source native AR** (`out_h = 640*src_h/src_w`), `aspect` param ignored — **never use project AR to size decode output** (pre-stretches, downstream consumers crop themselves). `decode_frame()`: one-shot HQ, seeks via `seek_to_secs`.
+**`decode.rs`** — `LiveDecoder`: stateful per-clip, open+seek on construct. `next_frame()` playback, `advance_to(pts)` forward scrub (decode-only pre-target, scale once on hit ~4× faster), `burn_to_pts()` sync pre-roll. Owns `frame_buf: Vec<u8>` pre-alloc `out_w*out_h*4` (no per-frame alloc). `open(path, ts, aspect, cached_scaler)` — `cached_scaler: Option<(SwsContext, Pixel, u32, u32)>` reused if format+dims match. Pub fields: `decoder_fmt, decoder_w, decoder_h` (reuse key). **`aspect` param is legacy dead parameter — ignored, do not wire up.** **Output always source native AR** (`out_h = 640*src_h/src_w`), downstream consumers crop themselves. `decode_frame()`: one-shot HQ, seeks via `seek_to_secs`.
 
 **`probe.rs`** — `probe_duration`, `probe_video_size_and_thumbnail`. **SwsContext built lazily from first decoded frame** (not from `decoder.format()`/dims upfront — AVCC reports coded dims e.g. 1088 not 1080; Annex-B has `AV_PIX_FMT_NONE` pre-packet). Matched invariant with GLOBAL_HEADER encoder change.
 
@@ -114,7 +115,7 @@ Clip name labels: `fit_label(text, max_px)` at bottom of file (6.5px/char heuris
 
 **`modules/export_module.rs`** — `{ filename, quality: QualityPreset, fps, export_aspect, clear_confirm_at }`. Quality = short-side px (480/720/1080/1440/2160), dims rounded to even. `is_encoding` computed once at top of `ui()`. Header: label left, two-stage **⊘ Reset** right (`clear_confirm_at` arms 5s countdown as amber `"⚠ Xs?"`, second click fires `ClearProject`, disabled during encode). Three states: Idle / Encoding (progress bar + Stop) / Done (green banner, 5s auto-dismiss via `ui.memory` temp key) / Error.
 
-**`modules/audio_module.rs`** — `{ exhausted: HashSet<Uuid> }`. `tick()` only. Manages rodio Sinks. **Top of every playing tick: diff `audio_sinks.keys()` vs current timeline IDs, drop stale** (handles undo during playback). `exhausted` prevents `File::open` per-tick on short WAVs.
+**`modules/audio_module.rs`** — `{ exhausted: HashSet<Uuid> }`. `tick()` only. Manages rodio Sinks. **Top of every playing tick: diff `audio_sinks.keys()` vs current timeline IDs, drop stale** (handles undo during playback). `exhausted` prevents `File::open` per-tick on short WAVs — **cleared whenever `audio_sinks` is cleared** (playhead set, stop, undo, ClearProject) to avoid blocking re-added clips.
 
 **`modules/video_module.rs`** — Unit struct. `tick()` + `poll_playback()`. `active_media_id()` static.
 `poll_playback()`: PTS-gated single-slot → `pending_pb_frame` → `frame_cache` when `current_time >= frame.pts` (±1 frame, not older than 3s). `request_repaint()` after promotion is non-redundant (background thread, not input event). **Clip-transition eviction at top before any other logic** (before UI reads `frame_cache`).
@@ -136,8 +137,8 @@ Clip name labels: `fit_label(text, max_px)` at bottom of file (6.5px/char heuris
 
 1. Add `TransitionKind` variant in `transitions/mod.rs`
 2. Add `TransitionType` variant + arms in `kind()` and `duration_secs()`
-3. Create `transitions/myname.rs`, impl `VideoTransition` (all 6 methods; use `transitions/helpers.rs`)
-4. Add `mod myname;` + `Box::new(myname::MyTransition)` in `make_entries()`
+3. Create `transitions/myname.rs`, impl `VideoTransition` (all 5 required methods: `kind`, `label`, `icon`, `build`, `apply`; use `transitions/helpers.rs`)
+4. Add ONE line to `declare_transitions!` in `mod.rs`: `myname::MyTransition,`
 
 Badge, tooltip, popup button, slider, encode, preview — all auto. Zero other changes.
 
@@ -205,7 +206,7 @@ Cache roles:
 
 **`horizontal_wrapped`/`Grid` refuses to wrap in `ScrollArea`** — `ScrollArea::vertical()` gives inner Ui unbounded horizontal space during measurement; both widgets conclude no wrap needed. Fix: manual `chunks(cols)+ui.horizontal()`. Never retry wrapped/Grid approaches.
 
-**Export MP4 tail freeze (video shorter than audio)** — three causes: (1) `output_frame_idx` read from post-`rescale_ts` packet PTS (wrong units), (2) `out_frame_idx += 1` gated on `frame_written` (under-counted due to B-frame lookahead), (3) no audio ceiling in `encode_clip` so drain_fifo eagerly wrote 2s+ overrun before post-encode trim could catch it. Fixes: capture `frame_pts` before `rescale_ts`, unconditional `out_frame_idx += 1` after `send_frame` in decoder-flush, `pts_secs >= clip_end` guards in demuxer audio branch and audio-decoder flush. If regresses: check `output_frame_idx` units (must be frame-count/`1/fps`), check audio ceiling guards in both locations.
+**Export MP4 tail freeze (video shorter than audio)** — three causes: (1) `out_frame_idx` read from post-`rescale_ts` packet PTS (wrong units), (2) `out_frame_idx += 1` gated on `frame_written` (under-counted due to B-frame lookahead), (3) no audio ceiling in `encode_clip` so drain_fifo eagerly wrote 2s+ overrun before post-encode trim could catch it. Fixes: capture `frame_pts` before `rescale_ts`, unconditional `out_frame_idx += 1` after `send_frame` in decoder-flush, `pts_secs >= clip_end` guards in demuxer audio branch and audio-decoder flush. If regresses: check `out_frame_idx` units (must be frame-count/`1/fps`), check audio ceiling guards in both locations.
 
 **Video freezes after seek then jumps** — `burn_to_pts` takes 600ms+ on long GOPs; `current_time` advances via `stable_dt`; first frame PTS T arrives but `local_t` is `T+burn_time`; old 3.0s lower-bound too tight. Fix: 3.0s lower bound in `poll_playback()` Step 3. If regresses: check `too_old` guard threshold.
 
@@ -254,10 +255,11 @@ Cache roles:
 ## Helpers Quick Reference
 
 Use these, never inline:
-- Timeline/library lookups: `crate::helpers::clip_query::{timeline_clip, library_entry_for, clip_at_time, selected_timeline_clip, selected_clip_library_entry, is_extracted_audio_clip, linked_audio_clip}`
+- Timeline/library lookups: `crate::helpers::clip_query::{timeline_clip, library_entry_for, clip_at_time, selected_timeline_clip, selected_clip_library_entry, is_extracted_audio_clip, linked_audio_clip}` (`library_clip` is an alias for `library_entry_for` — use `library_entry_for`)
 - Time display: `velocut_core::helpers::time::{format_time, format_duration}`
 - AR: `velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label}`
 - String truncation: `crate::helpers::format::truncate`
 - Seeks: `crate::helpers::seek::seek_to_secs`
 - YUV pack/unpack: `crate::helpers::yuv::{extract_yuv, write_yuv}` (`blend_yuv_frame` available but delegated to `VideoTransition::apply()`)
-- Transition UI: `velocut_core::transitions::{registered, registry}`, `transitions::helpers::{frame_alpha, ease_in_out, blend_byte}`
+- Transition UI: `velocut_core::transitions::{registered, registry}` (`registered()` = Vec for UI iteration, `registry()` = HashMap for O(1) encode lookup)
+- Transition math: `transitions::helpers::{frame_alpha, blend_byte, clamp01, lerp}` — easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `linear`, `ease_out_bounce`, `ease_out_elastic` — plane layout: `split_planes`, `y_len`, `uv_len`, `u_offset`, `v_offset` — spatial: `norm_x`, `norm_y`, `center_dist`, `wipe_alpha`
