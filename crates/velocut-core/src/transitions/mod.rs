@@ -31,6 +31,8 @@
 //             encode does O(1) lookup via `registry()`. Cut is never in either
 //             — callers short-circuit on `TransitionKind::Cut`.
 
+pub mod helpers;
+
 use std::collections::HashMap;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
