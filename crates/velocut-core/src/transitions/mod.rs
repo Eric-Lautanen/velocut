@@ -79,7 +79,8 @@ declare_transitions! {
     crossfade::Crossfade       => Crossfade,
     dip_to_black::DipToBlack   => DipToBlack,
     iris::Iris                 => Iris,
-    // wipe::Wipe               => Wipe,
+    wipe::Wipe                 => Wipe,
+    push::Push                 => Push,
 }
 
 // ── Serialized project types ──────────────────────────────────────────────────
