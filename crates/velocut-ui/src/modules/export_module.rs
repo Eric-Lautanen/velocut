@@ -642,8 +642,11 @@ impl ExportModule {
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let timeline_ids: std::collections::HashSet<_> =
+                    state.timeline.iter().map(|c| c.id).collect();
                 let transition_count = state.transitions.iter()
-                    .filter(|t| t.kind.kind != velocut_core::transitions::TransitionKind::Cut)
+                    .filter(|t| t.kind.kind != velocut_core::transitions::TransitionKind::Cut
+                        && timeline_ids.contains(&t.after_clip_id))
                     .count();
                 if transition_count == 0 {
                     ui.label(
