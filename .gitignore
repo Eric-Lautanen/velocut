@@ -1,8 +1,38 @@
-# Build results
+# Build artifacts
+target/
 [Dd]ebug/
 [Rr]elease/
 bin/
 obj/
+
+# Compiled outputs
 *.dll
 *.pdb
 *.exe
+
+# Rust/Cargo
+Cargo.lock.bak
+
+# FFmpeg static libs (if stored locally, not in repo)
+*.a
+*.lib
+
+# Editor & IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docview
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp / logs
+*.log
+*.tmp
+*.bak
+*~

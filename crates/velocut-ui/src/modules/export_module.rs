@@ -652,7 +652,7 @@ impl ExportModule {
                     );
                 } else {
                     ui.label(
-                        RichText::new(format!("⇌  {} transition{} active",
+                        RichText::new(format!("🔗  {} transition{} active",
                             transition_count,
                             if transition_count == 1 { "" } else { "s" }))
                             .size(11.0).color(ACCENT),
