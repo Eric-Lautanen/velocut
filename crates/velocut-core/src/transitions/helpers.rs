@@ -12,6 +12,8 @@
 //   - Pixel blend
 //   - Packed YUV420P plane layout  ← spatial transitions need these
 //   - Spatial helpers              ← wipes, irises, directional effects
+//   - Plane sampling               ← offset / warped pixel access
+//   - Buffer utilities             ← allocation and whole-buffer blending
 
 // ── Clamp / lerp ─────────────────────────────────────────────────────────────
 
@@ -112,6 +114,20 @@ pub fn ease_out_elastic(t: f32) -> f32 {
     2.0_f32.powf(-10.0 * t) * ((t * 10.0 - 0.75) * c4).sin() + 1.0
 }
 
+/// Sine-based ease-in/out — gentler than smooth-step, zero derivative at
+/// both endpoints.
+///
+/// Use for slow ambient transitions (fade-to-color, vignette reveals) where
+/// the polynomial family feels too mechanical.  The sinusoidal curve has a
+/// softer "shoulder" entering and leaving the transition.
+///
+/// Visualize: https://easings.net/#easeInOutSine
+#[inline]
+pub fn ease_in_out_sine(t: f32) -> f32 {
+    let t = clamp01(t);
+    -((std::f32::consts::PI * t).cos() - 1.0) * 0.5
+}
+
 // ── Frame alpha ───────────────────────────────────────────────────────────────
 
 /// Compute the blend alpha for frame `i` of `n` total blended frames.
@@ -195,6 +211,21 @@ pub fn split_planes(buf: &[u8], w: u32, h: u32) -> (&[u8], &[u8], &[u8]) {
     (&buf[..yl], &buf[yl..yl + cl], &buf[yl + cl..])
 }
 
+/// Width and height of the chroma (U / V) planes for a frame of `w × h` pixels.
+///
+/// Returns `(w / 2, h / 2)`.  Prefer this over inlining the halving in every
+/// spatial transition — it keeps the chroma dimension calculation in one place
+/// and documents intent.
+///
+/// ```
+/// use velocut_core::transitions::helpers::chroma_dims;
+/// assert_eq!(chroma_dims(1920, 1080), (960, 540));
+/// ```
+#[inline]
+pub fn chroma_dims(w: u32, h: u32) -> (u32, u32) {
+    (w / 2, h / 2)
+}
+
 // ── Spatial helpers ───────────────────────────────────────────────────────────
 //
 // For wipes, iris transitions, and any effect that must decide per-pixel
@@ -203,6 +234,8 @@ pub fn split_planes(buf: &[u8], w: u32, h: u32) -> (&[u8], &[u8], &[u8]) {
 /// Normalized X coordinate of pixel column `x` in a frame of width `w`.
 ///
 /// Returns a value in [0.0, 1.0] — 0.0 = left edge, 1.0 = right edge.
+///
+/// Use `norm_xy` when you need both axes at once (common in 2-D spatial effects).
 #[inline]
 pub fn norm_x(x: u32, w: u32) -> f32 {
     (x as f32 + 0.5) / w as f32
@@ -211,9 +244,27 @@ pub fn norm_x(x: u32, w: u32) -> f32 {
 /// Normalized Y coordinate of pixel row `y` in a frame of height `h`.
 ///
 /// Returns a value in [0.0, 1.0] — 0.0 = top edge, 1.0 = bottom edge.
+///
+/// Use `norm_xy` when you need both axes at once (common in 2-D spatial effects).
 #[inline]
 pub fn norm_y(y: u32, h: u32) -> f32 {
     (y as f32 + 0.5) / h as f32
+}
+
+/// Normalized (X, Y) coordinates for a pixel at column `px`, row `py`.
+///
+/// Convenience wrapper around `norm_x` + `norm_y`.  Use in spatial transitions
+/// (iris, diagonal wipe, clock wipe) where both axes are always needed together.
+///
+/// ```
+/// use velocut_core::transitions::helpers::norm_xy;
+/// let (nx, ny) = norm_xy(1, 1, 4, 4);
+/// assert!((nx - 0.375).abs() < 1e-6);
+/// assert!((ny - 0.375).abs() < 1e-6);
+/// ```
+#[inline]
+pub fn norm_xy(px: u32, py: u32, w: u32, h: u32) -> (f32, f32) {
+    (norm_x(px, w), norm_y(py, h))
 }
 
 /// Distance from the frame center for a pixel at normalized (`nx`, `ny`).
@@ -241,12 +292,95 @@ pub fn center_dist(nx: f32, ny: f32) -> f32 {
 ///
 /// `feather = 0.0` gives a hard binary wipe. `feather = 0.05` (5 % of frame
 /// width) gives a soft anti-aliased edge that reads well on most content.
+///
+/// **Direction-agnostic** — pass whatever normalised coordinate is appropriate:
+///   - `norm_x(px, w)` for a left-to-right wipe
+///   - `norm_y(py, h)` for a top-to-bottom wipe
+///   - `1.0 - norm_x(px, w)` for a right-to-left wipe
+///   - `center_dist(nx, ny)` for an iris / circle reveal
 #[inline]
 pub fn wipe_alpha(coord: f32, edge: f32, feather: f32) -> f32 {
     if feather <= 0.0 {
         return if coord >= edge { 1.0 } else { 0.0 };
     }
     clamp01((coord - (edge - feather * 0.5)) / feather)
+}
+
+// ── Plane sampling ────────────────────────────────────────────────────────────
+//
+// For transitions that need to read a pixel from a plane at an arbitrary
+// (possibly offset, possibly out-of-bounds) position.  Any spatial warp —
+// push, slide, zoom, rotation, parallax — needs this.
+//
+// Two variants:
+//   sample_plane         — unchecked, assumes (px, py) is in bounds (use in
+//                          tight loops where you've already clamped externally)
+//   sample_plane_clamped — signed coordinates, clamps to the nearest valid
+//                          pixel (use when pixels may shift out of range)
+
+/// Read a single byte from `plane` at pixel column `px`, row `py`.
+///
+/// `w` is the plane's width in pixels.  No bounds checking is performed in
+/// release builds.  Use `sample_plane_clamped` when coordinates may fall
+/// outside the plane.
+///
+/// ```
+/// use velocut_core::transitions::helpers::sample_plane;
+/// let plane = vec![10u8, 20, 30, 40]; // 4×1 plane
+/// assert_eq!(sample_plane(&plane, 2, 0, 4), 30);
+/// ```
+#[inline]
+pub fn sample_plane(plane: &[u8], px: u32, py: u32, w: u32) -> u8 {
+    plane[(py * w + px) as usize]
+}
+
+/// Read a single byte from `plane` at signed pixel (`px`, `py`), clamping to
+/// the nearest in-bounds pixel when coordinates fall outside the frame.
+///
+/// Use this in push, slide, and parallax transitions where an offset can
+/// legally push source coordinates negative or beyond the plane boundary.
+/// The edge pixel is repeated (clamped) rather than black-filled so the
+/// border region blends cleanly into the adjacent clip.
+///
+/// `w` and `h` are the plane dimensions in pixels.
+#[inline]
+pub fn sample_plane_clamped(plane: &[u8], px: i32, py: i32, w: u32, h: u32) -> u8 {
+    let cx = px.clamp(0, w as i32 - 1) as u32;
+    let cy = py.clamp(0, h as i32 - 1) as u32;
+    plane[(cy * w + cx) as usize]
+}
+
+// ── Buffer utilities ──────────────────────────────────────────────────────────
+//
+// Allocation and whole-buffer operations shared across multiple transition
+// impls.  Using these eliminates boilerplate and keeps the "packed YUV420P"
+// invariant in one place.
+
+/// Allocate a zero-filled packed YUV420P buffer for a frame of `w × h` pixels.
+///
+/// Useful in tests, pre-allocated output buffers, and transitions that build
+/// their output plane-by-plane.  The returned buffer has length
+/// `y_len(w, h) + uv_len(w, h) * 2`.
+///
+/// YUV value 0 = black luma + minimum chroma (not neutral grey — use 128 for
+/// neutral chroma if constructing intermediate frames).
+#[inline]
+pub fn alloc_frame(w: u32, h: u32) -> Vec<u8> {
+    vec![0u8; y_len(w, h) + uv_len(w, h) * 2]
+}
+
+/// Blend two equal-length byte slices at a uniform `alpha` ∈ [0.0, 1.0].
+///
+/// `alpha = 0.0` → 100 % `a`, `alpha = 1.0` → 100 % `b`.
+///
+/// Use for crossfade-style transitions that apply the same alpha to every
+/// pixel.  For per-pixel alpha (wipes, iris), loop manually with `blend_byte`.
+///
+/// Panics in debug builds if `a.len() != b.len()`.
+#[inline]
+pub fn blend_buffers(a: &[u8], b: &[u8], alpha: f32) -> Vec<u8> {
+    debug_assert_eq!(a.len(), b.len(), "blend_buffers: slice length mismatch");
+    a.iter().zip(b.iter()).map(|(&av, &bv)| blend_byte(av, bv, alpha)).collect()
 }
 
 #[cfg(test)]
@@ -329,5 +463,92 @@ mod tests {
     fn norm_xy_center_pixel() {
         // A 4-wide frame: pixel 1 (0-indexed) should be near center
         assert!((norm_x(1, 4) - 0.375).abs() < 1e-6);
+    }
+
+    #[test]
+    fn norm_xy_matches_separate_calls() {
+        let (nx, ny) = norm_xy(3, 2, 8, 6);
+        assert!((nx - norm_x(3, 8)).abs() < 1e-7);
+        assert!((ny - norm_y(2, 6)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn ease_in_out_sine_endpoints() {
+        assert!((ease_in_out_sine(0.0)).abs() < 1e-6);
+        assert!((ease_in_out_sine(1.0) - 1.0).abs() < 1e-6);
+        assert!((ease_in_out_sine(0.5) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ease_in_out_sine_softer_than_smoothstep() {
+        // At t=0.1 the sine ease should be greater than smooth-step
+        // (it rises faster early, characteristic of the softer curve).
+        let sine  = ease_in_out_sine(0.1);
+        let poly  = ease_in_out(0.1);
+        assert!(sine > poly, "sine ease should lead smooth-step at t=0.1 (got {sine} vs {poly})");
+    }
+
+    #[test]
+    fn chroma_dims_1080p() {
+        assert_eq!(chroma_dims(1920, 1080), (960, 540));
+    }
+
+    #[test]
+    fn sample_plane_basic() {
+        // 4×2 plane, values are their flat index
+        let plane: Vec<u8> = (0..8).collect();
+        assert_eq!(sample_plane(&plane, 0, 0, 4), 0);
+        assert_eq!(sample_plane(&plane, 3, 0, 4), 3);
+        assert_eq!(sample_plane(&plane, 0, 1, 4), 4);
+        assert_eq!(sample_plane(&plane, 3, 1, 4), 7);
+    }
+
+    #[test]
+    fn sample_plane_clamped_in_bounds() {
+        let plane: Vec<u8> = (0..8).collect(); // 4×2
+        assert_eq!(sample_plane_clamped(&plane, 2, 1, 4, 2), 6);
+    }
+
+    #[test]
+    fn sample_plane_clamped_negative_coords() {
+        let plane: Vec<u8> = (10..18).collect(); // 4×2, values 10..17
+        // Negative x → clamp to col 0
+        assert_eq!(sample_plane_clamped(&plane, -5, 0, 4, 2), 10);
+        // Negative y → clamp to row 0
+        assert_eq!(sample_plane_clamped(&plane, 1, -3, 4, 2), 11);
+    }
+
+    #[test]
+    fn sample_plane_clamped_out_of_bounds_high() {
+        let plane: Vec<u8> = (0..8).collect(); // 4×2
+        // x too large → clamp to col 3 (value = row*4+3)
+        assert_eq!(sample_plane_clamped(&plane, 99, 0, 4, 2), 3);
+        // y too large → clamp to row 1, col 2 = 6
+        assert_eq!(sample_plane_clamped(&plane, 2, 99, 4, 2), 6);
+    }
+
+    #[test]
+    fn alloc_frame_correct_size() {
+        let buf = alloc_frame(8, 4);
+        assert_eq!(buf.len(), y_len(8, 4) + uv_len(8, 4) * 2);
+        assert!(buf.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn blend_buffers_endpoints() {
+        let a = vec![0u8, 100, 200];
+        let b = vec![100u8, 200, 50];
+        let at_zero = blend_buffers(&a, &b, 0.0);
+        let at_one  = blend_buffers(&a, &b, 1.0);
+        assert_eq!(at_zero, a);
+        assert_eq!(at_one,  b);
+    }
+
+    #[test]
+    fn blend_buffers_midpoint() {
+        let a = vec![0u8, 200];
+        let b = vec![200u8, 0];
+        let mid = blend_buffers(&a, &b, 0.5);
+        assert_eq!(mid, vec![100u8, 100]);
     }
 }
