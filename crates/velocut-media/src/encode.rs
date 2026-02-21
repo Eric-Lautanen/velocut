@@ -61,8 +61,8 @@ use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
 
 use velocut_core::media_types::MediaResult;
-use velocut_core::transitions::{ClipTransition, TransitionType};
-use crate::helpers::yuv::{extract_yuv, blend_yuv_frame, write_yuv};
+use velocut_core::transitions::{ClipTransition, TransitionType, TransitionKind, VideoTransition, registry};
+use crate::helpers::yuv::{extract_yuv, write_yuv};
 use crate::helpers::seek::seek_to_secs;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -564,9 +564,13 @@ fn run_encode(
     // consistently even at clip boundaries and at the very end.
     let mut last_video_dts: i64 = i64::MIN;
     // How many seconds to skip at the START of the next clip (set when an
-    // outgoing crossfade blends the incoming clip's head, so encode_clip
-    // doesn't re-encode those frames).
+    // outgoing transition has already blended the incoming clip's head, so
+    // encode_clip doesn't re-encode those frames).
     let mut incoming_skip_secs: f64 = 0.0;
+
+    // Build the transition registry once — cheap (zero-size structs) but no
+    // reason to reconstruct it on every clip iteration.
+    let transition_registry = registry();
 
     for (clip_idx, clip) in spec.clips.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -577,27 +581,28 @@ fn run_encode(
         let skip = incoming_skip_secs;
         incoming_skip_secs = 0.0;
 
-        // Check for an outgoing crossfade after this clip.
-        let crossfade_secs: f64 = if clip_idx + 1 < spec.clips.len() {
+        // Find the transition after this clip (if any) and resolve its duration.
+        // Cut has no duration and no registry entry — short-circuit it here.
+        let transition_entry = if clip_idx + 1 < spec.clips.len() {
             spec.transitions.iter()
                 .find(|t| t.after_clip_index == clip_idx)
-                .and_then(|t| match &t.kind {
-                    TransitionType::Crossfade { duration_secs } => Some(*duration_secs as f64),
-                    TransitionType::Cut => None,
-                })
-                .unwrap_or(0.0)
+                .filter(|t| t.kind.kind() != TransitionKind::Cut)
         } else {
-            0.0
+            None
         };
 
+        let transition_secs: f64 = transition_entry
+            .map(|t| t.kind.duration_secs() as f64)
+            .unwrap_or(0.0);
+
         // Build the effective ClipSpec for this clip:
-        //   - skip: skip the head that was already blended by the incoming crossfade
-        //   - crossfade_secs: stop that many seconds early so apply_crossfade can
+        //   - skip: skip the head that was already blended by the incoming transition
+        //   - transition_secs: stop that many seconds early so apply_transition can
         //     blend the tail with the next clip's head
         let effective = ClipSpec {
             path:          clip.path.clone(),
             source_offset: clip.source_offset + skip,
-            duration:      (clip.duration - skip - crossfade_secs).max(0.0),
+            duration:      (clip.duration - skip - transition_secs).max(0.0),
             volume:        clip.volume,
             skip_audio:    clip.skip_audio,
         };
@@ -617,43 +622,46 @@ fn run_encode(
         )?;
 
         // ── Transition hook ───────────────────────────────────────────────────
-        if crossfade_secs > 0.0 {
+        if let Some(entry) = transition_entry {
             let next_clip = &spec.clips[clip_idx + 1];
 
-            // Tail: last `crossfade_secs` of the current clip (just after encode_clip stopped).
-            // skip_audio = false: the crossfade audio blend needs PCM from both clips.
+            // Tail: last `transition_secs` of the current clip (just after encode_clip stopped).
+            // skip_audio = false: the transition audio blend needs PCM from both clips.
             let tail_spec = ClipSpec {
                 path:          clip.path.clone(),
                 source_offset: effective.source_offset + effective.duration,
-                duration:      crossfade_secs,
+                duration:      transition_secs,
                 volume:        clip.volume,
                 skip_audio:    false,
             };
-            // Head: first `crossfade_secs` of the next clip.
+            // Head: first `transition_secs` of the next clip.
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
                 source_offset: next_clip.source_offset,
-                duration:      crossfade_secs,
+                duration:      transition_secs,
                 volume:        next_clip.volume,
                 skip_audio:    false,
             };
 
-            output_frame_idx = apply_crossfade(
-                &tail_spec,
-                &head_spec,
-                spec,
-                &mut octx,
-                &mut video_encoder,
-                &mut audio_state,
-                output_frame_idx,
-                total_frames,
-                frame_tb,
-                &cancel,
-                tx,
-            )?;
+            if let Some(transition_impl) = transition_registry.get(&entry.kind.kind()) {
+                output_frame_idx = apply_transition(
+                    transition_impl.as_ref(),
+                    &tail_spec,
+                    &head_spec,
+                    spec,
+                    &mut octx,
+                    &mut video_encoder,
+                    &mut audio_state,
+                    output_frame_idx,
+                    total_frames,
+                    frame_tb,
+                    &cancel,
+                    tx,
+                )?;
 
-            // Tell the next iteration to skip the head it already blended.
-            incoming_skip_secs = crossfade_secs;
+                // Tell the next iteration to skip the head it already blended.
+                incoming_skip_secs = transition_secs;
+            }
         }
 
         if cancel.load(Ordering::Relaxed) {
@@ -1203,7 +1211,7 @@ fn encode_clip(
 /// as: [Y plane (w×h)] ++ [U plane (w/2 × h/2)] ++ [V plane (w/2 × h/2)].
 /// Strides are removed — each row is packed tightly to exactly `w` (or `w/2`) bytes.
 ///
-/// Used by apply_crossfade to collect the tail frames of clip A and head frames
+/// Used by apply_transition to collect the tail frames of clip A and head frames
 /// of clip B before blending them.
 fn decode_clip_frames(
     clip: &ClipSpec,
@@ -1300,18 +1308,23 @@ fn decode_clip_frames(
     Ok(frames)
 }
 
-/// Encode the crossfade blend between `tail_spec` (end of clip A) and
-/// `head_spec` (start of clip B).
+/// Encode the blended frames between `tail_spec` (end of clip A) and
+/// `head_spec` (start of clip B) using the provided `VideoTransition` impl.
 ///
 /// Steps:
 ///   1. Decode all frames from both specs into packed YUV420P.
-///   2. For each frame pair blend with alpha going from 0 (exclusive) → 1 (exclusive).
+///   2. For each frame pair compute alpha via frame_alpha(i, n) and delegate
+///      blending entirely to `transition.apply()` — no blend math lives here.
 ///   3. Encode each blended frame into octx, advancing `out_frame_idx`.
 ///   4. Drain the audio FIFO after each video frame (audio carries over naturally
 ///      from clip A's tail that was pushed during encode_clip).
 ///
+/// Generic over any `VideoTransition` — adding a new transition type requires
+/// no changes to this function.
+///
 /// Returns the next unused `out_frame_idx`.
-fn apply_crossfade(
+fn apply_transition(
+    transition:    &dyn VideoTransition,
     tail_spec:     &ClipSpec,
     head_spec:     &ClipSpec,
     spec:          &EncodeSpec,
@@ -1332,8 +1345,8 @@ fn apply_crossfade(
         return Ok(out_frame_idx);
     }
 
-    let w = spec.width  as usize;
-    let h = spec.height as usize;
+    let w    = spec.width  as usize;
+    let h    = spec.height as usize;
     let uv_w = w / 2;
     let uv_h = h / 2;
     let ost_tb = octx.stream(0).unwrap().time_base();
@@ -1345,10 +1358,16 @@ fn apply_crossfade(
 
         // alpha goes from just above 0 to just below 1 — no pure A or pure B frame
         // (those are handled by encode_clip on each side).
-        let alpha = (i + 1) as f32 / (n + 1) as f32;
-        let blended = blend_yuv_frame(&tail_frames[i], &head_frames[i], alpha);
+        // Easing is the transition impl's responsibility.
+        let alpha   = velocut_core::transitions::helpers::frame_alpha(i, n);
+        let blended = transition.apply(
+            &tail_frames[i],
+            &head_frames[i],
+            spec.width,
+            spec.height,
+            alpha,
+        );
 
-        // Build a VideoFrame from the packed blended data.
         let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
         yuv.set_pts(Some(out_frame_idx));
         unsafe {
@@ -1359,14 +1378,14 @@ fn apply_crossfade(
         write_yuv(&blended, &mut yuv, w, h, uv_w, uv_h);
 
         video_encoder.send_frame(&yuv)
-            .map_err(|e| format!("crossfade encode frame: {e}"))?;
+            .map_err(|e| format!("transition encode frame: {e}"))?;
 
         let mut pkt = Packet::empty();
         while video_encoder.receive_packet(&mut pkt).is_ok() {
             pkt.set_stream(0);
             pkt.rescale_ts(frame_tb, ost_tb);
             pkt.write_interleaved(octx)
-                .map_err(|e| format!("crossfade write packet: {e}"))?;
+                .map_err(|e| format!("transition write packet: {e}"))?;
         }
 
         // Drain whatever audio the FIFO has from clip A's tail.

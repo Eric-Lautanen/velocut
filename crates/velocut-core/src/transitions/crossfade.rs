@@ -25,11 +25,19 @@ impl VideoTransition for Crossfade {
     }
 
     fn label(&self) -> &'static str {
-        "Crossfade"
+        "Dissolve"
+    }
+
+    fn icon(&self) -> &'static str {
+        "🌫"
     }
 
     fn default_duration_secs(&self) -> f32 {
         0.5
+    }
+
+    fn build(&self, duration_secs: f32) -> TransitionType {
+        TransitionType::Crossfade { duration_secs }
     }
 
     /// Blend two packed YUV420P buffers at `alpha` with smooth-step easing.

@@ -791,19 +791,18 @@ impl EditorModule for TimelineModule {
                                 .find(|t| t.after_clip_id == clip_a.id)
                                 .map(|t| &t.kind);
 
-                            let has_transition = matches!(current_kind, Some(TransitionType::Crossfade { .. }));
+                            // Any non-Cut transition counts as "has transition"
+                            // — checked against the registry so new transitions
+                            // are automatically included without touching this code.
+                            let has_transition = matches!(current_kind, Some(k) if k.kind() != velocut_core::transitions::TransitionKind::Cut);
                             let is_open = self.transition_popup.map(|(id, _)| id == clip_a.id).unwrap_or(false);
 
-                            // ── Badge colour ──────────────────────────────────
-                            // Open → accent; crossfade → blue; cut → clearly
-                            // visible mid-gray (was gray(90) — too dark to see
-                            // against the track background).
                             let badge_color = if is_open {
                                 ACCENT
                             } else if has_transition {
                                 Color32::from_rgb(120, 180, 255)
                             } else {
-                                Color32::from_gray(165)  // was 90 — now visible
+                                Color32::from_gray(165)
                             };
 
                             // Badge: small pill straddling the join line
@@ -826,8 +825,13 @@ impl EditorModule for TimelineModule {
                                 Stroke::new(1.0, badge_color),
                                 egui::StrokeKind::Outside,
                             );
-                            // Icon: ⇌ for crossfade, ✂ for cut
-                            let icon = if has_transition { "⇌" } else { "✂" };
+                            // Icon: comes from the active transition's impl, or ✂ for Cut.
+                            let icon = current_kind
+                                .and_then(|k| {
+                                    let reg = velocut_core::transitions::registry();
+                                    reg.get(&k.kind()).map(|t| t.icon())
+                                })
+                                .unwrap_or("✂");
                             painter.text(
                                 badge_center,
                                 Align2::CENTER_CENTER,
@@ -844,8 +848,11 @@ impl EditorModule for TimelineModule {
                             );
                             let badge_sense = badge_sense.on_hover_ui(|ui: &mut egui::Ui| {
                                 let tip = match current_kind {
-                                    Some(TransitionType::Crossfade { duration_secs }) =>
-                                        format!("Crossfade  {:.2}s — click to edit", duration_secs),
+                                    Some(k) if k.kind() != velocut_core::transitions::TransitionKind::Cut => {
+                                        let reg = velocut_core::transitions::registry();
+                                        let label = reg.get(&k.kind()).map(|t| t.label()).unwrap_or("Transition");
+                                        format!("{}  {:.2}s — click to edit", label, k.duration_secs())
+                                    }
                                     _ => "Cut — click to add transition".to_string(),
                                 };
                                 ui.label(RichText::new(tip).size(11.0));
@@ -968,11 +975,11 @@ impl EditorModule for TimelineModule {
                                 ui.separator();
                                 ui.add_space(6.0);
 
-                                // Type selector buttons
-                                ui.horizontal(|ui| {
+                                // Type selector buttons — driven entirely by the registry.
+                                // Adding a new transition requires no changes here.
+                                ui.horizontal_wrapped(|ui| {
+                                    // Cut is always the first option, hardcoded as "remove transition".
                                     let cut_selected = matches!(current_kind, TransitionType::Cut);
-                                    let fade_selected = matches!(current_kind, TransitionType::Crossfade { .. });
-
                                     let cut_btn = egui::Button::new(
                                         RichText::new("✂  Cut")
                                             .size(11.0)
@@ -981,48 +988,58 @@ impl EditorModule for TimelineModule {
                                     .fill(if cut_selected { ACCENT } else { DARK_BG_2 })
                                     .stroke(Stroke::new(1.0, if cut_selected { ACCENT } else { DARK_BORDER }))
                                     .min_size(egui::vec2(80.0, 26.0));
-
-                                    let fade_btn = egui::Button::new(
-                                        RichText::new("🌫️  Dissolve")
-                                            .size(11.0)
-                                            .color(if fade_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
-                                    )
-                                    .fill(if fade_selected { ACCENT } else { DARK_BG_2 })
-                                    .stroke(Stroke::new(1.0, if fade_selected { ACCENT } else { DARK_BORDER }))
-                                    .min_size(egui::vec2(80.0, 26.0));
-
                                     if ui.add(cut_btn).clicked() {
                                         cmd.push(EditorCommand::RemoveTransition(after_clip_id));
                                     }
-                                    if ui.add(fade_btn).clicked() {
-                                        let dur = match &current_kind {
-                                            TransitionType::Crossfade { duration_secs } => *duration_secs,
-                                            _ => 0.5,
-                                        };
-                                        cmd.push(EditorCommand::SetTransition {
-                                            after_clip_id,
-                                            kind: TransitionType::Crossfade { duration_secs: dur },
-                                        });
+
+                                    // One button per registered transition — no hardcoding.
+                                    for entry in velocut_core::transitions::registered() {
+                                        let selected = current_kind.kind() == entry.kind();
+                                        let btn = egui::Button::new(
+                                            RichText::new(format!("{}  {}", entry.icon(), entry.label()))
+                                                .size(11.0)
+                                                .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                        )
+                                        .fill(if selected { ACCENT } else { DARK_BG_2 })
+                                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }))
+                                        .min_size(egui::vec2(80.0, 26.0));
+                                        if ui.add(btn).clicked() {
+                                            // Preserve duration if switching between transitions,
+                                            // fall back to the new transition's default.
+                                            let dur = if current_kind.duration_secs() > 0.0 {
+                                                current_kind.duration_secs()
+                                            } else {
+                                                entry.default_duration_secs()
+                                            };
+                                            cmd.push(EditorCommand::SetTransition {
+                                                after_clip_id,
+                                                kind: entry.build(dur),
+                                            });
+                                        }
                                     }
                                 });
 
-                                // Duration slider — only shown for Crossfade
-                                if let TransitionType::Crossfade { duration_secs } = &current_kind {
+                                // Duration slider — shown for any active non-Cut transition.
+                                if current_kind.kind() != velocut_core::transitions::TransitionKind::Cut {
                                     ui.add_space(8.0);
                                     ui.label(
                                         RichText::new("Duration").size(10.0).color(DARK_TEXT_DIM),
                                     );
                                     ui.add_space(2.0);
-                                    let mut dur = *duration_secs;
+                                    let mut dur = current_kind.duration_secs();
                                     let slider = egui::Slider::new(&mut dur, 0.1f32..=3.0)
                                         .step_by(0.05)
                                         .suffix("s")
                                         .show_value(true);
                                     if ui.add(slider).changed() {
-                                        cmd.push(EditorCommand::SetTransition {
-                                            after_clip_id,
-                                            kind: TransitionType::Crossfade { duration_secs: dur },
-                                        });
+                                        // Re-build the same transition type with the new duration.
+                                        let reg = velocut_core::transitions::registry();
+                                        if let Some(entry) = reg.get(&current_kind.kind()) {
+                                            cmd.push(EditorCommand::SetTransition {
+                                                after_clip_id,
+                                                kind: entry.build(dur),
+                                            });
+                                        }
                                     }
                                 }
                             });
