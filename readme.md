@@ -32,7 +32,7 @@ The UI is built with [egui](https://github.com/emilk/egui) / [eframe](https://gi
 - **Smooth playback** — Dedicated 32-frame buffered playback pipeline, PTS-gated and clocked by `stable_dt` for accurate audio/video sync
 - **Waveform display** — 4000-column waveform overlays on audio/video clips, rendered at clip pixel width with per-clip gain visualization
 - **Per-clip volume** — dB-space volume slider per clip (−60 to +6 dB) with visual waveform gain feedback
-- **Transitions** — Cut and Crossfade transitions between clips with configurable duration, rendered via stride-aware YUV420P frame blending
+- **Transitions** — Cut, Crossfade (dissolve), Dip to Black, Wipe (left-to-right feathered bar), and Push (hard-displacement slide) between clips with configurable duration, rendered via stride-aware YUV420P frame blending. New transitions register in one line via the `declare_transitions!` macro.
 - **Multi-clip import** — Batch import from file dialog or drag-and-drop onto the window
 - **Library management** — Thumbnail grid with multi-select (Ctrl, Shift, Ctrl+A), drag-to-timeline, right-click context menu
 - **Export** — H.264/MP4 encode at 480p/720p/1080p/1440p/2160p, 24/30/60 fps, with live progress bar and per-job cancellation
@@ -79,7 +79,8 @@ Pure data types and contracts shared across the workspace. No UI, no FFmpeg.
 | `state.rs` | Serializable `ProjectState`: library clips, timeline clips, playback state, encode status, transitions. Runtime-only fields marked `#[serde(skip)]`. |
 | `commands.rs` | `EditorCommand` enum — every user action emitted by UI modules and dispatched by `app.rs::process_command()`. |
 | `media_types.rs` | `MediaResult` variants sent from worker threads to the UI channel: `AudioPath`, `Duration`, `Thumbnail`, `Waveform`, `VideoSize`, `FrameSaved`, `VideoFrame`, `EncodeProgress`, `EncodeDone`, `EncodeError`. Also `PlaybackFrame` (RGBA + PTS) for the dedicated playback channel. |
-| `transitions.rs` | `TransitionType` (Cut, Crossfade) and `TimelineTransition` storage. |
+| `transitions/mod.rs` | `declare_transitions!` macro — single registration point for all transitions. Generates `TransitionKind` enum, registry, and module declarations. `TransitionType { kind, duration_secs }` is a plain struct (not an enum) so the shape never changes when transitions are added. `registered()` for UI iteration; `registry()` for O(1) encode lookup. |
+| `transitions/helpers.rs` | Pure math utilities for transition implementors: easing curves (`ease_in_out`, `ease_in_out_cubic`, `ease_in_out_sine`, bounce, elastic), plane layout (`split_planes`, `chroma_dims`, `y_len`, `uv_len`), buffer utils (`blend_byte`, `blend_buffers`, `alloc_frame`), spatial helpers (`norm_xy`, `center_dist`, `wipe_alpha`), and plane sampling (`sample_plane`, `sample_plane_clamped`). |
 | `helpers/time.rs` | `format_time(s)` → `MM:SS:FF` (30 fps) used on the timeline ruler and preview transport. `format_duration(s)` → `H:MM:SS / M:SS / S.Xs` used in the library grid. |
 | `helpers/geometry.rs` | `aspect_ratio_value(ar)` and `aspect_ratio_label(ar)` — shared between `export_module.rs` and `video_module.rs`. |
 
@@ -116,7 +117,7 @@ The egui application and binary entry point.
 | `helpers/format.rs` | UI-layer string utilities: `truncate(s, max)` for fixed-width tile labels. |
 | `modules/library.rs` | Thumbnail card grid with multi-select, drag-to-timeline, right-click context menu, batch import. Manual row chunking (`chunks(cols)` + `ui.horizontal()`) — required for correct wrapping inside `ScrollArea`. |
 | `modules/preview_module.rs` | Live frame display with thumbnail fallback. Transport bar and volume slider via raw coordinate math. |
-| `modules/timeline.rs` | Scrollable ruler + 4-lane track view. Clip blocks with thumbnail strips and waveform overlays. Floating `egui::Area` popups for transitions and per-clip volume. Scrub deduplication (sub-frame deltas dropped). Hotkeys: Space, Delete, ←/→. |
+| `modules/timeline.rs` | Scrollable ruler + 4-lane track view. Clip blocks with thumbnail strips and waveform overlays. Floating `egui::Area` popups for transitions (5-column `egui::Grid` layout) and per-clip volume. Scrub deduplication (sub-frame deltas dropped). Hotkeys: Space, Delete, ←/→. |
 | `modules/export_module.rs` | Resolution/fps/aspect controls, live encode progress, two-stage ⊘ Reset, auto-dismissing done/error banners. |
 | `modules/audio_module.rs` | Rodio sink manager. Evicts stale sinks when timeline clips are removed (handles undo/redo during active playback). |
 | `modules/video_module.rs` | Playback pipeline (PTS-gated single-slot) and 4-tier scrub system. `request_repaint()` after frame promotion is intentional — frames arrive from a background thread. |
