@@ -977,47 +977,61 @@ impl EditorModule for TimelineModule {
 
                                 // Type selector buttons — driven entirely by the registry.
                                 // Adding a new transition requires no changes here.
-                                ui.horizontal_wrapped(|ui| {
-                                    // Cut is always the first option, hardcoded as "remove transition".
-                                    let cut_selected = current_kind.kind == velocut_core::transitions::TransitionKind::Cut;
-                                    let cut_btn = egui::Button::new(
-                                        RichText::new("✂  Cut")
-                                            .size(11.0)
-                                            .color(if cut_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
-                                    )
-                                    .fill(if cut_selected { ACCENT } else { DARK_BG_2 })
-                                    .stroke(Stroke::new(1.0, if cut_selected { ACCENT } else { DARK_BORDER }))
-                                    .min_size(egui::vec2(80.0, 26.0));
-                                    if ui.add(cut_btn).clicked() {
-                                        cmd.push(EditorCommand::RemoveTransition(after_clip_id));
-                                    }
-
-                                    // One button per registered transition — no hardcoding.
-                                    for entry in velocut_core::transitions::registered() {
-                                        let selected = current_kind.kind == entry.kind();
-                                        let btn = egui::Button::new(
-                                            RichText::new(format!("{}  {}", entry.icon(), entry.label()))
+                                // Grid wraps after every 5 buttons so the popup doesn't
+                                // grow horizontally without bound as transitions are added.
+                                const COLS: usize = 5;
+                                egui::Grid::new("transition_grid")
+                                    .num_columns(COLS)
+                                    .spacing([4.0, 4.0])
+                                    .show(ui, |ui| {
+                                        // Cut is always the first option (col 0),
+                                        // hardcoded as "remove transition".
+                                        let cut_selected = current_kind.kind == velocut_core::transitions::TransitionKind::Cut;
+                                        let cut_btn = egui::Button::new(
+                                            RichText::new("✂  Cut")
                                                 .size(11.0)
-                                                .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                                .color(if cut_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
                                         )
-                                        .fill(if selected { ACCENT } else { DARK_BG_2 })
-                                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }))
+                                        .fill(if cut_selected { ACCENT } else { DARK_BG_2 })
+                                        .stroke(Stroke::new(1.0, if cut_selected { ACCENT } else { DARK_BORDER }))
                                         .min_size(egui::vec2(80.0, 26.0));
-                                        if ui.add(btn).clicked() {
-                                            // Preserve duration if switching between transitions,
-                                            // fall back to the new transition's default.
-                                            let dur = if current_kind.duration_secs > 0.0 {
-                                                current_kind.duration_secs
-                                            } else {
-                                                entry.default_duration_secs()
-                                            };
-                                            cmd.push(EditorCommand::SetTransition {
-                                                after_clip_id,
-                                                kind: entry.build(dur),
-                                            });
+                                        if ui.add(cut_btn).clicked() {
+                                            cmd.push(EditorCommand::RemoveTransition(after_clip_id));
                                         }
-                                    }
-                                });
+
+                                        // One button per registered transition — no hardcoding.
+                                        // `col` tracks position within the current row; Cut
+                                        // already occupies column 0 so we start at 1.
+                                        let mut col = 1usize;
+                                        for entry in velocut_core::transitions::registered() {
+                                            if col % COLS == 0 {
+                                                ui.end_row();
+                                            }
+                                            let selected = current_kind.kind == entry.kind();
+                                            let btn = egui::Button::new(
+                                                RichText::new(format!("{}  {}", entry.icon(), entry.label()))
+                                                    .size(11.0)
+                                                    .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                            )
+                                            .fill(if selected { ACCENT } else { DARK_BG_2 })
+                                            .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }))
+                                            .min_size(egui::vec2(80.0, 26.0));
+                                            if ui.add(btn).clicked() {
+                                                // Preserve duration if switching between transitions,
+                                                // fall back to the new transition's default.
+                                                let dur = if current_kind.duration_secs > 0.0 {
+                                                    current_kind.duration_secs
+                                                } else {
+                                                    entry.default_duration_secs()
+                                                };
+                                                cmd.push(EditorCommand::SetTransition {
+                                                    after_clip_id,
+                                                    kind: entry.build(dur),
+                                                });
+                                            }
+                                            col += 1;
+                                        }
+                                    });
 
                                 // Duration slider — shown for any active non-Cut transition.
                                 if current_kind.kind != velocut_core::transitions::TransitionKind::Cut {
