@@ -353,7 +353,7 @@ fn status_strip(ui: &mut Ui, state: &ProjectState, multi: &HashSet<Uuid>) {
                         );
                     } else if !multi.is_empty() || state.selected_library_clip.is_some() {
                         ui.label(
-                            RichText::new("🗑️ Delete • ✋ Click range • 👆 Click multi")
+                            RichText::new("🗑 Delete  •  ☞ Click range  •  ☝ Click multi")
                                 .size(8.5)
                                 .color(Color32::from_rgb(72, 72, 88)),
                         );
@@ -517,10 +517,10 @@ fn paint_drag_ghost(
 fn empty_state(ui: &mut Ui) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("🎬").size(36.0));
+        ui.label(RichText::new("▶").size(36.0));
         ui.add_space(8.0);
         ui.label(RichText::new("Drop files here").size(12.0).color(DARK_TEXT_DIM));
-        ui.label(RichText::new("or click  ＋ Import  above").size(10.5).color(Color32::from_gray(62)));
+        ui.label(RichText::new("or click  + Import  above").size(10.5).color(Color32::from_gray(62)));
         ui.add_space(16.0);
         ui.label(RichText::new("Supports MP4, MOV, MKV, AVI, MP3, WAV").size(9.0).color(Color32::from_gray(48)));
     });
@@ -529,5 +529,5 @@ fn empty_state(ui: &mut Ui) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn clip_icon(t: ClipType) -> &'static str {
-    match t { ClipType::Video => "🎬", ClipType::Audio => "🎵" }
+    match t { ClipType::Video => "▶", ClipType::Audio => "♪" }
 }

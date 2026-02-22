@@ -93,8 +93,8 @@ pub fn probe_video_size_and_thumbnail(
     };
     let mut decoder = context.decoder().video().unwrap();
 
-    // Thumbnail output: 320 wide, proportional height
-    let thumb_w: u32 = 320;
+    // Thumbnail output: 160 wide, proportional height
+    let thumb_w: u32 = 160;
     let thumb_h: u32 = ((thumb_w as f64 * raw_h as f64 / raw_w.max(1) as f64) as u32)
         .max(2) & !1; // must be even
 

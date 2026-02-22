@@ -42,13 +42,13 @@ use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
 // ── Colour palette extensions (local to this module) ─────────────────────────
 
 /// Muted green used for the "done" success banner.
-const GREEN_DIM: Color32 = Color32::from_rgb(80,  190, 120);
+const GREEN_DIM: Color32 = Color32::from_rgb(100, 220, 140);
 /// Muted red used for error / cancel banners.
-const RED_DIM:   Color32 = Color32::from_rgb(200, 80,  80);
+const RED_DIM:   Color32 = Color32::from_rgb(230, 100, 100);
 /// Background fill for the progress bar track.
-const TRACK_BG:  Color32 = Color32::from_rgb(45,  45,  55);
+const TRACK_BG:  Color32 = Color32::from_rgb(60,  60,  75);
 /// Filled portion of the progress bar.
-const TRACK_FG:  Color32 = Color32::from_rgb(90,  160, 255);
+const TRACK_FG:  Color32 = Color32::from_rgb(110, 180, 255);
 
 // ── Quality preset ────────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ impl EditorModule for ExportModule {
                 .inner_margin(Margin { left: 8, right: 8, top: 6, bottom: 6 })
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("🚀 Export").size(12.0).strong());
+                        ui.label(RichText::new("▶ Export").size(12.0).strong());
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // ── Two-stage "Reset Everything" button ───────────
@@ -214,7 +214,7 @@ impl EditorModule for ExportModule {
                                 );
                                 format!("⚠ {}s?", secs_left)
                             } else {
-                                "🔄 Reset".into()
+                                "↺ Reset".into()
                             };
 
                             let (text_color, fill, border) = if in_confirm {
@@ -341,7 +341,7 @@ impl ExportModule {
         // guaranteed to be in the same layer as the widgets and behind them.
         // A separate painter layer for the background risks compositing on top.
         egui::Area::new(egui::Id::new("render_modal_content"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Tooltip)
             .fixed_pos(card_rect.min)
             .show(ctx, |ui| {
                 ui.set_min_size(card_rect.size());
@@ -354,7 +354,7 @@ impl ExportModule {
                 ui.painter().rect(
                     card_rect,
                     0.0,
-                    Color32::from_rgb(14, 14, 20),
+                    Color32::from_rgb(22, 24, 32),
                     Stroke::new(1.5, border_col),
                     egui::StrokeKind::Inside,
                 );
@@ -431,7 +431,7 @@ impl ExportModule {
 
         // Cancel — full width, neutral (same as original)
         let cancel_btn = egui::Button::new(
-            RichText::new("✋  Stop Render").size(11.0).color(DARK_TEXT_DIM),
+            RichText::new("⏹  Stop Render").size(11.0).color(DARK_TEXT_DIM),
         )
         .stroke(Stroke::new(1.0, DARK_BORDER))
         .fill(DARK_BG_2)
@@ -455,14 +455,14 @@ impl ExportModule {
 
         // Success frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
-            .fill(Color32::from_rgb(22, 55, 35))
+            .fill(Color32::from_rgb(25, 65, 40))
             .stroke(Stroke::new(1.0, GREEN_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new(format!("🎉  Saved: {label}"))
+                    RichText::new(format!("✔  Saved: {label}"))
                         .size(11.0)
                         .color(GREEN_DIM),
                 );
@@ -485,9 +485,9 @@ impl ExportModule {
     fn modal_error(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
         let msg = state.encode_error.as_deref().unwrap_or("");
         let display = if msg == "cancelled" {
-            "💥  Render cancelled".to_string()
+            "⊗  Render cancelled".to_string()
         } else {
-            format!("💥  Error: {msg}")
+            format!("⊗  Error: {msg}")
         };
 
         ui.label(RichText::new("Render stopped").size(13.0).strong().color(Color32::WHITE));
@@ -495,7 +495,7 @@ impl ExportModule {
 
         // Error frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
-            .fill(Color32::from_rgb(55, 20, 20))
+            .fill(Color32::from_rgb(70, 25, 25))
             .stroke(Stroke::new(1.0, RED_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))

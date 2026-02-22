@@ -89,11 +89,14 @@ impl LiveDecoder {
         let raw_w = decoder.width().max(2);
         let raw_h = decoder.height().max(2);
 
-        let (out_w, out_h) = if aspect <= 0.0 {
-            (raw_w.max(2), raw_h.max(2))
-        } else {
-            let w: u32 = 640;
-            let h: u32 = ((w as f32 / aspect.max(0.01)) as u32).max(2) & !1;
+        // Always decode at native aspect ratio so the preview can center-crop
+        // to the project ratio via crop_uv_rect, rather than stretching/squishing
+        // clips whose native AR doesn't match the project setting.
+        // The `aspect` parameter is kept for API compatibility but unused here —
+        // the encode path uses extract_frame, not LiveDecoder.
+        let (out_w, out_h) = {
+            let w: u32 = 320;
+            let h: u32 = ((w as f32 * raw_h as f32 / raw_w.max(1) as f32) as u32).max(2) & !1;
             (w, h)
         };
 

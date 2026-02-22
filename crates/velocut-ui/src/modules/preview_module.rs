@@ -77,7 +77,7 @@ impl EditorModule for PreviewModule {
                 .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("📺 Monitor").size(12.0).strong());
+                        ui.label(RichText::new("🖼 Monitor").size(12.0).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let mut ar = state.aspect_ratio;
                             egui::ComboBox::from_id_salt("aspect_ratio")

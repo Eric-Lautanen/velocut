@@ -21,13 +21,13 @@ use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 
 // ── Visual constants (local) ──────────────────────────────────────────────────
 
-const DARK_BG_CARD:  Color32 = Color32::from_rgb(14,  14,  20);
-const DARK_BG_2:     Color32 = Color32::from_rgb(28,  28,  36);
-const DARK_BORDER:   Color32 = Color32::from_rgb(55,  55,  70);
+const DARK_BG_CARD:  Color32 = Color32::from_rgb(22,  24,  32);
+const DARK_BG_2:     Color32 = Color32::from_rgb(40,  42,  54);
+const DARK_BORDER:   Color32 = Color32::from_rgb(90,  92, 110);
 const DARK_TEXT:     Color32 = Color32::WHITE;
-const DARK_TEXT_DIM: Color32 = Color32::from_rgb(140, 140, 160);
-const GREEN_DIM:     Color32 = Color32::from_rgb(80,  190, 120);
-const GREEN_BG:      Color32 = Color32::from_rgb(18,  48,  28);
+const DARK_TEXT_DIM: Color32 = Color32::from_rgb(190, 190, 210);
+const GREEN_DIM:     Color32 = Color32::from_rgb(100, 220, 140);
+const GREEN_BG:      Color32 = Color32::from_rgb(25,  65,  40);
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 
@@ -230,7 +230,7 @@ pub fn show_uninstall_modal(ctx: &egui::Context, visible: &mut bool) {
     let inner_rect = card_rect.shrink(PAD);
 
     egui::Area::new(egui::Id::new("reset_modal_card"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Tooltip)
         .fixed_pos(card_rect.min)
         .show(ctx, |ui| {
             ui.set_min_size(card_rect.size());
