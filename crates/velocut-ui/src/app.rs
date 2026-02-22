@@ -74,6 +74,15 @@ pub struct VeloCutApp {
     /// before any panel renders. Cannot be done in process_command because
     /// ctx is not available there.
     clear_egui_memory: bool,
+
+    /// Set to true by ClearProject and checked in save() and on_exit().
+    ///
+    /// eframe calls save() automatically after the export_module deletes the
+    /// app-data directory, which would recreate %APPDATA%\VeloCut\data\ and
+    /// undo the deletion. When this flag is true save() becomes a no-op, and
+    /// on_exit() re-runs delete_app_data_dir() as a backstop in case eframe
+    /// squeezed in an autosave between the button click and the exit.
+    reset_done: bool,
 }
 
 impl VeloCutApp {
@@ -115,6 +124,7 @@ impl VeloCutApp {
             redo_stack:   VecDeque::new(),
             startup_size_checked: false,
             clear_egui_memory:    false,
+            reset_done:           false,
         }
     }
 
@@ -436,31 +446,23 @@ impl VeloCutApp {
 
             // ── Project reset ─────────────────────────────────────────────────
             EditorCommand::ClearProject => {
-                // ── Step 1: queue temp WAV deletions before wiping the library.
-                // Once library is cleared there's no way to recover the paths.
-                for clip in &self.state.library {
-                    if let Some(apath) = &clip.audio_path {
-                        self.state.pending_audio_cleanup.push(apath.clone());
-                    }
-                }
+                // Steps are ordered carefully — see reset.rs for filesystem ops.
 
-                // ── Step 2: stop the playback thread and drain its channel.
-                // Must happen before touching ProjectState — the decode loop
+                // Step 1: stop playback before touching state. The decode loop
                 // holds clip references and races if state changes under it.
                 self.context.media_worker.stop_playback();
 
-                // ── Step 3: drop audio sinks before clearing state.
-                // rodio decode threads reference the WAV path; dropping sinks
-                // first lets them finish cleanly before the path becomes invalid.
+                // Step 2: drop audio sinks. rodio threads reference WAV paths;
+                // dropping sinks lets them finish cleanly before paths go stale.
                 self.context.audio_sinks.clear();
 
-                // ── Step 4: evict all GPU textures and reset the byte budget.
+                // Step 3: evict all GPU textures and reset the byte budget.
                 self.context.cache.clear_all();
 
-                // ── Step 5: reset scrub / playback tracking.
+                // Step 4: reset scrub / playback tracking.
                 self.context.playback.reset();
 
-                // ── Step 6: wipe serialisable project data.
+                // Step 5: wipe serialisable project data.
                 self.state.library.clear();
                 self.state.timeline.clear();
                 self.state.transitions.clear();
@@ -469,100 +471,34 @@ impl VeloCutApp {
                 self.state.current_time           = 0.0;
                 self.state.is_playing             = false;
 
-                // ── Step 7: zero encode state (may have been mid-encode).
+                // Step 6: zero encode state (may have been mid-encode).
                 self.state.encode_job      = None;
                 self.state.encode_progress = None;
                 self.state.encode_done     = None;
                 self.state.encode_error    = None;
 
-                // ── Step 8: clear undo/redo — there is nothing meaningful to
-                // undo after a full wipe and stale snapshots waste memory.
+                // Step 7: clear undo/redo — stale snapshots waste memory and
+                // there is nothing meaningful to undo after a full wipe.
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.sync_undo_len();
 
-                // ── Step 9: delete the entire VeloCut application-data folder.
-                //
-                // eframe::storage_dir("VeloCut") returns the *data* sub-directory
-                // where eframe persists app state, NOT the top-level app folder:
-                //   Windows : %APPDATA%\VeloCut\data\   ← storage_dir
-                //             %APPDATA%\VeloCut\         ← what we want to delete
-                //   macOS   : ~/Library/Application Support/VeloCut/data/
-                //             ~/Library/Application Support/VeloCut/
-                //   Linux   : ~/.local/share/VeloCut/data/
-                //             ~/.local/share/VeloCut/
-                //
-                // Deleting only storage_dir leaves sibling directories such as
-                // `logs/` intact. We call .parent() to get the true VeloCut root
-                // and remove the whole tree — covers app.ron, window geometry,
-                // logs, and any other VeloCut-owned files in one shot.
-                // eframe's save() will recreate the data directory on next exit
-                // with the current (now-blank) state. Failure is logged but never fatal.
-                if let Some(storage_dir) = eframe::storage_dir("VeloCut") {
-                    // .parent() is None only if storage_dir is a filesystem root,
-                    // which cannot happen for a named app subdirectory. Fall back to
-                    // storage_dir itself so we at least delete what we can.
-                    let app_dir = storage_dir.parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| storage_dir.clone());
+                // Step 8: clear the deferred audio-cleanup queue.
+                // export_module called reset::delete_temp_files() synchronously
+                // before pushing this command, so every velocut_* file is already
+                // gone. Clearing the queue prevents poll_media from attempting a
+                // second deletion next frame and logging a spurious "file not found".
+                self.state.pending_audio_cleanup.clear();
 
-                    match std::fs::remove_dir_all(&app_dir) {
-                        Ok(()) => eprintln!(
-                            "[reset] deleted VeloCut app data dir '{}'",
-                            app_dir.display()
-                        ),
-                        Err(e) => eprintln!(
-                            "[reset] could not delete VeloCut app data dir '{}': {e}",
-                            app_dir.display()
-                        ),
-                    }
-                } else {
-                    eprintln!("[reset] eframe::storage_dir returned None — storage not deleted");
-                }
-
-                // ── Step 10: delete all orphaned VeloCut temp and log files.
-                //
-                // pending_audio_cleanup (step 1) only covers audio_path entries
-                // still tracked in the library. WAVs from previously-deleted
-                // clips or from a prior crashed session are not in that list.
-                // Scanning the OS temp dir catches all of them, plus the
-                // append-only log file (velocut.log) written by vlog().
-                let tmp = std::env::temp_dir();
-                match std::fs::read_dir(&tmp) {
-                    Ok(entries) => {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name();
-                            let name_str = name.to_string_lossy();
-                            // velocut_* — audio temp files (e.g. velocut_<uuid>.wav)
-                            // velocut.log — the unified UI log file written by vlog()
-                            let is_velocut_file = name_str.starts_with("velocut_")
-                                || name_str == "velocut.log";
-                            if is_velocut_file {
-                                let p = entry.path();
-                                if let Err(e) = std::fs::remove_file(&p) {
-                                    eprintln!("[reset] could not delete temp file '{}': {e}", p.display());
-                                } else {
-                                    eprintln!("[reset] deleted temp file '{}'", p.display());
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("[reset] could not read temp dir: {e}"),
-                }
-
-                // ── Step 11: schedule egui in-memory clear.
-                //
-                // Panel heights, scroll positions, and popup-open flags all live
-                // in egui's IdTypeMap inside Memory. Clearing them here is not
-                // possible because ctx is unavailable in process_command. The
-                // flag is consumed at the top of the very next update() call,
-                // before any panel is rendered, so the wiped values are what the
-                // layout engine sees on the first post-reset frame.
-                //
-                // startup_size_checked is also reset so the timeline height
-                // startup guard re-runs and injects a fresh default.
+                // Step 9: schedule egui in-memory clear. Panel heights, scroll
+                // positions, and popup flags live in egui's IdTypeMap and cannot
+                // be cleared here because ctx is unavailable in process_command.
+                // The flag is consumed at the top of the very next update() call,
+                // before any panel renders. startup_size_checked is also reset so
+                // the timeline-height guard re-runs and injects a fresh default.
                 self.clear_egui_memory    = true;
                 self.startup_size_checked = false;
+                self.reset_done           = true;
             }
             EditorCommand::SetCrossfadeDuration(secs) => {
                 // Batch operation: set crossfade on every touching adjacent pair,
@@ -747,7 +683,22 @@ impl VeloCutApp {
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for VeloCutApp {
+    fn persist_egui_memory(&self) -> bool {
+        // After a reset both of eframe's storage writes must be suppressed:
+        //   1. App::save()           — guarded by the early return below.
+        //   2. egui internal memory  — guarded here (panel sizes, scroll
+        //                             positions, open-popup flags).
+        // Without this, eframe still flushes egui's Memory to disk even when
+        // save() is a no-op, recreating %APPDATA%\VeloCut\data\ on its own.
+        !self.reset_done
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // After a reset the app-data directory has been deleted. Skip writing
+        // so eframe does not recreate %APPDATA%\VeloCut\data\ and undo that.
+        if self.reset_done {
+            return;
+        }
         // audio_path points to temp WAVs that are deleted on exit — clear them
         // before serializing so they don't resurrect as dead paths on next launch.
         let mut project = self.state.clone();
@@ -764,6 +715,14 @@ impl eframe::App for VeloCutApp {
             if let Some(apath) = &clip.audio_path {
                 cleanup_audio_temp(apath);
             }
+        }
+        // eframe flushes its own storage (window geometry, egui panel state)
+        // after on_exit() returns, which recreates %APPDATA%\VeloCut\data\
+        // even if our save() is a no-op. schedule_app_data_dir_deletion()
+        // spawns a detached cmd process that waits ~1 s then deletes the
+        // directory — by then eframe's final flush will have completed.
+        if self.reset_done {
+            crate::helpers::reset::schedule_app_data_dir_deletion();
         }
     }
 
@@ -956,6 +915,7 @@ impl VeloCutApp {
         // Must be called after all panels so the scrim paints above the full UI.
         // No-op while encode_job is None.
         self.export.show_render_modal(ctx, &self.state, &mut self.pending_cmds);
+        crate::helpers::reset::show_uninstall_modal(ctx, &mut self.export.show_reset_complete);
     }
 
     /// Tick non-rendering modules and advance the playback clock.

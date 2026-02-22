@@ -35,6 +35,7 @@ use velocut_core::state::{ProjectState, AspectRatio};
 use velocut_core::commands::EditorCommand;
 use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
 use crate::modules::ThumbnailCache;
+use crate::helpers::reset;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
 
@@ -138,6 +139,9 @@ pub struct ExportModule {
     /// `None` = normal state.  `Some(t)` = waiting for confirmation within 5 s.
     /// Auto-expires — checked and cleared on every render frame.
     clear_confirm_at: Option<std::time::Instant>,
+    /// Set to true when the user confirms a reset. Consumed by
+    /// `reset::show_uninstall_modal` which renders the post-reset overlay.
+    pub show_reset_complete: bool,
 }
 
 impl Default for ExportModule {
@@ -146,8 +150,9 @@ impl Default for ExportModule {
             filename:         "sequence_01".into(),
             quality:          QualityPreset::FHD1080,
             fps:              30,
-            export_aspect:    None, // follows project
-            clear_confirm_at: None,
+            export_aspect:        None, // follows project
+            clear_confirm_at:     None,
+            show_reset_complete:  false,
         }
     }
 }
@@ -242,8 +247,14 @@ impl EditorModule for ExportModule {
                                 .clicked()
                             {
                                 if in_confirm {
+                                    // Filesystem cleanup happens here — at the
+                                    // button site — so app.rs::process_command
+                                    // only has to deal with in-memory state.
+                                    reset::delete_app_data_dir();
+                                    reset::delete_temp_files();
                                     cmd.push(EditorCommand::ClearProject);
-                                    self.clear_confirm_at = None;
+                                    self.clear_confirm_at   = None;
+                                    self.show_reset_complete = true;
                                 } else {
                                     self.clear_confirm_at = Some(std::time::Instant::now());
                                 }
