@@ -16,6 +16,7 @@ use velocut_media::{MediaWorker, MediaResult};
 use velocut_core::media_types::PlaybackFrame;
 use velocut_core::state::ProjectState;
 use crate::modules::ThumbnailCache;
+use crate::velocut_log;
 use eframe::egui;
 use rodio::{OutputStream, Sink};
 use std::collections::HashMap;
@@ -23,10 +24,10 @@ use uuid::Uuid;
 
 // ── Memory ceiling ────────────────────────────────────────────────────────────
 // Approximate byte budget for GPU-resident frame textures.
-// At 640×360 RGBA each frame is ~900 KB; 128 frames ≈ 115 MB.
+// At 640×360 RGBA each frame is ~900 KB; 192 MB ≈ 213 frames.
 // This constant is checked on every frame_bucket_cache insert.
 // Change it here to tune the scrub cache size without touching eviction logic.
-const MAX_FRAME_CACHE_BYTES: usize = 256 * 1024 * 1024; // 192 MB
+const MAX_FRAME_CACHE_BYTES: usize = 192 * 1024 * 1024; // 192 MB
 
 // ── CacheContext ──────────────────────────────────────────────────────────────
 // Owns all GPU-resident texture caches and the memory ceiling that governs them.
@@ -233,6 +234,13 @@ impl AppContext {
         state: &mut ProjectState,
         ctx:   &egui::Context,
     ) {
+        // Single repaint flag — set by any result that changes visible state.
+        // Calling ctx.request_repaint() once at the end is identical in effect
+        // to calling it N times mid-loop (egui deduplicates), but avoids the
+        // repeated Arc-lock overhead of N individual calls when draining a busy
+        // channel (e.g. bulk import of 20 clips on startup).
+        let mut needs_repaint = false;
+
         // ── [Opt 3] Scrub frames — high-priority path ─────────────────────────
         // Drain the dedicated scrub channel before the shared channel.
         // The scrub thread sends at most one result per condvar wake, so this
@@ -241,7 +249,7 @@ impl AppContext {
             // Only VideoFrame arrives on scrub_rx — match exhaustively so the
             // compiler warns if the channel ever carries an unexpected variant.
             if let MediaResult::VideoFrame { id, width, height, data } = result {
-                self.ingest_video_frame(id, width, height, data, state, ctx);
+                self.ingest_video_frame(id, width, height, data, state, &mut needs_repaint, ctx);
             }
         }
 
@@ -249,7 +257,7 @@ impl AppContext {
         while let Ok(result) = self.media_worker.rx.try_recv() {
             match result {
                 MediaResult::AudioPath { id, path } => {
-                    eprintln!("[audio] AudioPath arrived id={id} path={}", path.display());
+                    velocut_log!("[audio] AudioPath arrived id={id} path={}", path.display());
                     if let Some(clip) = state.library.iter_mut().find(|c| c.id == id) {
                         clip.audio_path = Some(path);
                     }
@@ -257,7 +265,7 @@ impl AppContext {
 
                 MediaResult::Duration { id, seconds } => {
                     state.update_clip_duration(id, seconds);
-                    ctx.request_repaint();
+                    needs_repaint = true;
                 }
 
                 MediaResult::Thumbnail { id, width, height, data } => {
@@ -269,39 +277,39 @@ impl AppContext {
                         egui::TextureOptions::LINEAR,
                     );
                     self.cache.thumbnail_cache.insert(id, tex);
-                    ctx.request_repaint();
+                    needs_repaint = true;
                 }
 
                 MediaResult::Waveform { id, peaks } => {
                     state.update_waveform(id, peaks);
-                    ctx.request_repaint();
+                    needs_repaint = true;
                 }
 
                 MediaResult::VideoSize { id, width, height } => {
                     if let Some(clip) = state.library.iter_mut().find(|c| c.id == id) {
                         clip.video_size = Some((width, height));
                     }
-                    // Aspect ratio auto-set moved to AddToTimeline (first clip placed).
+                    needs_repaint = true;
                 }
 
                 MediaResult::FrameSaved { path } => {
-                    eprintln!("[app] frame PNG saved → {:?}", path);
+                    velocut_log!("[app] frame PNG saved → {:?}", path);
                     let name = path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "frame".into());
                     state.save_status = Some(format!("✓ Saved: {}", name));
-                    ctx.request_repaint();
+                    needs_repaint = true;
                 }
 
                 // VideoFrame on the shared channel = HQ one-shot frame from
                 // extract_frame_hq.  Scrub frames no longer arrive here —
                 // they travel on scrub_rx and are consumed above.
                 MediaResult::VideoFrame { id, width, height, data } => {
-                    self.ingest_video_frame(id, width, height, data, state, ctx);
+                    self.ingest_video_frame(id, width, height, data, state, &mut needs_repaint, ctx);
                 }
 
                 MediaResult::Error { id, msg } => {
-                    eprintln!("[media] {id}: {msg}");
+                    velocut_log!("[media] {id}: {msg}");
                 }
 
                 // ── Encode results ────────────────────────────────────────────
@@ -312,7 +320,7 @@ impl AppContext {
                 MediaResult::EncodeProgress { job_id, frame, total_frames } => {
                     if state.encode_job == Some(job_id) {
                         state.encode_progress = Some((frame, total_frames));
-                        ctx.request_repaint();
+                        needs_repaint = true;
                     }
                 }
 
@@ -322,17 +330,21 @@ impl AppContext {
                             state.encode_progress = Some((total, total));
                         }
                         state.encode_done = Some(path);
-                        ctx.request_repaint();
+                        needs_repaint = true;
                     }
                 }
 
                 MediaResult::EncodeError { job_id, msg } => {
                     if state.encode_job == Some(job_id) {
                         state.encode_error = Some(msg);
-                        ctx.request_repaint();
+                        needs_repaint = true;
                     }
                 }
             }
+        }
+
+        if needs_repaint {
+            ctx.request_repaint();
         }
     }
 
@@ -343,12 +355,13 @@ impl AppContext {
     /// and frame_cache logic without duplication.
     fn ingest_video_frame(
         &mut self,
-        id:     Uuid,
-        width:  u32,
-        height: u32,
-        data:   Vec<u8>,
-        state:  &mut ProjectState,
-        ctx:    &egui::Context,
+        id:            Uuid,
+        width:         u32,
+        height:        u32,
+        data:          Vec<u8>,
+        state:         &mut ProjectState,
+        needs_repaint: &mut bool,
+        ctx:           &egui::Context,
     ) {
         let tex = ctx.load_texture(
             format!("frame-{id}"),
@@ -389,7 +402,7 @@ impl AppContext {
         // wrong-position one.  Skip the frame_cache write while playing.
         if !state.is_playing {
             self.cache.frame_cache.insert(id, tex);
-            ctx.request_repaint();
+            *needs_repaint = true;
         }
     }
 }

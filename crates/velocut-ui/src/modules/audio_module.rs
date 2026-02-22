@@ -7,6 +7,7 @@
 use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
 use crate::context::AppContext;
+use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
 use super::EditorModule;
 use egui::Ui;
@@ -17,28 +18,9 @@ use std::collections::{HashSet, HashMap};
 use std::time::Instant;
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// Diagnostic logging
-//
-// eprintln! is swallowed in Windows GUI-subsystem mode (no console attached
-// when the exe is double-clicked). Write to a temp file instead so we have
-// visibility in all launch modes without changing the subsystem.
-// File: %TEMP%\velocut_audio.log — append-only, created on first write.
-// ---------------------------------------------------------------------------
-fn audio_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::env::temp_dir().join("velocut_audio.log"))
-    {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{timestamp}] {msg}");
-    }
-}
+// Diagnostic logging: routed through the shared log helper so all VeloCut
+// output lands in a single %TEMP%\velocut.log regardless of launch mode.
+use crate::helpers::log::vlog as audio_log;
 
 /// Minimum elapsed time (seconds) after a sink is created before it may be
 /// marked exhausted via the empty() check.
@@ -163,21 +145,12 @@ impl AudioModule {
         // 2. Video clips on V rows (0, 2) whose audio hasn't been extracted yet.
         // This ensures that after ExtractAudioTrack, the A-row clip plays and the
         // muted V-row clip stays silent.
-        let active_clip = state.timeline.iter()
-            .find(|c| {
-                matches!(c.track_row, 1 | 3)
-                    && c.start_time <= t
-                    && t < c.start_time + c.duration
-            })
-            .or_else(|| state.timeline.iter().find(|c| {
-                matches!(c.track_row, 0 | 2)
-                    && !c.audio_muted
-                    && c.start_time <= t
-                    && t < c.start_time + c.duration
-            }));
+        // A-row clips (extracted audio) take priority over V-row clips.
+        // Logic lives in clip_query::active_audio_clip — single source of truth.
+        let active_clip = clip_query::active_audio_clip(state, t);
 
         if let Some(clip) = active_clip {
-            if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
+            if let Some(lib) = clip_query::library_entry_for(state, clip) {
 
                 // --- WAV guard ---------------------------------------------------
                 // Only play from a pre-extracted WAV, never from the raw source

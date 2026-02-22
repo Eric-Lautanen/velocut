@@ -5,6 +5,7 @@ use velocut_core::commands::EditorCommand;
 use velocut_core::helpers::time::format_time;
 use velocut_core::transitions::TransitionType;
 use crate::helpers::clip_query;
+use crate::helpers::format::fit_label;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
 use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};
@@ -385,7 +386,7 @@ impl EditorModule for TimelineModule {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             if ui.small_button(
-                                                egui::RichText::new("✕")
+                                                egui::RichText::new("❌")
                                                     .size(10.0)
                                                     .color(egui::Color32::from_gray(130)),
                                             ).clicked() {
@@ -931,7 +932,7 @@ impl EditorModule for TimelineModule {
                         let mut track_clips: Vec<_> = state.timeline.iter()
                             .filter(|c| c.track_row == track_row)
                             .collect();
-                        track_clips.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+                        track_clips.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
 
                         for i in 0..track_clips.len().saturating_sub(1) {
                             let clip_a = track_clips[i];
@@ -1423,21 +1424,4 @@ fn ruler_step(zoom: f32) -> f64 {
     else if zoom >= 30.0  { 5.0 }
     else { 10.0 }
 }
-/// Truncates `text` to fit within `max_px` using a per-character width
-/// heuristic (11px proportional ≈ 6.5 px/char average). Appends "…" when
-/// truncated. Avoids egui font measurement, which requires `&mut Fonts`.
-fn fit_label(text: &str, max_px: f32) -> String {
-    const AVG_CHAR_PX: f32 = 6.5;
-    const ELLIPSIS: &str = "…";
-    let max_chars = (max_px / AVG_CHAR_PX).max(0.0) as usize;
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
-    if max_chars == 0 {
-        return String::new();
-    }
-    // Reserve one slot for the ellipsis character itself.
-    let keep = max_chars.saturating_sub(1);
-    text.chars().take(keep).collect::<String>() + ELLIPSIS
-}
+// fit_label moved to crate::helpers::format — imported above.

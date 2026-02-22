@@ -19,8 +19,10 @@ use crate::modules::{
 use eframe::egui;
 use egui_desktop::{TitleBar, TitleBarOptions, render_resize_handles};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 use rfd::FileDialog;
+use crate::velocut_log;
 
 #[derive(Serialize, Deserialize)]
 struct AppStorage {
@@ -57,8 +59,9 @@ pub struct VeloCutApp {
     // timeline + transitions). Runtime-only fields (encode progress, temp
     // audio paths, playback position) are restored from the live state after
     // each undo/redo so they are unaffected by history navigation.
-    undo_stack: Vec<ProjectState>,
-    redo_stack: Vec<ProjectState>,
+    // VecDeque so cap-eviction uses pop_front() — O(1) vs Vec::remove(0) O(N).
+    undo_stack: VecDeque<ProjectState>,
+    redo_stack: VecDeque<ProjectState>,
 
     /// True after the first rendered frame has checked the window size.
     /// eframe persists geometry between sessions — if a previous run left the
@@ -108,8 +111,8 @@ impl VeloCutApp {
             export:       ExportModule::default(),
             audio:        AudioModule::new(),
             pending_cmds: Vec::new(),
-            undo_stack:   Vec::new(),
-            redo_stack:   Vec::new(),
+            undo_stack:   VecDeque::new(),
+            redo_stack:   VecDeque::new(),
             startup_size_checked: false,
             clear_egui_memory:    false,
         }
@@ -122,9 +125,9 @@ impl VeloCutApp {
     /// depth cap by discarding the oldest entry when over limit.
     fn push_undo_snapshot(&mut self) {
         if self.undo_stack.len() >= MAX_UNDO_DEPTH {
-            self.undo_stack.remove(0); // drop oldest — O(N) but infrequent
+            self.undo_stack.pop_front(); // drop oldest — O(1) with VecDeque
         }
-        self.undo_stack.push(self.state.clone());
+        self.undo_stack.push_back(self.state.clone());
         self.redo_stack.clear();
         self.sync_undo_len();
     }
@@ -133,17 +136,17 @@ impl VeloCutApp {
     /// (encode progress, pending cleanup, playback time) from the live state
     /// so history navigation never interrupts an ongoing encode or playback.
     fn apply_undo(&mut self) {
-        if let Some(snapshot) = self.undo_stack.pop() {
+        if let Some(snapshot) = self.undo_stack.pop_back() {
             let before = self.state.clone();
-            self.redo_stack.push(before);
+            self.redo_stack.push_back(before);
             self.restore_snapshot(snapshot);
         }
     }
 
     fn apply_redo(&mut self) {
-        if let Some(snapshot) = self.redo_stack.pop() {
+        if let Some(snapshot) = self.redo_stack.pop_back() {
             let before = self.state.clone();
-            self.undo_stack.push(before);
+            self.undo_stack.push_back(before);
             self.restore_snapshot(snapshot);
         }
     }
@@ -250,6 +253,9 @@ impl VeloCutApp {
                 }
                 self.state.library.retain(|c| c.id != id);
                 self.state.timeline.retain(|c| c.media_id != id);
+                // Evict the thumbnail so deleted clips don't leak GPU memory.
+                // No refcount check needed — library entry is the sole owner.
+                self.context.cache.thumbnail_cache.remove(&id);
             }
             EditorCommand::SelectLibraryClip(id) => {
                 self.state.selected_library_clip = id;
@@ -269,19 +275,8 @@ impl VeloCutApp {
                         if width > 0 && height > 0 {
                             use velocut_core::state::AspectRatio;
                             let r = width as f32 / height as f32;
-                            self.state.aspect_ratio =
-                                if      (r - 16.0/9.0).abs() < 0.05 { AspectRatio::SixteenNine   }
-                                else if (r - 9.0/16.0).abs() < 0.05 { AspectRatio::NineSixteen   }
-                                else if (r - 2.0/3.0 ).abs() < 0.05 { AspectRatio::TwoThree      }
-                                else if (r - 3.0/2.0 ).abs() < 0.05 { AspectRatio::ThreeTwo      }
-                                else if (r - 4.0/3.0 ).abs() < 0.05 { AspectRatio::FourThree     }
-                                else if (r - 1.0     ).abs() < 0.05 { AspectRatio::OneOne        }
-                                else if (r - 4.0/5.0 ).abs() < 0.05 { AspectRatio::FourFive      }
-                                else if (r - 21.0/9.0).abs() < 0.10 { AspectRatio::TwentyOneNine }
-                                else if (r - 2.39    ).abs() < 0.05 { AspectRatio::Anamorphic    }
-                                else if r > 1.0 { AspectRatio::SixteenNine }
-                                else            { AspectRatio::NineSixteen };
-                            eprintln!("[app] aspect ratio auto-set from first timeline clip {width}x{height}");
+                            self.state.aspect_ratio = AspectRatio::from_ratio(r);
+                            velocut_log!("[app] aspect ratio auto-set from first timeline clip {width}x{height}");
                         }
                     }
                 }
@@ -486,51 +481,63 @@ impl VeloCutApp {
                 self.redo_stack.clear();
                 self.sync_undo_len();
 
-                // ── Step 9: delete the eframe storage file (app.ron) now.
+                // ── Step 9: delete the entire VeloCut application-data folder.
                 //
-                // eframe::storage_dir("VeloCut") returns the platform folder
-                // where eframe persists app state:
-                //   Windows : %APPDATA%\VeloCut\data\
-                //   macOS   : ~/Library/Application Support/VeloCut/
-                //   Linux   : ~/.local/share/VeloCut/
+                // eframe::storage_dir("VeloCut") returns the *data* sub-directory
+                // where eframe persists app state, NOT the top-level app folder:
+                //   Windows : %APPDATA%\VeloCut\data\   ← storage_dir
+                //             %APPDATA%\VeloCut\         ← what we want to delete
+                //   macOS   : ~/Library/Application Support/VeloCut/data/
+                //             ~/Library/Application Support/VeloCut/
+                //   Linux   : ~/.local/share/VeloCut/data/
+                //             ~/.local/share/VeloCut/
                 //
-                // The file inside is `app.ron`. Deleting it immediately means
-                // the cleared state is on disk right now, not just queued for
-                // the next save() call on exit. If the process were to crash
-                // between here and exit the old data would still be gone.
-                // eframe's save() will simply recreate the file on next exit
-                // with the current (now-blank) state.
-                //
-                // We delete the whole data directory rather than just app.ron
-                // so any other eframe-managed files (e.g. window geometry ron)
-                // are also wiped. Failure is logged but never fatal.
+                // Deleting only storage_dir leaves sibling directories such as
+                // `logs/` intact. We call .parent() to get the true VeloCut root
+                // and remove the whole tree — covers app.ron, window geometry,
+                // logs, and any other VeloCut-owned files in one shot.
+                // eframe's save() will recreate the data directory on next exit
+                // with the current (now-blank) state. Failure is logged but never fatal.
                 if let Some(storage_dir) = eframe::storage_dir("VeloCut") {
-                    match std::fs::remove_dir_all(&storage_dir) {
+                    // .parent() is None only if storage_dir is a filesystem root,
+                    // which cannot happen for a named app subdirectory. Fall back to
+                    // storage_dir itself so we at least delete what we can.
+                    let app_dir = storage_dir.parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| storage_dir.clone());
+
+                    match std::fs::remove_dir_all(&app_dir) {
                         Ok(()) => eprintln!(
-                            "[reset] deleted eframe storage dir '{}'",
-                            storage_dir.display()
+                            "[reset] deleted VeloCut app data dir '{}'",
+                            app_dir.display()
                         ),
                         Err(e) => eprintln!(
-                            "[reset] could not delete eframe storage dir '{}': {e}",
-                            storage_dir.display()
+                            "[reset] could not delete VeloCut app data dir '{}': {e}",
+                            app_dir.display()
                         ),
                     }
                 } else {
                     eprintln!("[reset] eframe::storage_dir returned None — storage not deleted");
                 }
 
-                // ── Step 10: delete all orphaned velocut_* temp files.
+                // ── Step 10: delete all orphaned VeloCut temp and log files.
                 //
                 // pending_audio_cleanup (step 1) only covers audio_path entries
                 // still tracked in the library. WAVs from previously-deleted
                 // clips or from a prior crashed session are not in that list.
-                // Scanning the OS temp dir catches all of them.
+                // Scanning the OS temp dir catches all of them, plus the
+                // append-only log file (velocut.log) written by vlog().
                 let tmp = std::env::temp_dir();
                 match std::fs::read_dir(&tmp) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
                             let name = entry.file_name();
-                            if name.to_string_lossy().starts_with("velocut_") {
+                            let name_str = name.to_string_lossy();
+                            // velocut_* — audio temp files (e.g. velocut_<uuid>.wav)
+                            // velocut.log — the unified UI log file written by vlog()
+                            let is_velocut_file = name_str.starts_with("velocut_")
+                                || name_str == "velocut.log";
+                            if is_velocut_file {
                                 let p = entry.path();
                                 if let Err(e) = std::fs::remove_file(&p) {
                                     eprintln!("[reset] could not delete temp file '{}': {e}", p.display());
@@ -563,13 +570,14 @@ impl VeloCutApp {
                 if secs <= 0.0 {
                     self.state.transitions.clear();
                 } else {
-                    // Sort clips by start time to find adjacent pairs.
-                    let mut sorted = self.state.timeline.clone();
-                    sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+                    // Collect refs sorted by start_time — avoids cloning clip data,
+                    // only allocates a Vec of pointers (8 bytes each).
+                    let mut sorted: Vec<&TimelineClip> = self.state.timeline.iter().collect();
+                    sorted.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
                     self.state.transitions.clear();
                     for i in 0..sorted.len().saturating_sub(1) {
-                        let a = &sorted[i];
-                        let b = &sorted[i + 1];
+                        let a = sorted[i];
+                        let b = sorted[i + 1];
                         // Only pair clips on the same track that are touching.
                         if a.track_row != b.track_row { continue; }
                         let gap = b.start_time - (a.start_time + a.duration);
@@ -626,7 +634,7 @@ impl VeloCutApp {
         // Abort silently if an encode is already running.
         // ExportModule disables the button while is_encoding, but guard here too.
         if self.state.encode_job.is_some() {
-            eprintln!("[export] ignoring RenderMP4: encode already in progress");
+            velocut_log!("[export] ignoring RenderMP4: encode already in progress");
             return;
         }
 
@@ -640,76 +648,18 @@ impl VeloCutApp {
             None    => return, // user cancelled the dialog — no-op
         };
 
-        // Resolve timeline clips to ClipSpec by joining with the library.
-        // Clips are sorted by start_time so the output timeline is correct even
-        // if the Vec is not stored in order.
-        let mut timeline = self.state.timeline.clone();
-        timeline.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+        // Sort by start_time using refs — avoids cloning all clip data.
+        let mut sorted: Vec<&TimelineClip> = self.state.timeline.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
 
-        let clip_specs: Vec<ClipSpec> = timeline
-            .iter()
-            .filter(|tc| {
-                // Exclude extracted audio clips (A-row clips linked to a V-row partner).
-                // Their audio contribution is encoded via the V-row clip below, using
-                // the A-row clip's volume. Including them separately would write
-                // duplicate video frames AND duplicate audio into the output file.
-                !clip_query::is_extracted_audio_clip(tc)
-            })
-            .filter_map(|tc| {
-                self.state.library.iter()
-                    .find(|lc| lc.id == tc.media_id)
-                    .map(|lc| {
-                        // When a V-row clip's audio was extracted to the A track below
-                        // it, the user may have independently adjusted the A-row clip's
-                        // volume. Use that volume so the export reflects those changes.
-                        // The source file and offset are identical, so no path change
-                        // is needed — only the gain differs.
-                        let effective_volume = if tc.audio_muted {
-                            clip_query::linked_audio_clip(&self.state, tc)
-                                .map(|ac| ac.volume)
-                                .unwrap_or(tc.volume)
-                        } else {
-                            tc.volume
-                        };
-                        ClipSpec {
-                            path:          lc.path.clone(),
-                            source_offset: tc.source_offset,
-                            duration:      tc.duration,
-                            volume:        effective_volume,
-                            skip_audio:    false,
-                        }
-                    })
-            })
-            .collect();
-
-        if clip_specs.is_empty() {
-            eprintln!("[export] no resolvable clips — aborting render");
+        let Some((clip_specs, encode_transitions)) =
+            build_encode_plan(&self.state, &sorted) else
+        {
+            velocut_log!("[export] no resolvable clips — aborting render");
             return;
-        }
+        };
 
         let job_id = Uuid::new_v4();
-
-        // Map TimelineTransitions (UUID-keyed) to ClipTransitions (index-keyed).
-        // IMPORTANT: use position in the filtered timeline (non-extracted-audio clips
-        // only), not the raw timeline vec. The raw vec includes A-row extracted clips
-        // which are absent from clip_specs; using raw positions shifts all transition
-        // indices past any extracted clip, silently placing them at the wrong boundary.
-        let filtered_timeline: Vec<&TimelineClip> = timeline
-            .iter()
-            .filter(|tc| !clip_query::is_extracted_audio_clip(tc))
-            .collect();
-
-        let encode_transitions: Vec<ClipTransition> = self.state.transitions.iter()
-            .filter_map(|t| {
-                let idx = filtered_timeline.iter().position(|tc| tc.id == t.after_clip_id)?;
-                if idx + 1 < clip_specs.len() {
-                    Some(ClipTransition { after_clip_index: idx, kind: t.kind.clone() })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         let spec = EncodeSpec {
             job_id,
             clips: clip_specs,
@@ -869,6 +819,90 @@ impl eframe::App for VeloCutApp {
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
 
+        self.render_panels(ctx);
+
+        // ── Process commands emitted by modules this frame ────────────────────
+        let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
+        for cmd in cmds {
+            self.process_command(cmd);
+        }
+
+        self.tick_modules(ctx);
+    }
+}
+
+// ── Encode plan builder ──────────────────────────────────────────────────────
+//
+// Pure function — takes state + a pre-sorted slice of timeline refs and returns
+// the (ClipSpec, ClipTransition) vecs needed to build an EncodeSpec, or None
+// when no resolvable clips exist.
+//
+// Extracted from begin_render so it's independently testable and so begin_render
+// itself stays focused on I/O (file dialog, worker dispatch, state arming).
+fn build_encode_plan(
+    state:  &velocut_core::state::ProjectState,
+    sorted: &[&TimelineClip],
+) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>)> {
+    // Filter out extracted-audio A-row clips — their contribution is encoded
+    // through the paired V-row clip using the A-row's volume value.
+    let filtered: Vec<&TimelineClip> = sorted.iter()
+        .copied()
+        .filter(|tc| !clip_query::is_extracted_audio_clip(tc))
+        .collect();
+
+    let clip_specs: Vec<ClipSpec> = filtered.iter()
+        .copied()
+        .filter_map(|tc| {
+            state.library.iter()
+                .find(|lc| lc.id == tc.media_id)
+                .map(|lc| {
+                    // If audio was extracted to an A-row partner, use that partner's
+                    // volume so independent A-row adjustments are reflected in export.
+                    let effective_volume = if tc.audio_muted {
+                        clip_query::linked_audio_clip(state, tc)
+                            .map(|ac| ac.volume)
+                            .unwrap_or(tc.volume)
+                    } else {
+                        tc.volume
+                    };
+                    ClipSpec {
+                        path:          lc.path.clone(),
+                        source_offset: tc.source_offset,
+                        duration:      tc.duration,
+                        volume:        effective_volume,
+                        skip_audio:    false,
+                    }
+                })
+        })
+        .collect();
+
+    if clip_specs.is_empty() {
+        return None;
+    }
+
+    // Map TimelineTransitions (UUID-keyed) → ClipTransitions (index-keyed).
+    // Uses position in *filtered* vec, not raw timeline, so extracted-audio
+    // clips don't shift transition indices.
+    let encode_transitions: Vec<ClipTransition> = state.transitions.iter()
+        .filter_map(|t| {
+            let idx = filtered.iter().copied().position(|tc| tc.id == t.after_clip_id)?;
+            if idx + 1 < clip_specs.len() {
+                Some(ClipTransition { after_clip_index: idx, kind: t.kind.clone() })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Some((clip_specs, encode_transitions))
+}
+
+// ── Sub-frame helpers (called from update) ────────────────────────────────────
+
+impl VeloCutApp {
+    /// Render the title bar, all panels, and the encode modal overlay.
+    /// Called from `update()` after pre-frame housekeeping.
+    fn render_panels(&mut self, ctx: &egui::Context) {
         const BOLT_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><polygon points="9,1 4,9 8,9 7,15 12,7 8,7" fill="rgb(255,160,50)"/></svg>"#;
         TitleBar::new(
             TitleBarOptions::new()
@@ -919,18 +953,15 @@ impl eframe::App for VeloCutApp {
             self.preview.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
         });
 
-        // ── Render modal overlay ──────────────────────────────────────────────
-        // Must be called after all panels so the scrim and card paint above
-        // the entire UI. show_render_modal is a no-op while encode_job is None.
+        // Must be called after all panels so the scrim paints above the full UI.
+        // No-op while encode_job is None.
         self.export.show_render_modal(ctx, &self.state, &mut self.pending_cmds);
+    }
 
-        // ── Process commands emitted by modules this frame ────────────────────
-        let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
-        for cmd in cmds {
-            self.process_command(cmd);
-        }
-
-        // ── Tick non-rendering modules (concrete calls bypass trait no-op) ────
+    /// Tick non-rendering modules and advance the playback clock.
+    /// Called from `update()` after command processing so ticks see the
+    /// freshest state (including commands processed this frame).
+    fn tick_modules(&mut self, ctx: &egui::Context) {
         VideoModule::tick(&self.state, &mut self.context);
         self.audio.tick(&self.state, &mut self.context);
 

@@ -25,10 +25,7 @@ impl VideoModule {
     /// Returns the media_id of the timeline clip currently under the playhead.
     /// Used by app.rs to do the thumbnail→frame swap for the preview panel.
     pub fn active_media_id(state: &ProjectState) -> Option<Uuid> {
-        state.timeline.iter().find(|c| {
-            state.current_time >= c.start_time
-                && state.current_time < c.start_time + c.duration
-        }).map(|c| c.media_id)
+        clip_query::clip_at_time(state, state.current_time).map(|c| c.media_id)
     }
 
     // ── poll_playback ─────────────────────────────────────────────────────────
@@ -178,7 +175,7 @@ impl VideoModule {
                     // Drop stale scrub frame so preview doesn't freeze on wrong pos.
                     ctx.cache.frame_cache.remove(&clip.media_id);
                     ctx.cache.pending_pb_frame = None;
-                    if let Some(lib) = state.library.iter().find(|l| l.id == clip.media_id) {
+                    if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         let aspect   = state.active_video_ratio();
                         ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
@@ -239,7 +236,7 @@ impl VideoModule {
             }
 
             // Layer 2 (every scrub move): fire exact-timestamp decode request.
-            if let Some(lib) = state.library.iter().find(|m| m.id == clip.media_id) {
+            if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 let aspect = state.active_video_ratio();
                 ctx.media_worker.request_frame(lib.id, lib.path.clone(), local_t, aspect);
             }
@@ -248,7 +245,7 @@ impl VideoModule {
             let coarse_key = (clip.media_id, coarse_bucket);
             if ctx.playback.scrub_coarse_req != Some(coarse_key) {
                 ctx.playback.scrub_coarse_req = Some(coarse_key);
-                if let Some(lib) = state.library.iter().find(|m| m.id == clip.media_id) {
+                if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                     let aspect = state.active_video_ratio();
                     ctx.media_worker.request_frame(lib.id, lib.path.clone(), coarse_bucket as f64 * 2.0, aspect);
                 }
@@ -261,7 +258,7 @@ impl VideoModule {
                     .unwrap_or(false);
                 if !idle { return; }
                 if ctx.cache.frame_bucket_cache.contains_key(&fine_key) { return; }
-                if let Some(lib) = state.library.iter().find(|m| m.id == clip.media_id) {
+                if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                     let aspect = state.active_video_ratio();
                     ctx.media_worker.request_frame(lib.id, lib.path.clone(), fine_bucket as f64 / 4.0, aspect);
                 }

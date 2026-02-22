@@ -177,7 +177,11 @@ impl EditorModule for LibraryModule {
 
                                 if is_dragging {
                                     paint_drag_ghost(ui, id, &clip.name, clip.clip_type, thumb_cache);
-                                    ui.memory_mut(|m| m.data.insert_temp(Id::new("DND_PAYLOAD"), id));
+                                    // DND_PAYLOAD is written below in the drag_started_id branch
+                                    // (fires on the first drag frame). The is_dragging branch
+                                    // runs on every subsequent drag frame — writing here would be
+                                    // redundant since the payload is already set and never changes
+                                    // mid-drag. Keep the single canonical write in drag_started_id.
                                 }
 
                                 let card_resp = paint_card(ui, clip, is_selected, in_multi, is_dragging, thumb_cache);

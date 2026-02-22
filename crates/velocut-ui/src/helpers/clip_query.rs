@@ -160,3 +160,33 @@ pub fn playhead_source_timestamp(state: &ProjectState) -> Option<(f64, &LibraryC
 
     Some((tc.source_offset + offset, lib))
 }
+
+// ── Audio playback helper ─────────────────────────────────────────────────────
+
+/// Return the clip that should be providing audio at `time`.
+///
+/// Priority: A-row clips (extracted audio, rows 1/3) over V-row clips (rows 0/2).
+/// This ensures that after `ExtractAudioTrack`, the A-row WAV plays instead of
+/// the muted V-row source. V-row clips with `audio_muted = true` are skipped.
+///
+/// Centralised here so `audio_module.rs` and any future consumer share a single
+/// definition of "what clip plays audio at time t" — no silent drift between callsites.
+#[inline]
+pub fn active_audio_clip(state: &ProjectState, time: f64) -> Option<&TimelineClip> {
+    // A-row first (extracted audio takes priority)
+    state.timeline.iter()
+        .find(|c| {
+            matches!(c.track_row, 1 | 3)
+                && c.start_time <= time
+                && time < c.start_time + c.duration
+        })
+        .or_else(|| {
+            // V-row fallback — skip muted clips
+            state.timeline.iter().find(|c| {
+                matches!(c.track_row, 0 | 2)
+                    && !c.audio_muted
+                    && c.start_time <= time
+                    && time < c.start_time + c.duration
+            })
+        })
+}

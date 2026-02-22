@@ -7,7 +7,49 @@
 // that are purely about rendering strings in the UI (truncation, labels) and
 // have no meaning outside of a display context.
 
-/// Truncate `s` to at most `max` *bytes*, returning a `&str` that ends on a
+/// Truncates `text` to fit within `max_px` using a per-character width
+/// heuristic (11px proportional ≈ 6.5 px/char average). Appends "…" when
+/// truncated. Avoids egui font measurement, which requires `&mut Fonts`.
+///
+/// Used by timeline clip labels and anywhere else a pixel-budget string
+/// truncation is needed without access to a live `Fonts` instance.
+pub fn fit_label(text: &str, max_px: f32) -> String {
+    const AVG_CHAR_PX: f32 = 6.5;
+    const ELLIPSIS: &str = "…";
+    let max_chars = (max_px / AVG_CHAR_PX).max(0.0) as usize;
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    // Reserve one slot for the ellipsis character itself.
+    let keep = max_chars.saturating_sub(1);
+    text.chars().take(keep).collect::<String>() + ELLIPSIS
+}
+
+#[cfg(test)]
+mod fit_label_tests {
+    use super::*;
+
+    #[test]
+    fn short_text_unchanged() {
+        assert_eq!(fit_label("hello", 200.0), "hello");
+    }
+
+    #[test]
+    fn zero_budget_returns_empty() {
+        assert_eq!(fit_label("hello", 0.0), "");
+    }
+
+    #[test]
+    fn truncated_text_has_ellipsis() {
+        let result = fit_label("hello world long name", 30.0);
+        assert!(result.ends_with('…'));
+        assert!(result.len() < "hello world long name".len());
+    }
+}
 /// valid UTF-8 character boundary.
 ///
 /// Used by the library card grid to keep clip names from overflowing their

@@ -23,6 +23,12 @@ pub type ThumbnailCache = HashMap<Uuid, TextureHandle>;
 
 /// Every editor panel implements this trait.
 /// Modules read state, emit commands — they never mutate state directly.
+///
+/// `thumb_cache` is passed to every `ui()` implementation for uniformity even
+/// though not all modules use it (prefixed `_thumb_cache` in those impls).
+/// This avoids a per-module parameter set and keeps the dispatch in `app.rs`
+/// trivial. If the trait signature ever needs to evolve, wrap params in a
+/// `UiContext` struct instead of adding more arguments.
 #[allow(dead_code)]
 pub trait EditorModule {
     fn name(&self) -> &str;

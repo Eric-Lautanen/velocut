@@ -162,6 +162,30 @@ impl Default for ProjectState {
     }
 }
 
+impl AspectRatio {
+    /// Detect the closest named aspect ratio from a width/height pixel ratio.
+    ///
+    /// Tolerances are ±0.05 for all ratios except 21:9 (±0.10, wider spread
+    /// in practice due to non-standard ultrawide implementations).  Falls back
+    /// to `SixteenNine` for unknown landscape and `NineSixteen` for portrait.
+    ///
+    /// Extracted from `app.rs::process_command(AddToTimeline)` so the logic is
+    /// testable and reusable without touching the command handler.
+    pub fn from_ratio(r: f32) -> Self {
+        if      (r - 16.0/9.0).abs() < 0.05 { Self::SixteenNine   }
+        else if (r - 9.0/16.0).abs() < 0.05 { Self::NineSixteen   }
+        else if (r - 2.0/3.0 ).abs() < 0.05 { Self::TwoThree      }
+        else if (r - 3.0/2.0 ).abs() < 0.05 { Self::ThreeTwo      }
+        else if (r - 4.0/3.0 ).abs() < 0.05 { Self::FourThree     }
+        else if (r - 1.0     ).abs() < 0.05 { Self::OneOne        }
+        else if (r - 4.0/5.0 ).abs() < 0.05 { Self::FourFive      }
+        else if (r - 21.0/9.0).abs() < 0.10 { Self::TwentyOneNine }
+        else if (r - 2.39    ).abs() < 0.05 { Self::Anamorphic    }
+        else if r > 1.0                      { Self::SixteenNine   }
+        else                                 { Self::NineSixteen   }
+    }
+}
+
 impl ProjectState {
     /// Import a file into the library. Duration = 0 until ffprobe returns.
     pub fn add_to_library(&mut self, path: PathBuf) -> Uuid {

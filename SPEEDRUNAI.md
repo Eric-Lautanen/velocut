@@ -278,3 +278,174 @@ Use these, never inline:
 - YUV pack/unpack: `crate::helpers::yuv::{extract_yuv, write_yuv}` (`blend_yuv_frame` available but delegated to `VideoTransition::apply()`)
 - Transition UI: `velocut_core::transitions::{registered, registry}` (`registered()` = Vec for UI iteration, `registry()` = HashMap for O(1) encode lookup)
 - Transition math: `transitions::helpers::{frame_alpha, blend_byte, blend_buffers, alloc_frame, clamp01, lerp}` — easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `ease_in_out_sine`, `linear`, `ease_out_bounce`, `ease_out_elastic` — plane layout: `split_planes`, `chroma_dims`, `y_len`, `uv_len`, `u_offset`, `v_offset` — spatial: `norm_x`, `norm_y`, `norm_xy`, `center_dist`, `wipe_alpha` — sampling: `sample_plane`, `sample_plane_clamped`
+---
+
+## Session Log — Feb 2026
+
+### Bugs Fixed This Session
+
+**Audio extraction was purely visual** — `ExtractAudioTrack` in `app.rs` called `state.extract_audio_track()` and discarded the return value. The A-row clip got `media_id = video_clip.media_id`, so it showed video thumbnails and played video. Fix: after state mutation, create a dedicated `LibraryClip` typed `Audio` (reusing the already-extracted WAV from `lib.audio_path`), push it to the library, and rewire `tc.media_id` on the A-row clip to the new audio entry. Files: `app.rs`.
+
+**Deleting video clip left stale frame in preview** — `frame_cache` and `frame_bucket_cache` were never evicted on `DeleteTimelineClip`. Fix: capture `deleted_media_id` before `retain()`, check if any remaining clip still references it, and if not: remove from both caches and set `preview.current_frame = None`. Files: `app.rs`.
+
+**Transition badges appearing on audio rows** — `timeline.rs` transition badge loop ran for all 4 track rows. Fix: `if track_row % 2 == 1 { continue; }` — one line, skips A1(1) and A2(3). Files: `timeline.rs`.
+
+**Dip-to-black transition showed green instead of black** — YUV420P black is Y=0, U=128, V=128. The original code blended all bytes toward 0, sending chroma to 0 which is fully saturated green. Fix: added `y_len` import, split luma vs chroma ranges using `luma_len = y_len(width, height) as usize`, blend Y toward 0 and U/V toward 128 via `blend_to_black` / `blend_from_black` closures. Also renamed `_width`/`_height` params to `width`/`height` (were unused before the fix). Files: `dip_to_black.rs`.
+
+---
+
+## Current App State (Feb 2026)
+
+- Workspace: `velocut-core` / `velocut-media` / `velocut-ui`, ~10K lines total
+- UI: 4-panel layout (library left, preview center, export right, timeline bottom), custom title bar, no-decoration window
+- Transitions: Crossfade, Dip-to-Black, Iris, Wipe, Push — registry-driven, zero hardcoding
+- Audio extraction: fully functional — dedicated audio library entry, correct WAV playback, no video thumbnails on A-row
+- Undo/redo: 50-snapshot depth, ProjectState clone-based
+- Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
+- Scrub: 3-layer (L1 cached bucket, L2 exact decode, L3 idle precise), dedicated scrub_rx channel
+- Playback: PTS-gated single-slot, stable_dt clock master
+
+---
+
+## UI Crate Improvement Backlog (Prioritized)
+
+### 🔴 HIGH — Performance / Correctness
+
+**[P1] Replace `sort_by(partial_cmp().unwrap())` with `sort_unstable_by(f64::total_cmp)`**
+- Files: `app.rs:568`, `app.rs:647`, `timeline.rs:934`
+- `partial_cmp` returns `None` for NaN — `unwrap()` panics if any `start_time` is NaN (possible after malformed project load). `sort_unstable_by` avoids the stable-sort allocation, `f64::total_cmp` is panic-free.
+- Fix: `clips.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));`
+
+**[P2] Replace `undo_stack.remove(0)` with `VecDeque`**
+- File: `app.rs`
+- `Vec::remove(0)` shifts all 50 entries every time the cap is hit — O(N) memcpy. Use `VecDeque<ProjectState>` with `pop_front()`. Both stacks. Change type, change `push` → `push_back`, `pop` → `pop_back`, cap check uses `len()` same as before.
+
+**[P3] Adopt `clip_query` helpers in `video_module.rs` and `audio_module.rs`**
+- `video_module.rs` has 4 inline `state.library.iter().find(|m| m.id == clip.media_id)` calls (lines 181, 242, 251, 264) — these run every tick at 60fps. Replace with `clip_query::library_entry_for(state, clip)`.
+- `audio_module.rs` has 2 inline finds (lines 172, 180). Line 172 is the two-chain active-clip search — this could become a new helper `clip_query::active_audio_clip(state, t)` (see P7).
+- `context.rs:ingest_video_frame` does `state.timeline.iter().find(|c| c.media_id == id)` for bucket fallback — use `clip_query::clip_at_time` or a new `clip_for_media_id` helper.
+
+**[P4] Fix `MAX_FRAME_CACHE_BYTES` comment/value mismatch**
+- File: `context.rs:30`
+- Comment says "192 MB" but constant is `256 * 1024 * 1024`. Either update the constant to `192 * 1024 * 1024` or update the comment. The SPEEDRUNAI.md also says 192 MB. Decide on one value and sync all three.
+
+**[P5] Batch `request_repaint()` calls in `ingest_media_results`**
+- File: `context.rs`
+- Currently called after `Duration`, `Thumbnail`, `Waveform`, `FrameSaved`, `VideoFrame`, and each encode result. `VideoSize` doesn't call it but probably should. More importantly, draining 10 results in one frame calls it up to 10 times — egui deduplicates these but it's still noise. Call `ctx.request_repaint()` once at the end of `ingest_media_results` if any result was processed, using a `mut any_repaint = false` flag.
+
+### 🟡 MEDIUM — Architecture / Maintainability
+
+**[P6] Extract `AspectRatio::from_ratio(f32) -> AspectRatio` into `state.rs`**
+- File: `app.rs:265–283`
+- 18-line if-else chain with magic float tolerances (0.05, 0.10) embedded inside `process_command`. This logic belongs in `state.rs` next to `AspectRatio` and `active_video_ratio()`. A `from_ratio` associated fn lets the `AddToTimeline` handler become 3 lines and the logic is testable.
+
+**[P7] Add `clip_query::active_audio_clip(state, t)` helper**
+- File: `audio_module.rs:162–179`
+- The two-chain A-row-first-then-V-row search is the canonical "what clip provides audio at time t" query. It's currently inlined in `audio_module.rs` and would be useful in other places. Move to `clip_query.rs`, document the priority rule (A-row over V-row), and use it from `audio_module`.
+
+**[P8] Split `EditorModule::ui()` trait signature — remove `_thumb_cache` from modules that don't use it**
+- Files: `export_module.rs`, `audio_module.rs`, `video_module.rs` (all use `_thumb_cache` — prefixed, unused)
+- The trait forces every module to accept `&mut ThumbnailCache` even if it never reads it. Options: (a) make `thumb_cache` an `Option<&mut ThumbnailCache>` — breaking; (b) add a separate `fn uses_thumbnail_cache() -> bool` default false; (c) keep as-is since Rust elides the unused borrow at compile time. Lowest-risk: (c) document that `_thumb_cache` params are intentional and linted away. Medium-effort: add a `Context` struct passed to `ui()` so the signature can evolve without breaking every module.
+
+**[P9] Move `begin_render()` logic out of `app.rs`**
+- File: `app.rs:620–730`
+- `begin_render` is 110 lines in app.rs: opens a file dialog, resolves `ClipSpec`s, maps transitions, starts the encode. This is export logic and belongs in `export_module.rs` or a new `render_builder.rs`. The blocking `FileDialog::save_file()` is fine in `process_command` (runs after UI pass) but the `ClipSpec` construction and transition mapping should be a pure function. Prerequisite: the save dialog note in `poll_media` (line ~715) explains why it lives in app.rs — same issue applies here. Resolved together when `EditorModule::ui()` gains `&mut AppContext` or a command-callback approach.
+
+**[P10] Evict `thumbnail_cache` entries for deleted library clips**
+- File: `context.rs` / `app.rs`
+- `CacheContext::clear_all()` drops everything but clip deletion (`DeleteLibraryClip`) never evicts just that clip's thumbnail. For large projects (100+ imports) this leaks GPU textures indefinitely. Fix: in `DeleteLibraryClip` handler, call `self.context.cache.thumbnail_cache.remove(&id)` after `library.retain()`.
+
+**[P11] `SetCrossfadeDuration` clones entire timeline**
+- File: `app.rs:562`
+- `let mut sorted = self.state.timeline.clone()` to find adjacent pairs. Could collect `&TimelineClip` refs and sort those (stack-allocation of pointers, no data copy), or sort by index. For typical project sizes (~50 clips) the clone is under 10μs but it's still unnecessary.
+
+**[P12] `DND_PAYLOAD` written twice per drag frame**
+- File: `library.rs`
+- `is_dragging` branch (line ~172) writes `DND_PAYLOAD`, then `drag_started_id` branch (line ~235) writes it again. The `is_dragging` write is correct (continuous); the `drag_started` write is redundant since `is_dragging` fires on the very next frame. Consolidate to one write site.
+
+### 🟢 LOW — Polish / Future
+
+**[P13] Replace `eprintln!` in GUI subsystem mode with consistent logging**
+- `audio_module.rs` already routes through `audio_log()` (file-based, works without console). `app.rs` and `context.rs` use raw `eprintln!` which is swallowed on double-click launch. Either route everything through `audio_log` (rename to `velocut_log` or use the `log` crate + a file appender) or at minimum convert the `[export]`, `[media]`, and `[app]` eprintlns to file-log.
+
+**[P14] Move `fit_label` to `helpers/format.rs`**
+- File: `timeline.rs` (bottom)
+- Currently private. SPEEDRUNAI already notes this. Move when a second callsite appears. If the 6.5px/char heuristic is good enough, expose it now so library.rs card labels can use it too (currently library uses egui's built-in `Label::truncate()`).
+
+**[P15] `VeloCutApp::update()` decomposition**
+- File: `app.rs:790–960`
+- `update()` is ~170 lines. Extract `fn render_panels(&mut self, ctx)` (the 5 panel show calls) and `fn tick_modules(&mut self, ctx)` (the VideoModule + audio tick + time advance). Makes the frame loop readable at a glance.
+
+**[P16] `SaveFrameToDisk` looks up by path not UUID**
+- File: `app.rs:611`
+- `self.state.library.iter().find(|l| l.path == path)` compares `PathBuf` values (heap allocation per comparison). Should carry the `Uuid` in the command and look up by ID. Low priority since this code path fires only on explicit frame-export, not per-frame.
+
+---
+
+## Session Log — Feb 2026 (cont.) — Medium/Low Priority Pass
+
+### Items Completed This Session
+
+**[P6] `AspectRatio::from_ratio(f32)` added to `state.rs`**
+Moved the 18-line `if-else` chain with float tolerances (0.05/0.10) out of `app.rs::process_command(AddToTimeline)` into `impl AspectRatio { pub fn from_ratio(r: f32) -> Self }`. Handler now reads `AspectRatio::from_ratio(r)` — one line. Logic is now testable independently.
+
+**[P7] `clip_query::active_audio_clip(state, t)` added to `clip_query.rs`**
+Canonical "what clip provides audio at time t" query with A-row priority rule documented and implemented once. `audio_module.rs` two-chain inline search replaced with single `clip_query::active_audio_clip(state, t)` call. Future audio consumers use the same helper automatically.
+
+**[P8] `EditorModule` trait `thumb_cache` param documented in `modules/mod.rs`**
+Added doc comment explaining why every `ui()` impl receives `&mut ThumbnailCache` even when unused (uniformity, trivial dispatch). Points future maintainers toward a `UiContext` struct as the evolution path if the signature needs to grow.
+
+**[P9] `build_encode_plan` pure function extracted from `begin_render` in `app.rs`**
+`begin_render` was 100+ lines. The ClipSpec construction, filtered-timeline extraction, and transition index mapping are now in a free function `build_encode_plan(state, sorted: &[&TimelineClip]) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>)>`. Returns `None` on empty — caller logs and aborts. `begin_render` now owns only: dialog, sort, plan call, EncodeSpec assembly, state arming, worker dispatch.
+
+**[P10] Thumbnail evicted on `DeleteLibraryClip` in `app.rs`**
+`self.context.cache.thumbnail_cache.remove(&id)` added after `library.retain()`. Deleted clips no longer leak GPU texture memory for the session lifetime.
+
+**[P11] `SetCrossfadeDuration` no longer clones timeline data**
+`let mut sorted = self.state.timeline.clone()` → `let mut sorted: Vec<&TimelineClip> = self.state.timeline.iter().collect()`. Only pointers allocated, no clip data copied. Same fix applied to `begin_render` (was also cloning before the sort).
+
+**[P12] `DND_PAYLOAD` written once per drag in `library.rs`**
+Removed the write inside the `is_dragging` branch (fires every frame during drag). The canonical write in `drag_started_id` (fires on drag start) is the single correct site. Added comment explaining why the continuous write was redundant.
+
+**[P13] Unified logging via `helpers/log.rs` + `velocut_log!` macro**
+New `log.rs` in helpers: `pub fn vlog(msg: &str)` writes to `%TEMP%/velocut.log` with Unix timestamp. New `velocut_log!($($arg:tt)*)` macro formats like `eprintln!` and routes through `vlog`. `audio_module.rs` private `audio_log` replaced with `use crate::helpers::log::vlog as audio_log` — single log file now. `app.rs` and `context.rs` `eprintln!` calls migrated to `velocut_log!`. New file `helpers/mod.rs` updated with `pub mod log`.
+
+**[P14] `fit_label` moved to `helpers/format.rs`**
+`fit_label(text, max_px)` was a private fn at the bottom of `timeline.rs`. Moved to `format.rs` as `pub fn fit_label`, with doc comment and unit tests (short, zero-budget, truncated cases). `timeline.rs` updated to `use crate::helpers::format::{truncate, fit_label}` and private copy removed.
+
+**[P15] `update()` decomposed into `render_panels` + `tick_modules`**
+`update()` was ~170 lines. Extracted:
+- `fn render_panels(&mut self, ctx)` — title bar, 4 panels, encode modal
+- `fn tick_modules(&mut self, ctx)` — VideoModule::tick, audio tick, playback clock advance, encode repaint
+
+`update()` body is now ~50 lines: memory wipe guard, startup size check, drag-drop, poll_media, render_panels, command drain, tick_modules.
+
+**[P16] Skipped — blocked on `commands.rs`**
+`SaveFrameToDisk { path, timestamp }` should carry a `Uuid` instead of `PathBuf` to avoid O(N) path-string comparison per call. Requires changing the `EditorCommand` enum variant in `velocut-core/src/commands.rs` (not uploaded). Deferred to next session when commands.rs is available.
+
+---
+
+## Updated File Index (velocut-ui)
+
+| File | Last Changed | Notes |
+|------|-------------|-------|
+| `src/app.rs` | This session | VecDeque undo, sort_unstable, build_encode_plan, AspectRatio::from_ratio, thumbnail evict, velocut_log |
+| `src/context.rs` | This session | 192MB const fix, batched request_repaint, velocut_log |
+| `src/state.rs` | This session | AspectRatio::from_ratio added |
+| `src/helpers/mod.rs` | This session | Added `pub mod log` |
+| `src/helpers/clip_query.rs` | This session | Added active_audio_clip |
+| `src/helpers/format.rs` | This session | Added fit_label with tests |
+| `src/helpers/log.rs` | **New** | vlog + velocut_log! macro |
+| `src/modules/mod.rs` | This session | EditorModule thumb_cache doc |
+| `src/modules/audio_module.rs` | This session | clip_query helpers, active_audio_clip, unified logging |
+| `src/modules/video_module.rs` | This session | clip_query::library_entry_for everywhere, clip_at_time |
+| `src/modules/timeline.rs` | This session | sort_unstable_by, fit_label imported |
+| `src/modules/library.rs` | This session | DND_PAYLOAD single write |
+
+---
+
+## Remaining Backlog
+
+**[P16] `SaveFrameToDisk` UUID lookup** — needs `commands.rs` to change enum variant. Low priority (cold path, not per-frame).
+
+**[P9-remainder] Move `begin_render` entirely to `export_module`** — `build_encode_plan` is now extracted. Moving the file dialog + worker dispatch requires `EditorModule::ui()` to receive `&mut AppContext` or a command-callback. Medium effort, revisit when trait signature is up for revision.
