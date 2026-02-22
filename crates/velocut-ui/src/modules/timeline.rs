@@ -310,14 +310,27 @@ impl EditorModule for TimelineModule {
 
             ui.separator();
 
+            // ── Adaptive track sizing ─────────────────────────────────────────
+            // Read the height left after the toolbar + separator so we can scale
+            // track heights to fit the panel. At the natural 340px panel the
+            // computed height == 54px (max). As the panel shrinks, tracks scale
+            // down to a minimum of 28px. Below that the ScrollArea takes over and
+            // a vertical scrollbar appears so every track stays reachable.
+            let header_height = 28.0_f32;
+            let track_gap     = 4.0_f32;
+            let num_tracks    = 4_usize;
+            let track_height  = {
+                let avail = ui.available_height();
+                // Solve for the track_height that fills the available space exactly,
+                // then clamp to [28, 54].
+                let natural = (avail - header_height) / num_tracks as f32 - track_gap;
+                natural.clamp(28.0, 54.0)
+            };
 
                 egui::ScrollArea::both()
                     .id_salt("timeline_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui: &mut egui::Ui| {
-                    let track_height  = 54.0_f32;
-                    let track_gap     = 4.0_f32;
-                    let header_height = 28.0_f32;
-                    let num_tracks    = 4_usize;
 
                     let max_time = state.total_duration().max(60.0);
                     let total_w  = (max_time as f32 * state.timeline_zoom) + 300.0;
@@ -565,7 +578,9 @@ impl EditorModule for TimelineModule {
 
                         // Name label — capped to half the clip width so it never
                         // overflows into the duration badge or the right-hand clip.
-                        if width > 30.0 {
+                        // Suppressed at small track heights where waveform/thumbnail
+                        // is the only visual that fits.
+                        if width > 30.0 && track_height > 36.0 {
                             let label_font = FontId::proportional(11.0);
                             let label_text = fit_label(media_name, width * 0.5);
                             let label_pos  = clip_rect.min + Vec2::new(6.0, 8.0);
@@ -575,8 +590,8 @@ impl EditorModule for TimelineModule {
                         }
 
 
-                        // Duration badge
-                        if width > 50.0 {
+                        // Duration badge — only at comfortable track heights.
+                        if width > 50.0 && track_height > 36.0 {
                             painter.text(clip_rect.right_bottom() - Vec2::new(4.0, 4.0),
                                 Align2::RIGHT_BOTTOM, format!("{:.1}s", clip.duration),
                                 FontId::monospace(9.0),
@@ -586,7 +601,9 @@ impl EditorModule for TimelineModule {
                         // ── Speaker / volume badge ─────────────────────────────
                         // Paint only here. ui.interact is registered AFTER
                         // clip_interact below so it wins the hit-test.
-                        let vol_badge_geo: Option<(Rect, Pos2, bool)> = if width > 40.0 {
+                        // Suppressed at small track heights where the badge
+                        // would overlap the waveform or clip label.
+                        let vol_badge_geo: Option<(Rect, Pos2, bool)> = if width > 40.0 && track_height > 40.0 {
                             let badge_center = Pos2::new(
                                 clip_rect.center().x,
                                 clip_rect.max.y - 10.0,

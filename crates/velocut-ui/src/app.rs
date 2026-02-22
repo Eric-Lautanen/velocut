@@ -60,6 +60,12 @@ pub struct VeloCutApp {
     // each undo/redo so they are unaffected by history navigation.
     undo_stack: Vec<ProjectState>,
     redo_stack: Vec<ProjectState>,
+
+    /// True after the first rendered frame has checked the window size.
+    /// eframe persists geometry between sessions — if a previous run left the
+    /// window at near-zero dimensions, we snap it back to the default on
+    /// the very first frame. Runs exactly once per process lifetime.
+    startup_size_checked: bool,
 }
 
 impl VeloCutApp {
@@ -100,6 +106,7 @@ impl VeloCutApp {
             pending_cmds: Vec::new(),
             undo_stack:   Vec::new(),
             redo_stack:   Vec::new(),
+            startup_size_checked: false,
         }
     }
 
@@ -671,6 +678,21 @@ impl eframe::App for VeloCutApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Startup size guard ────────────────────────────────────────────────
+        // eframe restores persisted window geometry. If a previous run left the
+        // window at tiny/zero dimensions (e.g. the resizable-panel bug), we snap
+        // back to the default on the very first rendered frame. Fires once only.
+        if !self.startup_size_checked {
+            self.startup_size_checked = true;
+            let screen = ctx.screen_rect();
+            const MIN_W: f32 = 900.0;
+            const MIN_H: f32 = 600.0;
+            if screen.width() < MIN_W || screen.height() < MIN_H {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                    egui::vec2(1465.0, 965.0),
+                ));
+            }
+        }
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
 
@@ -690,8 +712,9 @@ impl eframe::App for VeloCutApp {
         render_resize_handles(ctx);
 
         egui::TopBottomPanel::bottom("timeline_panel")
-            .resizable(false)
-            .exact_height(340.0)
+            .resizable(true)
+            .min_height(160.0)
+            .default_height(340.0)
             .show(ctx, |ui| {
                 self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });

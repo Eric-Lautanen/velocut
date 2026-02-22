@@ -211,8 +211,14 @@ impl EditorModule for PreviewModule {
                 Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Outside);
 
             let cy = bar_rect.center().y;
+            // Compute how much space we actually have.
+            // When the panel is narrow, suppress the volume slider to save space,
+            // and always clamp the start x so controls never draw outside the bar.
+            let show_volume  = bar_w >= CONTENT_W + 16.0;
+            let content_w    = if show_volume { CONTENT_W } else { CONTENT_W - GAP - VOL_W };
             // x advances left-to-right through the content block
-            let mut x = bar_rect.center().x - CONTENT_W / 2.0;
+            let mut x = (bar_rect.center().x - content_w / 2.0)
+                .max(bar_rect.min.x + 6.0);
 
             // ── Helper: one fixed-size transport button ───────────────────
             // Paints bg + border, calls draw_icon closure, returns clicked.
@@ -348,16 +354,19 @@ impl EditorModule for PreviewModule {
             // ── Volume Slider ─────────────────────────────────────────────
             // ui.put() places the widget at an exact rect we control,
             // keeping it perfectly aligned with the painted buttons.
-            let vol_rect = Rect::from_min_size(
-                Pos2::new(x, cy - BTN_SIZE / 2.0),
-                Vec2::new(VOL_W, BTN_SIZE));
-            let mut vol = state.volume;
-            if ui.put(vol_rect,
-                egui::Slider::new(&mut vol, 0.0_f32..=1.0_f32)
-                    .show_value(false)
-                    .trailing_fill(true)
-            ).changed() {
-                cmd.push(EditorCommand::SetVolume(vol));
+            // Hidden when the panel is too narrow to fit all controls.
+            if show_volume {
+                let vol_rect = Rect::from_min_size(
+                    Pos2::new(x, cy - BTN_SIZE / 2.0),
+                    Vec2::new(VOL_W, BTN_SIZE));
+                let mut vol = state.volume;
+                if ui.put(vol_rect,
+                    egui::Slider::new(&mut vol, 0.0_f32..=1.0_f32)
+                        .show_value(false)
+                        .trailing_fill(true)
+                ).changed() {
+                    cmd.push(EditorCommand::SetVolume(vol));
+                }
             }
 
         }); // ui.vertical

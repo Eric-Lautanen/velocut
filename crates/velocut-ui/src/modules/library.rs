@@ -138,8 +138,9 @@ impl EditorModule for LibraryModule {
             status_strip(ui, state, &self.multi_selection);
             ui.add_space(1.0);
 
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .show(ui, |ui| {
                     // Background click → clear all selection
                     let bg = ui.interact(

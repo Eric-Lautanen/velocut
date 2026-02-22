@@ -253,13 +253,20 @@ impl EditorModule for ExportModule {
                 });
 
             ui.separator();
-            ui.add_space(6.0);
 
-            // Encode status is shown in the full-screen render modal.
-            ui.vertical(|ui| {
-                ui.add_space(4.0);
-                self.show_settings_ui(ui, state, cmd, is_encoding);
-            });
+            // Wrap settings in a scroll area so controls are reachable when
+            // the panel is shorter than its natural content height. The bar
+            // only appears when the content actually overflows — no bar at
+            // normal panel heights.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        self.show_settings_ui(ui, state, cmd, is_encoding);
+                    });
+                });
         });
     }
 }
