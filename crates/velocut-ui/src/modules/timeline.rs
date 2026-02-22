@@ -449,26 +449,31 @@ impl EditorModule for TimelineModule {
             ui.separator();
 
             // ── Adaptive track sizing ─────────────────────────────────────────
-            // Read the height left after the toolbar + separator so we can scale
-            // track heights to fit the panel. At the natural 340px panel the
-            // computed height == 54px (max). As the panel shrinks, tracks scale
-            // down to a minimum of 28px. Below that the ScrollArea takes over and
-            // a vertical scrollbar appears so every track stays reachable.
+            // The panel height is owned by app.rs (timeline_height_frac) and
+            // driven with exact_height every frame, so available_height() here is
+            // always a real, stable value — immune to the minimize/restore shrink
+            // bug. Track heights scale between [28, 54] px to fill the space as
+            // the user resizes the panel via the drag handle at the top.
             let header_height = 28.0_f32;
             let track_gap     = 4.0_f32;
             let num_tracks    = 4_usize;
             let track_height  = {
                 let avail = ui.available_height();
-                // Solve for the track_height that fills the available space exactly,
-                // then clamp to [28, 54].
                 let natural = (avail - header_height) / num_tracks as f32 - track_gap;
                 natural.clamp(28.0, 54.0)
             };
 
-                egui::ScrollArea::both()
-                    .id_salt("timeline_scroll")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-                    .show(ui, |ui: &mut egui::Ui| {
+            // Floor for the ScrollArea: never measure smaller than all 4 tracks at
+            // minimum height. auto_shrink(false) prevents egui from collapsing the
+            // outer scroll frame to content size when the timeline is empty.
+            let min_content_h = header_height + (28.0 + track_gap) * num_tracks as f32;
+
+            egui::ScrollArea::both()
+                .id_salt("timeline_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .auto_shrink([false, false])
+                .min_scrolled_height(min_content_h)
+                .show(ui, |ui: &mut egui::Ui| {
 
                     let max_time = state.total_duration().max(60.0);
                     let total_w  = (max_time as f32 * state.timeline_zoom) + 300.0;

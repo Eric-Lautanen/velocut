@@ -28,6 +28,18 @@ use ffmpeg_the_third as ffmpeg;
 /// Always logs a warning on failure so seek issues are visible in the console
 /// without crashing the encode.
 ///
+/// # Why backward seek (`..=seek_ts`)
+/// A forward seek (`seek_ts..`) lands on the keyframe AT OR AFTER `target_secs`.
+/// When `target_secs` falls mid-GOP — which is always the case for the clip
+/// following a transition — that forward keyframe may be several seconds away.
+/// Every source frame between `target_secs` and that keyframe is absent from
+/// the decode stream; the fps-conversion loop interprets the gap as slow-motion
+/// and repeats the first available frame, producing a visible freeze.
+///
+/// A backward seek lands on the keyframe BEFORE `target_secs`. The pre-roll
+/// frames are discarded by the caller's PTS filter, so the first encoded frame
+/// is still correctly at `target_secs` — no duplication, no freeze.
+///
 /// # Why skip at 0.0
 /// `avformat_seek_file(max_ts=0)` returns EPERM on Windows when called on a
 /// freshly-opened context. Since the demuxer starts at position 0 by default,
@@ -42,7 +54,7 @@ pub fn seek_to_secs(
     }
 
     let seek_ts = (target_secs * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-    match ictx.seek(seek_ts, seek_ts..) {
+    match ictx.seek(seek_ts, ..=seek_ts) {
         Ok(()) => true,
         Err(e) => {
             eprintln!(

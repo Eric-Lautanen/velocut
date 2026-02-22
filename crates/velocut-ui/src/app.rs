@@ -65,6 +65,12 @@ pub struct VeloCutApp {
     /// window at near-zero dimensions, we snap it back to the default on
     /// the very first frame. Runs exactly once per process lifetime.
     startup_size_checked: bool,
+
+    /// Set to true by ClearProject so the next update() call wipes egui's
+    /// in-memory IdTypeMap (panel heights, scroll offsets, open popup flags)
+    /// before any panel renders. Cannot be done in process_command because
+    /// ctx is not available there.
+    clear_egui_memory: bool,
 }
 
 impl VeloCutApp {
@@ -105,6 +111,7 @@ impl VeloCutApp {
             undo_stack:   Vec::new(),
             redo_stack:   Vec::new(),
             startup_size_checked: false,
+            clear_egui_memory:    false,
         }
     }
 
@@ -421,6 +428,77 @@ impl VeloCutApp {
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.sync_undo_len();
+
+                // ── Step 9: delete the eframe storage file (app.ron) now.
+                //
+                // eframe::storage_dir("VeloCut") returns the platform folder
+                // where eframe persists app state:
+                //   Windows : %APPDATA%\VeloCut\data\
+                //   macOS   : ~/Library/Application Support/VeloCut/
+                //   Linux   : ~/.local/share/VeloCut/
+                //
+                // The file inside is `app.ron`. Deleting it immediately means
+                // the cleared state is on disk right now, not just queued for
+                // the next save() call on exit. If the process were to crash
+                // between here and exit the old data would still be gone.
+                // eframe's save() will simply recreate the file on next exit
+                // with the current (now-blank) state.
+                //
+                // We delete the whole data directory rather than just app.ron
+                // so any other eframe-managed files (e.g. window geometry ron)
+                // are also wiped. Failure is logged but never fatal.
+                if let Some(storage_dir) = eframe::storage_dir("VeloCut") {
+                    match std::fs::remove_dir_all(&storage_dir) {
+                        Ok(()) => eprintln!(
+                            "[reset] deleted eframe storage dir '{}'",
+                            storage_dir.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "[reset] could not delete eframe storage dir '{}': {e}",
+                            storage_dir.display()
+                        ),
+                    }
+                } else {
+                    eprintln!("[reset] eframe::storage_dir returned None — storage not deleted");
+                }
+
+                // ── Step 10: delete all orphaned velocut_* temp files.
+                //
+                // pending_audio_cleanup (step 1) only covers audio_path entries
+                // still tracked in the library. WAVs from previously-deleted
+                // clips or from a prior crashed session are not in that list.
+                // Scanning the OS temp dir catches all of them.
+                let tmp = std::env::temp_dir();
+                match std::fs::read_dir(&tmp) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name();
+                            if name.to_string_lossy().starts_with("velocut_") {
+                                let p = entry.path();
+                                if let Err(e) = std::fs::remove_file(&p) {
+                                    eprintln!("[reset] could not delete temp file '{}': {e}", p.display());
+                                } else {
+                                    eprintln!("[reset] deleted temp file '{}'", p.display());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[reset] could not read temp dir: {e}"),
+                }
+
+                // ── Step 11: schedule egui in-memory clear.
+                //
+                // Panel heights, scroll positions, and popup-open flags all live
+                // in egui's IdTypeMap inside Memory. Clearing them here is not
+                // possible because ctx is unavailable in process_command. The
+                // flag is consumed at the top of the very next update() call,
+                // before any panel is rendered, so the wiped values are what the
+                // layout engine sees on the first post-reset frame.
+                //
+                // startup_size_checked is also reset so the timeline height
+                // startup guard re-runs and injects a fresh default.
+                self.clear_egui_memory    = true;
+                self.startup_size_checked = false;
             }
             EditorCommand::SetCrossfadeDuration(secs) => {
                 // Batch operation: set crossfade on every touching adjacent pair,
@@ -683,6 +761,14 @@ impl eframe::App for VeloCutApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Post-reset egui memory wipe ───────────────────────────────────────
+        // Consumes the flag set by ClearProject. Replacing mem.data with a
+        // default IdTypeMap evicts all stored egui values (panel heights, scroll
+        // positions, open-popup flags) in one shot, before any widget runs.
+        if self.clear_egui_memory {
+            ctx.memory_mut(|mem| mem.data = egui::util::IdTypeMap::default());
+            self.clear_egui_memory = false;
+        }
         // ── Startup size guard ────────────────────────────────────────────────
         // eframe restores persisted window geometry. If a previous run left the
         // window at tiny/zero dimensions (e.g. the resizable-panel bug), we snap
@@ -743,7 +829,7 @@ impl eframe::App for VeloCutApp {
 
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(true)
-            .min_height(160.0)
+            .min_height(340.0)
             .default_height(340.0)
             .show(ctx, |ui| {
                 self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
@@ -760,7 +846,7 @@ impl eframe::App for VeloCutApp {
         egui::SidePanel::right("export_panel")
             .resizable(true)
             .default_width(220.0)
-            .min_width(160.0)
+            .min_width(220.0)
             .show(ctx, |ui| {
                 self.export.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });

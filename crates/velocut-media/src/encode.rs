@@ -652,6 +652,7 @@ fn run_encode(
                     frame_tb,
                     &cancel,
                     tx,
+                    &mut last_video_dts,
                 )?;
 
                 // Tell the next iteration to skip the head it already blended.
@@ -851,15 +852,28 @@ fn encode_clip(
         if w > 0 && h > 0 { (w, h) } else { (video_decoder.width(), video_decoder.height()) }
     };
 
-    // Skip the seek when source_offset is zero — the demuxer starts at the
-    // beginning of the file automatically, and avformat_seek_file(max_ts=0)
-    // returns EPERM on Windows when called on a freshly-opened context.
-    // seek_to_secs handles the 0.0 guard and Windows soft-fail internally.
-    // encode_clip treats seek failure as a hard error since a missed seek on
-    // a trimmed clip would produce incorrect output frames.
-    if clip.source_offset > 0.0 && !seek_to_secs(&mut ictx, clip.source_offset, "encode_clip") {
-        return Err(format!("seek failed in '{}' at {:.3}s", clip.path.display(), clip.source_offset));
-    }
+    // Seek to source_offset using a BACKWARD seek (max_ts constraint) so we
+    // always land on the keyframe BEFORE source_offset.
+    //
+    // WHY BACKWARD, NOT FORWARD:
+    //   A forward seek (seek_ts..) lands on the keyframe AT OR AFTER source_offset.
+    //   When source_offset falls mid-GOP — which is always the case for the clip
+    //   following a transition, because effective_B.source_offset = B.source_offset
+    //   + transition_secs — that forward keyframe may be several seconds away.
+    //   Every source frame between source_offset and that keyframe is then absent
+    //   from the decode stream.  The fps-conversion loop below interprets the gap
+    //   as a slow-motion source and REPEATS the first available frame to fill
+    //   the missing output slots, producing a freeze that lasts exactly as long
+    //   as the keyframe gap (up to a full GOP — 5–30 s in camera footage).
+    //
+    //   A backward seek instead lands on the keyframe BEFORE source_offset.
+    //   The pre-roll frames between that keyframe and source_offset are discarded
+    //   by the PTS filter (frame_pts_secs < clip.source_offset - half_frame),
+    //   so the first encoded frame is still correctly at source_offset.
+    //   No duplication, no freeze.
+    //
+    // Seek failure is a soft-fail: the PTS filter catches any pre-roll regardless.
+    seek_to_secs(&mut ictx, clip.source_offset, "encode_clip");
 
     // ── Format converters (deferred until first frame of each type) ───────────
     let mut video_scaler:    Option<CropScaler>          = None;
@@ -1236,29 +1250,9 @@ fn decode_clip_frames(
     let mut video_decoder = vdec_ctx.decoder().video()
         .map_err(|e| format!("crossfade open video decoder: {e}"))?;
 
-    // decode_clip_frames needs backward-seeking so it can land on the keyframe
-    // BEFORE the target window, not the one after it.
-    //
-    // seek_to_secs uses `seek_ts..` (forward-only min_ts constraint), which
-    // forces ffmpeg to find a keyframe AT OR AFTER seek_ts. For a tail window
-    // [clip_end - transition_secs, clip_end], the nearest keyframe >= target
-    // may be past clip_end — ffmpeg lands there, the PTS guard immediately
-    // breaks, decode_clip_frames returns 0 frames, apply_transition short-
-    // circuits (n=0), and the transition is silently replaced by a hard cut.
-    //
-    // Fix: use `..=seek_ts` (max_ts constraint only) so ffmpeg is free to land
-    // on the keyframe BEFORE the target. Pre-roll frames between the keyframe
-    // and source_offset are then discarded by the PTS filter below.
-    if clip.source_offset > 0.0 {
-        let seek_ts = (clip.source_offset * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-        if let Err(e) = ictx.seek(seek_ts, ..=seek_ts) {
-            eprintln!(
-                "[decode_clip_frames] seek soft-fail at {:.3}s: {e} \
-                 — decoding from start, PTS filter will skip pre-roll",
-                clip.source_offset,
-            );
-        }
-    }
+    // Backward seek: land on the keyframe BEFORE source_offset so we never miss
+    // frames in the transition window. See seek_to_secs for the full rationale.
+    seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
 
     let mut video_scaler: Option<CropScaler> = None;
     let clip_end   = clip.source_offset + clip.duration;
@@ -1323,6 +1317,131 @@ fn decode_clip_frames(
     Ok(frames)
 }
 
+/// Decode audio from `clip` into flat left/right FLTP sample vecs at 44 100 Hz,
+/// covering `[source_offset, source_offset + duration)`.
+///
+/// Called by `apply_transition` to supply PCM for the cross-fade window so audio
+/// is not silent during transitions.  Without this, `encode_clip` cuts audio off
+/// at clip_end and the FIFO is nearly empty while `apply_transition` runs, producing
+/// near-silence for `transition_secs` seconds and shifting all of clip B's audio
+/// forward by that amount.
+///
+/// Volume gain (`clip.volume`) is applied and samples are clamped to [-1.0, 1.0].
+/// Soft-fails: missing audio stream → empty vecs (silence carried through);
+/// corrupt packets are skipped rather than aborting the encode.
+fn decode_clip_audio(
+    clip: &ClipSpec,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let mut ictx = open_input(&clip.path)
+        .map_err(|e| format!("transition audio open '{}': {e}", clip.path.display()))?;
+
+    let audio_stream_idx = match ictx.streams().best(MediaType::Audio) {
+        Some(s) => s.index(),
+        None    => return Ok((Vec::new(), Vec::new())), // no audio track — silence
+    };
+
+    let ast         = ictx.stream(audio_stream_idx).unwrap();
+    let in_audio_tb = ast.time_base();
+
+    let adec_ctx = codec::context::Context::from_parameters(ast.parameters())
+        .map_err(|e| format!("transition audio decoder ctx '{}': {e}", clip.path.display()))?;
+    let mut adec = adec_ctx.decoder().audio()
+        .map_err(|e| format!("transition audio decoder open '{}': {e}", clip.path.display()))?;
+
+    seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_audio");
+
+    let clip_end    = clip.source_offset + clip.duration;
+    let target_fmt  = Sample::F32(SampleType::Planar);
+    let mut audio_resampler: Option<resampling::Context> = None;
+    let mut left  = Vec::<f32>::new();
+    let mut right = Vec::<f32>::new();
+
+    // Inner helper: append one decoded/resampled FLTP stereo frame into left/right vecs.
+    fn push_frame(frame: &AudioFrame, vol: f32, left: &mut Vec<f32>, right: &mut Vec<f32>) {
+        let n = frame.samples();
+        if n == 0 { return; }
+        unsafe {
+            let l_bytes = frame.data(0);
+            let l_f32   = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
+            left.extend(l_f32.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+
+            let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
+            let r_f32   = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
+            right.extend(r_f32.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+        }
+    }
+
+    'pkt: for result in ictx.packets() {
+        let (stream, packet) = result
+            .map_err(|e| format!("transition audio read packet: {e}"))?;
+        if stream.index() != audio_stream_idx { continue; }
+
+        if adec.send_packet(&packet).is_err() { continue; } // soft-fail on bad packet
+
+        let mut raw = AudioFrame::empty();
+        while adec.receive_frame(&mut raw).is_ok() {
+            let pts_secs = raw.pts()
+                .map(|pts| pts as f64 * f64::from(in_audio_tb))
+                .unwrap_or(0.0);
+            if pts_secs < clip.source_offset - 0.05 { continue; }
+            if pts_secs >= clip_end { break 'pkt; }
+
+            let raw_channels   = raw.ch_layout().channels();
+            let needs_resample = raw.format() != target_fmt
+                || raw.rate()               != AUDIO_RATE as u32
+                || raw_channels             != 2;
+
+            if needs_resample {
+                let rs = audio_resampler.get_or_insert_with(|| {
+                    let src_layout = if raw.ch_layout().channels() >= 2 {
+                        raw.ch_layout()
+                    } else {
+                        ChannelLayout::MONO
+                    };
+                    resampling::Context::get2(
+                        raw.format(), src_layout,            raw.rate(),
+                        target_fmt,   ChannelLayout::STEREO, AUDIO_RATE as u32,
+                    ).expect("create audio resampler (transition)")
+                });
+                let mut resampled = AudioFrame::empty();
+                if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
+                    push_frame(&resampled, clip.volume, &mut left, &mut right);
+                }
+            } else {
+                push_frame(&raw, clip.volume, &mut left, &mut right);
+            }
+        }
+    }
+
+    // Flush decoder tail — same clip_end ceiling as the packet loop.
+    let _ = adec.send_eof();
+    let mut raw = AudioFrame::empty();
+    while adec.receive_frame(&mut raw).is_ok() {
+        let pts_secs = raw.pts()
+            .map(|pts| pts as f64 * f64::from(in_audio_tb))
+            .unwrap_or(0.0);
+        if pts_secs >= clip_end { break; }
+
+        let raw_channels   = raw.ch_layout().channels();
+        let needs_resample = raw.format() != target_fmt
+            || raw.rate()               != AUDIO_RATE as u32
+            || raw_channels             != 2;
+
+        if needs_resample {
+            if let Some(rs) = &mut audio_resampler {
+                let mut resampled = AudioFrame::empty();
+                if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
+                    push_frame(&resampled, clip.volume, &mut left, &mut right);
+                }
+            }
+        } else {
+            push_frame(&raw, clip.volume, &mut left, &mut right);
+        }
+    }
+
+    Ok((left, right))
+}
+
 /// Encode the blended frames between `tail_spec` (end of clip A) and
 /// `head_spec` (start of clip B) using the provided `VideoTransition` impl.
 ///
@@ -1351,9 +1470,24 @@ fn apply_transition(
     frame_tb:      Rational,
     cancel:        &Arc<AtomicBool>,
     tx:            &Sender<MediaResult>,
+    last_video_dts: &mut i64,
 ) -> Result<i64, String> {
     let tail_frames = decode_clip_frames(tail_spec, spec)?;
     let head_frames = decode_clip_frames(head_spec, spec)?;
+
+    // Decode PCM for both sides of the transition so we can cross-fade audio in
+    // lockstep with the video blend.  encode_clip intentionally cuts its audio off
+    // at clip_end (to avoid writing un-un-writable AAC frames), so the FIFO is
+    // nearly empty when we arrive here.  Without these decoded buffers the output
+    // has near-silence for the full transition_secs window, which also shifts every
+    // subsequent clip B's audio later by that amount.
+    let (tail_audio_l, tail_audio_r) = decode_clip_audio(tail_spec)?;
+    let (head_audio_l, head_audio_r) = decode_clip_audio(head_spec)?;
+
+    // Exact rational samples-per-video-frame at the output rate.
+    // Using f64 accumulation (sample_start/end via round) avoids integer drift
+    // that would otherwise accumulate 1–2 samples per frame over long transitions.
+    let samples_per_frame_f = AUDIO_RATE as f64 / spec.fps as f64;
 
     let n = tail_frames.len().min(head_frames.len());
     if n == 0 {
@@ -1399,11 +1533,47 @@ fn apply_transition(
         while video_encoder.receive_packet(&mut pkt).is_ok() {
             pkt.set_stream(0);
             pkt.rescale_ts(frame_tb, ost_tb);
+            // DTS monotonicity guard — same as encode_clip.
+            // The H.264 encoder's B-frame reorder buffer spans the encode_clip →
+            // apply_transition → encode_clip boundaries, so delayed B-frame packets
+            // from the previous clip can emerge here with non-monotonic DTS values.
+            // Without clamping, write_interleaved rejects the packet and the player
+            // stalls at the transition point.
+            let raw_dts = pkt.dts().unwrap_or(0);
+            if *last_video_dts != i64::MIN {
+                let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
+                if dts_s < prev_s {
+                    let clamped = *last_video_dts + 1;
+                    eprintln!(
+                        "[transition] non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
+                         clamping {raw_dts} → {clamped}"
+                    );
+                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                }
+            }
+            *last_video_dts = pkt.dts().unwrap_or(raw_dts);
             pkt.write_interleaved(octx)
                 .map_err(|e| format!("transition write packet: {e}"))?;
         }
 
-        // Drain whatever audio the FIFO has from clip A's tail.
+        // Cross-fade audio for this video frame and push it into the FIFO before
+        // draining.  The sample range for frame i is [round(i*spf), round((i+1)*spf)).
+        // Using .get().copied().unwrap_or(0.0) gracefully handles the case where
+        // decoded audio is slightly shorter than the video (source edge cases).
+        let sample_start = (i       as f64 * samples_per_frame_f).round() as usize;
+        let sample_end   = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
+        let af = alpha as f32;
+        for s in sample_start..sample_end {
+            let t_l = tail_audio_l.get(s).copied().unwrap_or(0.0);
+            let t_r = tail_audio_r.get(s).copied().unwrap_or(0.0);
+            let h_l = head_audio_l.get(s).copied().unwrap_or(0.0);
+            let h_r = head_audio_r.get(s).copied().unwrap_or(0.0);
+            audio_state.fifo.left .push((t_l * (1.0 - af) + h_l * af).clamp(-1.0, 1.0));
+            audio_state.fifo.right.push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
+        }
+
+        // Drain full AAC frames now that this video frame's audio has been pushed.
         audio_state.drain_fifo(octx, false)?;
 
         out_frame_idx += 1;
