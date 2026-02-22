@@ -292,7 +292,7 @@ impl ExportModule {
             return;
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
 
         // ── Scrim ─────────────────────────────────────────────────────────────
         // 0.5 opacity black over the entire window, painted on the Foreground

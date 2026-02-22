@@ -23,6 +23,7 @@ pub type ThumbnailCache = HashMap<Uuid, TextureHandle>;
 
 /// Every editor panel implements this trait.
 /// Modules read state, emit commands — they never mutate state directly.
+#[allow(dead_code)]
 pub trait EditorModule {
     fn name(&self) -> &str;
     fn ui(

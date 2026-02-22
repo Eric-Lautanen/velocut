@@ -48,7 +48,6 @@ pub struct VeloCutApp {
     export:       ExportModule,
     /// Stored separately so tick() calls the concrete method, not the trait default no-op.
     audio:        AudioModule,
-    video:        VideoModule,
     /// Commands emitted by modules each frame, processed after the UI pass
     pending_cmds: Vec<EditorCommand>,
 
@@ -102,7 +101,6 @@ impl VeloCutApp {
             timeline,
             export:       ExportModule::default(),
             audio:        AudioModule::new(),
-            video:        VideoModule::new(),
             pending_cmds: Vec::new(),
             undo_stack:   Vec::new(),
             redo_stack:   Vec::new(),
@@ -684,7 +682,7 @@ impl eframe::App for VeloCutApp {
         // back to the default on the very first rendered frame. Fires once only.
         if !self.startup_size_checked {
             self.startup_size_checked = true;
-            let screen = ctx.screen_rect();
+            let screen = ctx.viewport_rect();
             const MIN_W: f32 = 900.0;
             const MIN_H: f32 = 600.0;
             if screen.width() < MIN_W || screen.height() < MIN_H {

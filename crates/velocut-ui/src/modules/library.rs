@@ -63,12 +63,6 @@ impl LibraryModule {
         Self { multi_selection: HashSet::new(), visible_ids: HashSet::new() }
     }
 
-    /// True if `id` is considered "selected" in any mode.
-    fn is_any_selected(&self, id: Uuid, state: &ProjectState) -> bool {
-        self.multi_selection.contains(&id)
-            || state.selected_library_clip == Some(id)
-    }
-
     /// Clear everything — both the module set and the state anchor.
     fn clear_selection(&mut self, cmd: &mut Vec<EditorCommand>) {
         self.multi_selection.clear();

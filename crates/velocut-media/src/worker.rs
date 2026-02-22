@@ -55,7 +55,7 @@ pub struct MediaWorker {
     /// request exists at a time; 8 gives headroom for back-to-back requests
     /// during rapid scrub without dropping frames.
     pub scrub_rx: Receiver<MediaResult>,
-    scrub_tx:     Sender<MediaResult>,
+    _scrub_tx:    Sender<MediaResult>,
 
     /// Latest-wins slot for on-demand scrub frames.
     frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)>,
@@ -216,7 +216,7 @@ impl MediaWorker {
         });
 
         Self {
-            rx, tx, scrub_rx, scrub_tx, frame_req, pb_tx, pb_rx,
+            rx, tx, scrub_rx, _scrub_tx: scrub_tx, frame_req, pb_tx, pb_rx,
             shutdown:       Arc::new(AtomicBool::new(false)),
             probe_sem:      Arc::new((Mutex::new(0), Condvar::new())),
             encode_cancels: Arc::new(Mutex::new(HashMap::new())),

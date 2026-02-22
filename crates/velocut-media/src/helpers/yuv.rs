@@ -56,29 +56,6 @@ pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usiz
     raw
 }
 
-/// Linear blend of two packed YUV420P frames.
-///
-/// `alpha` = 0.0 → 100% frame_a (outgoing clip)
-/// `alpha` = 1.0 → 100% frame_b (incoming clip)
-///
-/// Blend is performed in gamma-encoded byte space — a linear approximation
-/// that is visually correct for typical dissolves on SDR content.
-/// For HDR or wide-gamut content a linear-light blend would be more accurate,
-/// but that requires float intermediate storage and is out of scope here.
-///
-/// Both slices must have the same length (same frame dimensions).
-/// Panics in debug builds if lengths differ; silently clips in release.
-pub fn blend_yuv_frame(frame_a: &[u8], frame_b: &[u8], alpha: f32) -> Vec<u8> {
-    debug_assert_eq!(frame_a.len(), frame_b.len(),
-        "blend_yuv_frame: frame size mismatch — both clips must be scaled to the same output dimensions");
-
-    let inv = 1.0 - alpha;
-    frame_a.iter()
-        .zip(frame_b.iter())
-        .map(|(&a, &b)| (inv * a as f32 + alpha * b as f32).round() as u8)
-        .collect()
-}
-
 /// Write a packed YUV420P buffer back into a VideoFrame's planes, respecting stride.
 ///
 /// The inverse of `extract_yuv` — used when the blended frame needs to be sent

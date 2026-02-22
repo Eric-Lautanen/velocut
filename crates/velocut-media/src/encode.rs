@@ -280,15 +280,10 @@ impl AudioFifo {
     /// How many samples are currently buffered (per channel).
     fn len(&self) -> usize { self.left.len() }
 
-    /// Append one decoded / resampled FLTP audio frame.
+    /// Append one decoded / resampled FLTP audio frame, scaled by `volume`.
     ///
     /// The frame must be in FLTP format (float planar); stereo or mono.
     /// Mono frames are duplicated to both output channels.
-    fn push(&mut self, frame: &AudioFrame) {
-        self.push_scaled(frame, 1.0);
-    }
-
-    /// Like `push`, but multiplies every sample by `volume` before buffering.
     /// Volume is a linear gain: 1.0 = unity, 0.0 = silence, 2.0 = +6 dB.
     fn push_scaled(&mut self, frame: &AudioFrame, volume: f32) {
         let n = frame.samples();

@@ -20,8 +20,6 @@ use uuid::Uuid;
 pub struct VideoModule;
 
 impl VideoModule {
-    pub fn new() -> Self { Self }
-
     // ── Public helpers ────────────────────────────────────────────────────────
 
     /// Returns the media_id of the timeline clip currently under the playhead.
