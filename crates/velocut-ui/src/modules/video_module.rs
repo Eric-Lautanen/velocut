@@ -192,10 +192,17 @@ impl VideoModule {
             ctx.playback.last_frame_req    = None;
             ctx.playback.scrub_last_moved  = None;
             ctx.playback.scrub_coarse_req  = None;
-            ctx.cache.pending_pb_frame  = None;
+            ctx.cache.pending_pb_frame     = None;
+            // Bucket cache is no longer needed after playback stops — clear it
+            // so TextureHandles are released and GPU memory returns to baseline.
+            ctx.cache.frame_bucket_cache.clear();
         }
 
         let Some(clip) = current_clip else {
+            if let Some((prev_id, _)) = ctx.playback.last_frame_req {
+                // Playhead moved into empty space — evict that clip's bucket cache.
+                ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+            }
             ctx.playback.last_frame_req   = None;
             ctx.playback.scrub_last_moved = None;
             ctx.playback.scrub_coarse_req = None;
@@ -221,6 +228,10 @@ impl VideoModule {
                 if prev_id != clip.media_id {
                     ctx.cache.frame_cache.remove(&prev_id);
                     ctx.playback.scrub_coarse_req = None;
+                    // Evict all bucket cache entries for the previous clip.
+                    // Buckets accumulate one entry per ¼s scrubbed — without this
+                    // they are never freed, causing unbounded TextureHandle growth.
+                    ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
                 }
             }
             ctx.playback.last_frame_req = Some((clip.media_id, local_t));

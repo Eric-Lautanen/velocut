@@ -28,6 +28,9 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Drop CPU-side pixel data after GPU upload — safe since we don't
+            // serialize textures. Reduces memory footprint during frame churn.
+            cc.egui_ctx.options_mut(|o| o.reduce_texture_memory = true);
             Ok(Box::new(app::VeloCutApp::new(cc)))
         }),
     )

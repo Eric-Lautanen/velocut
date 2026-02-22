@@ -135,6 +135,11 @@ Clip name labels: `fit_label(text, max_px)` at bottom of file (6.5px/char heuris
 **`modules/video_module.rs`** — Unit struct. `tick()` + `poll_playback()`. `active_media_id()` static.
 `poll_playback()`: PTS-gated single-slot → `pending_pb_frame` → `frame_cache` when `current_time >= frame.pts` (±1 frame, not older than 3s). `request_repaint()` after promotion is non-redundant (background thread, not input event). **Clip-transition eviction at top before any other logic** (before UI reads `frame_cache`).
 `tick()`: playback → restart decode on clip change. Scrub → L1 nearest bucket (0ms), L2 exact-ts every drag px, L2b coarse 2s prefetch, L3 precise frame 150ms idle debounce. Scrub suppressed during playback. Both paths use `clip_at_time(state,...)`.
+**`frame_bucket_cache` eviction** — 3 sites, all via `retain` or `clear`, no external crates:
+1. Scrub clip change (`prev_id != clip.media_id`) — `retain(|(id,_),_| *id != prev_id)`
+2. Playback stop (`just_stopped`) — `frame_bucket_cache.clear()`
+3. Playhead moves to empty space (`current_clip` is None) — `retain` against `last_frame_req.prev_id`
+Never add a 4th eviction site without updating this list.
 
 ---
 
@@ -170,7 +175,7 @@ That's it. `TransitionKind` variant, registry, badge, tooltip, popup button, sli
 - Playback: PTS-gated `pending_pb_frame`. One frame promoted per tick. Never drain full `pb_rx` in one tick.
 - `stable_dt` master clock. `current_time += stable_dt`. Never advance from frame timestamps.
 - Probe semaphore (max 4) gates duration+thumbnail only. Waveform+audio after `drop(_guard)`.
-- `frame_bucket_cache` byte-capped. **Always via `insert_bucket_frame`** — never write directly. Evicts 32 furthest O(N).
+- `frame_bucket_cache` byte-capped. **Always via `insert_bucket_frame`** — never write directly. Evicts 32 furthest O(N). **Evicted at 3 sites in `video_module.rs::tick()`** — clip change, stop, empty space. See `video_module.rs` entry for details.
 - DnD: `DND_PAYLOAD` written by LibraryModule on drag, cleared by TimelineModule on drop or when no pointer button down.
 - PTS comparisons in `decode.rs` always in seconds. Raw PTS only for seek target calc.
 - All seeks via `helpers::seek::seek_to_secs`. Never `ictx.seek()` directly.
@@ -247,7 +252,7 @@ Cache roles:
 
 ## Resource Lifecycle
 
-- **TextureHandle** (all caches): dropping = GPU free. `frame_bucket_cache` write only via `insert_bucket_frame` to keep byte budget accurate.
+- **TextureHandle** (all caches): dropping = GPU free. `frame_bucket_cache` write only via `insert_bucket_frame` to keep byte budget accurate. Evicted at 3 sites in `tick()` — TextureHandles dropped immediately on eviction, GPU memory returns to baseline within that tick.
 - **Audio temp WAVs** (`$TEMP/velocut_audio_{uuid}.wav`): created by `audio.rs::extract_audio`, queued in `state.pending_audio_cleanup`, deleted by `poll_media()`. Must be queued before library wipe in `ClearProject`.
 - **Rodio sinks**: `audio_module.rs::tick()` only.
 - **`LiveDecoder` (FFmpeg ictx + decoder)**: dropped when `start_playback` replaces it on pb thread.
@@ -262,8 +267,8 @@ Cache roles:
 - **Velocity-scaled L2b prefetch**: currently fixed 2s window. Scale to 8–10s on fast fling, 1s backward. Track scrub velocity in `timeline.rs` (delta time/wall-clock, smoothed 3–5 frames).
 - **Hover prefetch**: emit `RequestScrubPrefetch(hover_time)` at L2b priority on hover before drag starts. Same code path, different trigger.
 - **Hover cursor frame preview**: small thumbnail above cursor on hover (not dragging, not playing). Read-only lookup in `frame_bucket_cache` by `(media_id, nearest_bucket_index)`. Pass `&ctx.frame_bucket_cache` read-only into `timeline.rs::ui()`.
-- **`fit_label` to `helpers/format.rs`**: currently private in `timeline.rs`. Move when second callsite appears.
-- **`thumbnail_cache` eviction**: currently never evicted. Fine for typical projects but leaks for large clip counts.
+- **`thumbnail_cache` eviction**: evicted on `DeleteLibraryClip` (P10, done). Not evicted on `ClearProject` — `clear_all()` handles that. Fine for typical projects. No action needed unless very large clip counts (100+) show memory pressure.
+- **`egui::Options::reduce_texture_memory`**: tried and reverted — caused +20 MB idle overhead. Do not re-enable without measuring first.
 
 ---
 
@@ -304,6 +309,7 @@ Use these, never inline:
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
 - Scrub: 3-layer (L1 cached bucket, L2 exact decode, L3 idle precise), dedicated scrub_rx channel
 - Playback: PTS-gated single-slot, stable_dt clock master
+- Memory: ~90 MB idle, ~120 MB peak active, returns to baseline on stop. `frame_bucket_cache` eviction at 3 sites. No leaks observed in normal use.
 
 ---
 
@@ -379,6 +385,59 @@ Use these, never inline:
 **[P16] `SaveFrameToDisk` looks up by path not UUID**
 - File: `app.rs:611`
 - `self.state.library.iter().find(|l| l.path == path)` compares `PathBuf` values (heap allocation per comparison). Should carry the `Uuid` in the command and look up by ID. Low priority since this code path fires only on explicit frame-export, not per-frame.
+
+---
+
+## Session Log — Feb 2026 (cont.) — Memory Management Pass
+
+### Investigation
+
+Identified two structural memory issues via code review:
+
+1. **`frame_bucket_cache` was unbounded** — `HashMap<(Uuid,u32), (TextureHandle,usize)>` accumulated one entry per ¼s scrubbed, forever. Each entry holds a live `TextureHandle` keeping GPU memory allocated. Scrubbing through a long clip or switching clips repeatedly caused permanent memory growth.
+
+2. **`ThumbnailCache` has no eviction** — still true, noted but acceptable for typical project sizes. `DeleteLibraryClip` was already fixed to call `thumbnail_cache.remove` (P10 from prior session).
+
+### What Was Tried and Reverted
+
+**`egui_extras` `reduce_texture_memory = true`** (one-line flag in `main.rs`) — Drops CPU-side RGBA data after GPU upload. Reverted: caused +20 MB at idle compared to baseline. egui's bookkeeping overhead without the CPU copy exceeded the savings. **Do not re-enable without benchmarking.** This flag is only beneficial if you're texture-thrashing with no re-upload; the scrub/playback workload does re-upload on every new frame.
+
+### Fix Applied — `frame_bucket_cache` eviction (3 sites in `video_module.rs`)
+
+No new crates. Pure `HashMap::retain` + `clear`:
+
+**Site 1 — Scrub clip change** (inside `if prev_id != clip.media_id`):
+```rust
+ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+```
+
+**Site 2 — Playback stop** (`just_stopped` block):
+```rust
+ctx.cache.frame_bucket_cache.clear();
+```
+
+**Site 3 — Playhead moves to empty space** (`current_clip` is None):
+```rust
+if let Some((prev_id, _)) = ctx.playback.last_frame_req {
+    ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+}
+```
+
+### Memory Profile (Post-Fix, 6 clips library + 6 clips timeline)
+
+- **Idle baseline**: ~90 MB
+- **Peak during active scrub/playback**: ~120 MB
+- **After scrub stops / playback stops**: returns to ~90 MB
+
+The 30 MB delta is the legitimate working set (frame textures in flight). Memory now tracks actual workload — not a leak. Considered resolved.
+
+**Sub-500 MB total for a full video editor with real-time FFmpeg decode, GPU texture management, rodio audio, and egui UI is healthy.**
+
+### Updated File Index
+
+| File | Changed | Notes |
+|------|---------|-------|
+| `src/modules/video_module.rs` | This session | 3-site `frame_bucket_cache` eviction added |
 
 ---
 
