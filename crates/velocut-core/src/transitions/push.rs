@@ -44,7 +44,7 @@ impl VideoTransition for Push {
     }
 
     fn default_duration_secs(&self) -> f32 {
-        0.4  // push reads fast; 400 ms feels snappy without being jarring
+        2.0
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {

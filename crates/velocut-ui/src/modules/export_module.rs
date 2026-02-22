@@ -45,7 +45,7 @@ const GREEN_DIM: Color32 = Color32::from_rgb(80,  190, 120);
 /// Muted red used for error / cancel banners.
 const RED_DIM:   Color32 = Color32::from_rgb(200, 80,  80);
 /// Background fill for the progress bar track.
-const TRACK_BG:  Color32 = Color32::from_rgb(35,  35,  40);
+const TRACK_BG:  Color32 = Color32::from_rgb(45,  45,  55);
 /// Filled portion of the progress bar.
 const TRACK_FG:  Color32 = Color32::from_rgb(90,  160, 255);
 
@@ -336,13 +336,15 @@ impl ExportModule {
                 ui.set_min_size(card_rect.size());
                 ui.set_max_size(card_rect.size());
 
-                // Paint card background first — same layer as widgets so it's
-                // always behind them. 0.7 opacity dark fill, sharp edges.
+                // Paint card background — fully opaque so the scrim behind it
+                // does not bleed through and dim the widgets inside the card.
+                // The scrim itself handles the 0.7 opacity overlay; the card
+                // must be 100% opaque to be visually distinct from it.
                 ui.painter().rect(
                     card_rect,
                     0.0,
-                    Color32::from_rgba_unmultiplied(10, 10, 16, 179),
-                    Stroke::new(1.0, border_col),
+                    Color32::from_rgb(14, 14, 20),
+                    Stroke::new(1.5, border_col),
                     egui::StrokeKind::Inside,
                 );
 
@@ -440,9 +442,9 @@ impl ExportModule {
         ui.label(RichText::new("Export complete").size(13.0).strong().color(Color32::WHITE));
         ui.add_space(14.0);
 
-        // Success frame — same colours as original done banner
+        // Success frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
-            .fill(Color32::from_rgb(30, 60, 40))
+            .fill(Color32::from_rgb(22, 55, 35))
             .stroke(Stroke::new(1.0, GREEN_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
@@ -480,9 +482,9 @@ impl ExportModule {
         ui.label(RichText::new("Render stopped").size(13.0).strong().color(Color32::WHITE));
         ui.add_space(14.0);
 
-        // Error frame — same colours as original error banner
+        // Error frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
-            .fill(Color32::from_rgb(60, 25, 25))
+            .fill(Color32::from_rgb(55, 20, 20))
             .stroke(Stroke::new(1.0, RED_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))

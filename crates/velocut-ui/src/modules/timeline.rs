@@ -27,6 +27,13 @@ pub struct TimelineModule {
     /// close the popup it just spawned.
     vol_popup_just_opened: bool,
 
+    /// Whether the hotkey reference popup is currently visible.
+    hotkeys_open: bool,
+    /// True on the frame the hotkey popup is first opened — suppresses the
+    /// click-outside-to-close check so the opening click doesn't immediately
+    /// close the popup it just spawned.
+    hotkeys_just_opened: bool,
+
     /// Last timeline position (seconds) for which a scrub decode was emitted.
     ///
     /// Used to deduplicate `SetPlayhead` commands during ruler and playhead-handle
@@ -46,6 +53,8 @@ impl TimelineModule {
             transition_popup_just_opened: false,
             vol_popup:                    None,
             vol_popup_just_opened:        false,
+            hotkeys_open:                 false,
+            hotkeys_just_opened:          false,
             last_scrub_emitted_time:      f64::NEG_INFINITY,
         }
     }
@@ -283,6 +292,34 @@ impl EditorModule for TimelineModule {
                             });
                         }
 
+                        // ── Hotkey reference ──────────────────────────────────
+                        ui.group(|ui| {
+                            let btn = egui::Button::new(
+                                    egui::RichText::new("?")
+                                        .size(13.0)
+                                        .color(if self.hotkeys_open {
+                                            ACCENT
+                                        } else {
+                                            egui::Color32::from_gray(175)
+                                        }),
+                                )
+                                .fill(if self.hotkeys_open {
+                                    egui::Color32::from_rgba_unmultiplied(80, 50, 10, 60)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .min_size(egui::vec2(0.0, 26.0));
+                            if ui.add(btn)
+                                .on_hover_text("Keyboard shortcuts reference")
+                                .clicked()
+                            {
+                                self.hotkeys_open = !self.hotkeys_open;
+                                if self.hotkeys_open {
+                                    self.hotkeys_just_opened = true;
+                                }
+                            }
+                        });
+
                         // ── Right side: zoom + status ─────────────────────────
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(tool_btn("🔍+")).clicked() {
@@ -307,6 +344,107 @@ impl EditorModule for TimelineModule {
                         });
                     });
                 });
+
+            // ── Hotkey reference popup ────────────────────────────────────────
+            // Floats above the timeline panel, anchored near the bottom-left of
+            // the toolbar. Closed by clicking ? again or clicking outside.
+            if self.hotkeys_open {
+                let anchor    = ui.next_widget_position();
+                let popup_w   = 360.0_f32;
+                let popup_h   = 420.0_f32;
+                let popup_pos = egui::pos2(anchor.x + 6.0, anchor.y - popup_h - 40.0);
+
+                let area_resp = egui::Area::new(egui::Id::new("hotkeys_popup"))
+                    .fixed_pos(popup_pos)
+                    .order(egui::Order::Foreground)
+                    .interactable(true)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(18, 18, 26))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 160, 50, 90),
+                            ))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(14))
+                            .shadow(egui::Shadow {
+                                offset: [0, 6],
+                                blur: 18,
+                                spread: 0,
+                                color: egui::Color32::from_black_alpha(150),
+                            })
+                            .show(ui, |ui| {
+                                ui.set_min_width(popup_w - 28.0);
+                                ui.set_max_width(popup_w - 28.0);
+
+                                // Title row
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("⌨  Keyboard Shortcuts")
+                                        .size(12.5).strong().color(ACCENT));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button(
+                                                egui::RichText::new("✕")
+                                                    .size(10.0)
+                                                    .color(egui::Color32::from_gray(130)),
+                                            ).clicked() {
+                                                self.hotkeys_open = false;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+
+                                hotkey_section(ui, "Playback", &[
+                                    ("Space",            "Play / Pause"),
+                                    ("← →",             "Step one frame"),
+                                    ("⏹  Stop button",  "Stop & return to start"),
+                                ]);
+                                hotkey_section(ui, "Timeline", &[
+                                    ("S",                "Split clip at playhead"),
+                                    ("Del / Backspace",  "Remove selected clip"),
+                                    ("Ctrl + Z",         "Undo"),
+                                    ("Ctrl + Y",         "Redo"),
+                                    ("Ctrl + Shift + Z", "Redo (alternate)"),
+                                ]);
+                                hotkey_section(ui, "Media Library", &[
+                                    ("Del / Backspace",  "Remove selected clip(s)"),
+                                    ("Ctrl + A",         "Select all"),
+                                    ("Ctrl + Click",     "Toggle clip in selection"),
+                                    ("Shift + Click",    "Range select"),
+                                    ("Escape",           "Clear selection"),
+                                ]);
+                                hotkey_section(ui, "Timeline Clips", &[
+                                    ("Click",            "Select clip"),
+                                    ("Drag body",        "Move clip"),
+                                    ("Drag left edge",   "Trim clip start"),
+                                    ("Drag right edge",  "Trim clip end"),
+                                    ("Right-click",      "Clip context menu"),
+                                    ("🔊 badge",         "Adjust clip volume"),
+                                    ("✂ badge",          "Set transition type"),
+                                ]);
+                                hotkey_section(ui, "Zoom", &[
+                                    ("🔍+  /  🔍−",     "Zoom timeline in / out"),
+                                ]);
+                            });
+                    });
+
+                // Click outside → close (same guard as transition_popup / vol_popup)
+                if !self.hotkeys_just_opened {
+                    if ui.input(|i| {
+                        i.pointer.any_click()
+                            && i.pointer.interact_pos()
+                                .map(|p| !area_resp.response.rect.contains(p))
+                                .unwrap_or(false)
+                    }) {
+                        self.hotkeys_open = false;
+                    }
+                }
+                self.hotkeys_just_opened = false;
+            }
 
             ui.separator();
 
@@ -1207,6 +1345,47 @@ impl EditorModule for TimelineModule {
             }
         });
     }
+}
+
+// ── Hotkey reference popup helper ─────────────────────────────────────────────
+
+/// Renders one labelled category block inside the hotkey popup.
+///
+/// Each row is a two-column table: key chord on the left (monospace, accented),
+/// description on the right (proportional, dimmed). The section header is
+/// rendered in a muted uppercase style to visually separate categories without
+/// taking up much vertical space.
+fn hotkey_section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .size(9.5)
+            .monospace()
+            .color(egui::Color32::from_rgba_unmultiplied(255, 160, 50, 130)),
+    );
+    ui.add_space(2.0);
+
+    for &(key, desc) in rows {
+        ui.horizontal(|ui| {
+            // Fixed-width key column so all descriptions align cleanly.
+            ui.allocate_ui(egui::vec2(148.0, 16.0), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(key)
+                            .size(10.5)
+                            .monospace()
+                            .color(ACCENT),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(desc)
+                    .size(10.5)
+                    .color(DARK_TEXT_DIM),
+            );
+        });
+    }
+    ui.add_space(6.0);
 }
 
 fn draw_waveform(painter: &egui::Painter, clip_rect: Rect, peaks: &[f32], clip_type: ClipType, volume: f32) {

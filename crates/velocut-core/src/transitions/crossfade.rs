@@ -33,7 +33,7 @@ impl VideoTransition for Crossfade {
     }
 
     fn default_duration_secs(&self) -> f32 {
-        0.5
+        2.0
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {

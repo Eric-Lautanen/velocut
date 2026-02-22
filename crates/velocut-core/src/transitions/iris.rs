@@ -47,7 +47,7 @@ impl VideoTransition for Iris {
     }
 
     fn default_duration_secs(&self) -> f32 {
-        0.7
+        2.0
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {

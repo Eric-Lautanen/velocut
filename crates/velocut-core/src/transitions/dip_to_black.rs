@@ -39,7 +39,7 @@ impl VideoTransition for DipToBlack {
     }
 
     fn default_duration_secs(&self) -> f32 {
-        0.8  // slightly longer than crossfade — the double-fade needs room to breathe
+        2.0  // slightly longer than crossfade — the double-fade needs room to breathe
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {

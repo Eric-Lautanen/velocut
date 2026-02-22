@@ -1236,9 +1236,29 @@ fn decode_clip_frames(
     let mut video_decoder = vdec_ctx.decoder().video()
         .map_err(|e| format!("crossfade open video decoder: {e}"))?;
 
-    // decode_clip_frames treats seek failure as soft — PTS filtering below
-    // will skip pre-roll frames if the seek didn't land accurately.
-    seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
+    // decode_clip_frames needs backward-seeking so it can land on the keyframe
+    // BEFORE the target window, not the one after it.
+    //
+    // seek_to_secs uses `seek_ts..` (forward-only min_ts constraint), which
+    // forces ffmpeg to find a keyframe AT OR AFTER seek_ts. For a tail window
+    // [clip_end - transition_secs, clip_end], the nearest keyframe >= target
+    // may be past clip_end — ffmpeg lands there, the PTS guard immediately
+    // breaks, decode_clip_frames returns 0 frames, apply_transition short-
+    // circuits (n=0), and the transition is silently replaced by a hard cut.
+    //
+    // Fix: use `..=seek_ts` (max_ts constraint only) so ffmpeg is free to land
+    // on the keyframe BEFORE the target. Pre-roll frames between the keyframe
+    // and source_offset are then discarded by the PTS filter below.
+    if clip.source_offset > 0.0 {
+        let seek_ts = (clip.source_offset * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
+        if let Err(e) = ictx.seek(seek_ts, ..=seek_ts) {
+            eprintln!(
+                "[decode_clip_frames] seek soft-fail at {:.3}s: {e} \
+                 — decoding from start, PTS filter will skip pre-roll",
+                clip.source_offset,
+            );
+        }
+    }
 
     let mut video_scaler: Option<CropScaler> = None;
     let clip_end   = clip.source_offset + clip.duration;

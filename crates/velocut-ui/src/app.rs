@@ -554,12 +554,19 @@ impl VeloCutApp {
 
         let job_id = Uuid::new_v4();
 
-        // Map TimelineTransitions (UUID-keyed) to ClipTransitions (index-keyed)
-        // by finding each after_clip_id's position in the sorted timeline vec.
-        // Clips that resolve out of range (e.g. last clip) are silently dropped.
+        // Map TimelineTransitions (UUID-keyed) to ClipTransitions (index-keyed).
+        // IMPORTANT: use position in the filtered timeline (non-extracted-audio clips
+        // only), not the raw timeline vec. The raw vec includes A-row extracted clips
+        // which are absent from clip_specs; using raw positions shifts all transition
+        // indices past any extracted clip, silently placing them at the wrong boundary.
+        let filtered_timeline: Vec<&TimelineClip> = timeline
+            .iter()
+            .filter(|tc| !clip_query::is_extracted_audio_clip(tc))
+            .collect();
+
         let encode_transitions: Vec<ClipTransition> = self.state.transitions.iter()
             .filter_map(|t| {
-                let idx = timeline.iter().position(|tc| tc.id == t.after_clip_id)?;
+                let idx = filtered_timeline.iter().position(|tc| tc.id == t.after_clip_id)?;
                 if idx + 1 < clip_specs.len() {
                     Some(ClipTransition { after_clip_index: idx, kind: t.kind.clone() })
                 } else {
@@ -680,16 +687,41 @@ impl eframe::App for VeloCutApp {
         // eframe restores persisted window geometry. If a previous run left the
         // window at tiny/zero dimensions (e.g. the resizable-panel bug), we snap
         // back to the default on the very first rendered frame. Fires once only.
+        // ── Startup layout guard ──────────────────────────────────────────────
+        // On the first frame the native window may report a near-zero viewport
+        // before the OS has actually sized it. A bottom panel that tries to
+        // claim 340 px gets clamped to whatever tiny space exists, stores that
+        // in egui memory, and every later frame uses the stored tiny value —
+        // even after clearing storage (the race re-fires on the next cold start).
+        //
+        // Fix: spin here until the viewport has settled to a real size, then
+        // actively insert_temp the desired timeline height. insert_temp wins over
+        // any previously persisted value for this key, so `default_height` is
+        // irrelevant — we own the initial height explicitly.
         if !self.startup_size_checked {
-            self.startup_size_checked = true;
             let screen = ctx.viewport_rect();
-            const MIN_W: f32 = 900.0;
-            const MIN_H: f32 = 600.0;
-            if screen.width() < MIN_W || screen.height() < MIN_H {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                    egui::vec2(1465.0, 965.0),
-                ));
+            const SETTLE_MIN_H: f32 = 400.0;
+            if screen.height() >= SETTLE_MIN_H {
+                self.startup_size_checked = true;
+
+                // Target: timeline takes ~35 % of the window height, clamped to
+                // a comfortable [300, 420] px band.
+                let timeline_h = (screen.height() * 0.35).clamp(300.0, 420.0);
+                ctx.memory_mut(|mem| {
+                    mem.data.insert_temp(egui::Id::new("timeline_panel"), timeline_h);
+                });
+
+                // Also guard against a previously shrunken window geometry.
+                const MIN_W: f32 = 900.0;
+                const MIN_H: f32 = 600.0;
+                if screen.width() < MIN_W || screen.height() < MIN_H {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        egui::vec2(1465.0, 965.0),
+                    ));
+                }
             }
+            // Keep repainting until the viewport settles (typically frame 1-2).
+            ctx.request_repaint();
         }
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
