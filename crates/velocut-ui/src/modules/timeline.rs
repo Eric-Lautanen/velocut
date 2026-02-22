@@ -938,6 +938,7 @@ impl EditorModule for TimelineModule {
                             let clip_b = track_clips[i + 1];
                             let gap = clip_b.start_time - (clip_a.start_time + clip_a.duration);
                             if gap.abs() > 0.25 { continue; } // only touching clips
+                            if track_row % 2 == 1 { continue; } // audio rows — no video transitions
 
                             let join_x = rect.min.x
                                 + ((clip_a.start_time + clip_a.duration) as f32 * state.timeline_zoom);

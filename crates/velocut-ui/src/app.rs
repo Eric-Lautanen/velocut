@@ -1,5 +1,5 @@
 // src/app.rs (velocut-ui)
-use velocut_core::state::{ProjectState, TimelineClip};
+use velocut_core::state::{ProjectState, TimelineClip, LibraryClip, ClipType};
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
 use velocut_media::audio::cleanup_audio_temp;
@@ -298,13 +298,70 @@ impl VeloCutApp {
                         partner.audio_muted    = false;
                     }
                 }
+                // Capture the deleted clip's media_id before removal so we can
+                // evict its cached frame if no other timeline clip shares it.
+                let deleted_media_id = self.state.timeline.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.media_id);
                 self.state.timeline.retain(|c| c.id != id);
+                // Evict frame cache for this media_id if it's now unreferenced.
+                // Without this the preview keeps showing the deleted clip's last
+                // frame even after the clip is gone.
+                if let Some(mid) = deleted_media_id {
+                    let still_used = self.state.timeline.iter().any(|c| c.media_id == mid);
+                    if !still_used {
+                        self.context.cache.frame_cache.remove(&mid);
+                        self.context.cache.frame_bucket_cache
+                            .retain(|(bucket_mid, _), _| *bucket_mid != mid);
+                        self.preview.current_frame = None;
+                    }
+                }
                 if self.state.selected_timeline_clip == Some(id) {
                     self.state.selected_timeline_clip = None;
                 }
             }
             EditorCommand::ExtractAudioTrack(clip_id) => {
-                self.state.extract_audio_track(clip_id);
+                // Gather library info BEFORE mutating state.
+                let lib_info = self.state.timeline.iter()
+                    .find(|c| c.id == clip_id)
+                    .and_then(|tc| self.state.library.iter().find(|l| l.id == tc.media_id))
+                    .map(|lib| (
+                        lib.path.clone(),
+                        lib.audio_path.clone(),
+                        lib.waveform_peaks.clone(),
+                        lib.duration,
+                        lib.name.clone(),
+                    ));
+
+                if let Some((src_path, wav_path, peaks, duration, src_name)) = lib_info {
+                    if let Some(audio_clip_id) = self.state.extract_audio_track(clip_id) {
+                        // Create a dedicated Audio library entry so the A-row clip
+                        // has the correct type (no thumbnails, no video decode).
+                        // Use the already-extracted WAV as the source path if ready;
+                        // fall back to the original file (audio_module will use it fine).
+                        let audio_lib_id = Uuid::new_v4();
+                        let effective_path = wav_path.clone()
+                            .unwrap_or_else(|| src_path.clone());
+                        self.state.library.push(LibraryClip {
+                            id:              audio_lib_id,
+                            path:            effective_path,
+                            name:            format!("[Audio] {src_name}"),
+                            duration,
+                            clip_type:       ClipType::Audio,
+                            thumbnail_path:  None,
+                            duration_probed: true,
+                            waveform_peaks:  peaks,
+                            video_size:      None,
+                            audio_path:      wav_path,
+                        });
+                        // Rewire the A-row timeline clip to the audio library entry.
+                        if let Some(tc) = self.state.timeline.iter_mut()
+                            .find(|c| c.id == audio_clip_id)
+                        {
+                            tc.media_id = audio_lib_id;
+                        }
+                    }
+                }
             }
             EditorCommand::SetClipVolume { id, volume } => {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {

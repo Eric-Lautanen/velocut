@@ -17,7 +17,7 @@
 // consistent with crossfade.rs's `blend_byte` approach.
 
 use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
-use crate::transitions::helpers::{blend_byte, ease_in_out};
+use crate::transitions::helpers::{blend_byte, ease_in_out, y_len};
 
 /// Fade-to-black between two clips.
 ///
@@ -60,8 +60,8 @@ impl VideoTransition for DipToBlack {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        _width:  u32,
-        _height: u32,
+        width:  u32,
+        height: u32,
         alpha:   f32,
     ) -> Vec<u8> {
         debug_assert_eq!(
@@ -72,20 +72,34 @@ impl VideoTransition for DipToBlack {
             frame_b.len(),
         );
 
+        // Black in YUV420P: Y=0, U=128, V=128.
+        // Blending U/V toward 0 produces green — each plane needs its own target.
+        let luma_len = y_len(width, height) as usize;
+
+        let blend_to_black = |src: &[u8], ramp: f32| -> Vec<u8> {
+            src.iter().enumerate().map(|(i, &v)| {
+                let black = if i < luma_len { 0u8 } else { 128u8 };
+                blend_byte(v, black, ramp)
+            }).collect()
+        };
+
+        let blend_from_black = |src: &[u8], ramp: f32| -> Vec<u8> {
+            src.iter().enumerate().map(|(i, &v)| {
+                let black = if i < luma_len { 0u8 } else { 128u8 };
+                blend_byte(black, v, ramp)
+            }).collect()
+        };
+
         if alpha <= 0.5 {
             // First half: fade frame_a out to black.
             // ramp goes 0→1 as alpha goes 0→0.5
             let ramp = ease_in_out(alpha * 2.0);
-            frame_a.iter()
-                .map(|&a| blend_byte(a, 0, ramp))
-                .collect()
+            blend_to_black(frame_a, ramp)
         } else {
             // Second half: fade frame_b in from black.
             // ramp goes 0→1 as alpha goes 0.5→1.0
             let ramp = ease_in_out((alpha - 0.5) * 2.0);
-            frame_b.iter()
-                .map(|&b| blend_byte(0, b, ramp))
-                .collect()
+            blend_from_black(frame_b, ramp)
         }
     }
 }
