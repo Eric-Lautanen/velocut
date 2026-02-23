@@ -323,7 +323,6 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Undo/redo: 50-snapshot, VecDeque
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
-- Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.
 - FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active and confirmed** — `get_format` callback fires, `AV_PIX_FMT_D3D11 (171)` selected for all three decoders (primary, decoder_b, recycled primary). Format value is build-specific (171 in this fork, not mainline 172) — all comparisons use `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`, never hardcoded integers. CPU fallback still available if device init fails.
 - **Transition blend perf**: blend done in RGBA on CPU (`blend_rgba_transition`). At 1504×832 this is ~10 MB/frame; at 4K it becomes ~64 MB/frame and saturates CPU memory bandwidth. **Interim fix: rayon parallel blend — DONE** (`apply_rgba` in all 5 transition impls uses `par_chunks_mut`). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
 - `decode_one_frame_rgba` now accepts `aspect: f32` (same convention as `LiveDecoder::open`). `aspect > 0` → 320px scrub. `aspect <= 0` → native resolution. `request_transition_frame` passes `1.0`; `request_transition_frame_hq` passes `0.0`.

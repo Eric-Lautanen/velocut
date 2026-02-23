@@ -43,7 +43,6 @@ The UI is built with [egui](https://github.com/emilk/egui) / [eframe](https://gi
 - **Session persistence** — Project state saved and restored between launches via eframe storage
 - **Project reset** — Two-stage ⊘ Reset button with 5-second confirmation window and ordered 8-step teardown
 - **Custom chrome** — Frameless window with custom title bar, software resize handles, and accent-colored branding
-- **Memory** — ~90 MB idle, ~120 MB peak; returns to baseline on stop. No leaks in normal use
 
 ---
 
