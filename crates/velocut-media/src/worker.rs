@@ -127,7 +127,7 @@ impl MediaWorker {
                     let cached_sws = live.take().map(|d| {
                         (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h)
                     });
-                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws) {
+                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws, None) {
                         Ok(mut d) => {
                             // Set skip_until_pts so next_frame() burns through the GOP
                             // (decode-only, no scale/alloc) and returns the frame at
@@ -212,7 +212,7 @@ impl MediaWorker {
                             coast_last_alpha = 0.5;
                             let t0 = std::time::Instant::now();
                             eprintln!("[pb] Start received (active), ts={ts:.3}");
-                            match LiveDecoder::open(&path, ts, aspect, None) {
+                            match LiveDecoder::open(&path, ts, aspect, None, None) {
                                 Ok(mut nd) => {
                                     // burn_to_pts runs synchronously (decode-only, no scale)
                                     // before we enter the send loop. The channel is empty at
@@ -266,7 +266,7 @@ impl MediaWorker {
                                 blend.as_ref().map(|b| b.spec.alpha_start as f64).unwrap_or(0.0),
                             );
                             held_streak = 0; blend_frame_count = 0;
-                            match LiveDecoder::open(&path, ts, aspect, None) {
+                            match LiveDecoder::open(&path, ts, aspect, None, None) {
                                 Ok(mut nd) => {
                                     let tpts = nd.ts_to_pts(ts);
                                     nd.burn_to_pts(tpts);
@@ -352,7 +352,13 @@ impl MediaWorker {
                                         if b.decoder_b.is_none() {
                                             eprintln!("[blend] decoder_b is None — opening lazily, clip_b_start={clip_b_start:.3}");
                                             let t_open = std::time::Instant::now();
-                                            match LiveDecoder::open(&clip_b_path, clip_b_start, decoder_b_aspect, None) {
+                                            // Force decoder_b to the same output dimensions as the
+                                            // primary decoder. When clips have different native
+                                            // resolutions both decoders must produce identically-sized
+                                            // RGBA buffers — blend_rgba_transition indexes them as
+                                            // w*h*4 and will panic or corrupt on a mismatch.
+                                            let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
+                                            match LiveDecoder::open(&clip_b_path, clip_b_start, decoder_b_aspect, None, primary_size) {
                                                 Ok(mut db) => {
                                                     let tpts = db.ts_to_pts(clip_b_start);
                                                     db.skip_until_pts = tpts;
@@ -537,7 +543,7 @@ impl MediaWorker {
                                 coast_last_alpha = 0.5;
                                 let t0 = std::time::Instant::now();
                                 eprintln!("[pb] Start received (idle), ts={ts:.3}");
-                                match LiveDecoder::open(&path, ts, aspect, None) {
+                                match LiveDecoder::open(&path, ts, aspect, None, None) {
                                     Ok(mut d) => {
                                         let tpts = d.ts_to_pts(ts);
                                         d.burn_to_pts(tpts);
@@ -601,7 +607,7 @@ impl MediaWorker {
                                     let db_start = spec.clip_b_source_start;
                                     let t_db     = std::time::Instant::now();
                                     eprintln!("[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}");
-                                    match LiveDecoder::open(&db_path, db_start, aspect, None) {
+                                    match LiveDecoder::open(&db_path, db_start, aspect, None, None) {
                                         Ok(mut db) => {
                                             let tpts = db.ts_to_pts(db_start);
                                             db.burn_to_pts(tpts);
@@ -687,7 +693,7 @@ impl MediaWorker {
                                 // is, so step-2 discards at most one frame and playback
                                 // continues smoothly from the bridge endpoint.
                                 eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
-                                match LiveDecoder::open(&path, burn_ts, aspect, None) {
+                                match LiveDecoder::open(&path, burn_ts, aspect, None, None) {
                                     Ok(mut d) => {
                                         let tpts = d.ts_to_pts(burn_ts);
                                         d.burn_to_pts(tpts);
@@ -854,6 +860,24 @@ impl MediaWorker {
         let (lock, cvar) = &*self.frame_req;
         *lock.lock().unwrap() = Some(FrameRequest { id, path, timestamp, aspect });
         cvar.notify_one();
+    }
+
+    /// Layer-3 HQ decode: one-shot native-resolution frame after scrub goes idle.
+    ///
+    /// Spawns a background thread that calls `decode_frame` with `aspect=0.0`
+    /// (native source dimensions — no downscale).  The result travels through
+    /// `scrub_rx` so the UI picks it up with the same low-latency path as
+    /// regular scrub frames and replaces the 320 px scrub thumbnail with a
+    /// full-quality image.
+    pub fn request_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64) {
+        let tx = self.scrub_tx.clone();
+        let sd = self.shutdown.clone();
+        thread::spawn(move || {
+            if sd.load(Ordering::Relaxed) { return; }
+            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx) {
+                eprintln!("[media] request_frame_hq: {e}");
+            }
+        });
     }
 
     /// Decode frames from two clips, blend them with the given transition, and

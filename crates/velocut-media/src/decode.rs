@@ -12,6 +12,7 @@ use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
+use ffmpeg::ffi;
 
 use velocut_core::media_types::MediaResult;
 
@@ -46,8 +47,92 @@ pub struct LiveDecoder {
     /// then clone() once to hand off to the caller.  Saves the flat_map().collect()
     /// iterator overhead and guarantees no mid-frame realloc.
     frame_buf: Vec<u8>,
+
+    /// D3D11VA hardware device context.  Some when hwaccel init succeeded;
+    /// None when unavailable or init failed (automatic CPU fallback).
+    /// Kept alive for the lifetime of the decoder — FFmpeg ref-counts it internally.
+    hw_device_ctx: Option<HwDeviceCtx>,
 }
 
+// ── D3D11VA hardware device context ──────────────────────────────────────────
+
+/// RAII wrapper around an `AVBufferRef*` holding an `AVHWDeviceContext`.
+/// Calls `av_buffer_unref` on drop so the ref-count is always balanced.
+struct HwDeviceCtx(*mut ffi::AVBufferRef);
+
+impl Drop for HwDeviceCtx {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::av_buffer_unref(&mut self.0); }
+        }
+    }
+}
+
+// Safety: the AVBufferRef is ref-counted internally by FFmpeg and its
+// internal data (AVHWDeviceContext + D3D11Device) is thread-safe for
+// concurrent decoding.  We never alias the raw pointer across threads.
+unsafe impl Send for HwDeviceCtx {}
+
+/// Try to create a D3D11VA hardware device context.
+///
+/// Returns `None` silently on any failure — callers fall back to CPU decode.
+/// `adapter_index` 0 = system default GPU (correct for single-GPU machines;
+/// multi-GPU machines may want the user to configure this later).
+fn try_create_d3d11va_device() -> Option<HwDeviceCtx> {
+    unsafe {
+        let mut hw_ctx: *mut ffi::AVBufferRef = std::ptr::null_mut();
+        // AV_HWDEVICE_TYPE_D3D11VA = 5 in FFmpeg's enum.
+        // Passing NULL opts/device string = use default adapter.
+        let ret = ffi::av_hwdevice_ctx_create(
+            &mut hw_ctx,
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret < 0 || hw_ctx.is_null() {
+            eprintln!("[hwaccel] D3D11VA device init failed ({}), using CPU decode", ret);
+            return None;
+        }
+        eprintln!("[hwaccel] D3D11VA device created");
+        Some(HwDeviceCtx(hw_ctx))
+    }
+}
+
+/// Transfer a hardware frame (D3D11 surface) to a CPU-accessible frame.
+///
+/// Returns the transferred frame on success, or the original frame unchanged
+/// if it is already a CPU format — so callers can always use the return value
+/// regardless of whether hwaccel is active.
+fn ensure_cpu_frame(
+    frame: ffmpeg::util::frame::video::Video,
+) -> ffmpeg::util::frame::video::Video {
+    unsafe {
+        let fmt = (*frame.as_ptr()).format;
+        // AV_PIX_FMT_D3D11 = 172, AV_PIX_FMT_D3D11VA_VLD = 113
+        if fmt != 172 && fmt != 113 {
+            return frame; // already CPU
+        }
+        let mut cpu_frame = ffmpeg::util::frame::video::Video::empty();
+        let ret = ffi::av_hwframe_transfer_data(
+            cpu_frame.as_mut_ptr(),
+            frame.as_ptr(),
+            0,
+        );
+        if ret < 0 {
+            eprintln!("[hwaccel] av_hwframe_transfer_data failed ({}), dropping frame", ret);
+            return frame; // return original; scaler will likely fail but won't panic
+        }
+        // Copy metadata (pts, time_base, etc.) to the CPU frame.
+        (*cpu_frame.as_mut_ptr()).pts       = (*frame.as_ptr()).pts;
+        (*cpu_frame.as_mut_ptr()).pkt_dts   = (*frame.as_ptr()).pkt_dts;
+        (*cpu_frame.as_mut_ptr()).best_effort_timestamp =
+            (*frame.as_ptr()).best_effort_timestamp;
+        cpu_frame
+    }
+}
+
+// ── Stateful per-clip decoder ─────────────────────────────────────────────────
 impl LiveDecoder {
     /// Open a decoder at `timestamp` seconds.
     ///
@@ -60,8 +145,9 @@ impl LiveDecoder {
     pub fn open(
         path:          &PathBuf,
         timestamp:     f64,
-        _aspect:        f32,
+        aspect:        f32,   // >0 = scrub mode (320px wide); <=0 = playback/HQ mode (native res)
         cached_scaler: Option<(SwsContext, Pixel, u32, u32)>,
+        forced_size:   Option<(u32, u32)>,  // when Some, override aspect/native logic entirely
     ) -> Result<Self> {
         let mut ictx = input(path)?;
         let video_idx = ictx.streams().best(Type::Video)
@@ -85,30 +171,74 @@ impl LiveDecoder {
 
         // Build decoder — width/height come from here, replacing the previous
         // unsafe raw-pointer read from stream.parameters().as_ptr().
-        let decoder = dec_ctx.decoder().video()?;
+        let mut decoder = dec_ctx.decoder().video()?;
         let raw_w = decoder.width().max(2);
         let raw_h = decoder.height().max(2);
 
-        // Always decode at native aspect ratio so the preview can center-crop
-        // to the project ratio via crop_uv_rect, rather than stretching/squishing
-        // clips whose native AR doesn't match the project setting.
-        // The `aspect` parameter is kept for API compatibility but unused here —
-        // the encode path uses extract_frame, not LiveDecoder.
-        let (out_w, out_h) = {
+        // Resolution strategy (in priority order):
+        //   forced_size     → exact (w, h) override; used by decoder_b so it always
+        //                     matches the primary decoder's output — prevents blend
+        //                     size mismatches when two clips have different native res.
+        //   aspect > 0      → scrub mode: fixed 320 px wide, native source AR.
+        //                     Low-res on purpose — shown only during active scrub (L1/L2).
+        //   aspect <= 0     → playback / HQ mode: native source dimensions, no downscale.
+        let (out_w, out_h) = if let Some((fw, fh)) = forced_size {
+            (fw, fh)
+        } else if aspect > 0.0 {
             let w: u32 = 320;
             let h: u32 = ((w as f32 * raw_h as f32 / raw_w.max(1) as f32) as u32).max(2) & !1;
             (w, h)
+        } else {
+            (raw_w, raw_h)
         };
 
         let dec_fmt = decoder.format();
         let dec_w   = decoder.width();
         let dec_h   = decoder.height();
 
+        // ── D3D11VA hardware acceleration ─────────────────────────────────────
+        // Try to attach a D3D11VA device context to the codec context before
+        // the first packet is sent.  On success the decoder will output frames
+        // in AV_PIX_FMT_D3D11; ensure_cpu_frame() transfers them back to CPU
+        // (NV12 typically) before sws_scale is called.
+        //
+        // Scrub-mode decoders (aspect > 0) skip hwaccel — they're short-lived,
+        // low-res, and the transfer overhead isn't worth it for 320px frames.
+        // Playback / HQ decoders (aspect <= 0) use hwaccel when available.
+        let hw_device_ctx = if aspect <= 0.0 {
+            let maybe_hw = try_create_d3d11va_device();
+            if let Some(ref hw) = maybe_hw {
+                unsafe {
+                    // av_buffer_ref bumps the ref-count so both the codec
+                    // context and our HwDeviceCtx wrapper own a reference.
+                    let hw_ref = ffi::av_buffer_ref(hw.0);
+                    if !hw_ref.is_null() {
+                        (*decoder.as_mut_ptr()).hw_device_ctx = hw_ref;
+                        eprintln!("[hwaccel] D3D11VA attached to decoder");
+                    }
+                }
+            }
+            maybe_hw
+        } else {
+            None
+        };
+
+        // The decoder format reported before the first packet can be wrong
+        // (AVCC coded dims, AV_PIX_FMT_NONE for some Annex-B streams).
+        // We record what the codec metadata says here; the scaler is built
+        // from the *actual* first-frame format in next_frame() when hwaccel
+        // is active, since the output format changes to D3D11/NV12.
+        // For CPU-only paths the existing eager scaler construction is fine.
         // [Opt #1] Reuse cached SwsContext when source format/dimensions haven't
         // changed — avoids re-running lookup-table initialisation on every
         // backward scrub or cross-clip reset.  Out dimensions are fixed for the
         // lifetime of a session (same `aspect` is always passed), so a matching
         // source key is sufficient to guarantee safe reuse.
+        //
+        // When hwaccel is active the real output format is determined by the
+        // first decoded frame, so we build the scaler lazily there instead.
+        // For now we pre-build using dec_fmt as a best-effort — next_frame()
+        // will rebuild if the actual format differs (NV12 from D3D11 transfer).
         let scaler = match cached_scaler {
             Some((sws, cf, cw, ch)) if cf == dec_fmt && cw == dec_w && ch == dec_h => sws,
             _ => SwsContext::get(dec_fmt, dec_w, dec_h, Pixel::RGBA, out_w, out_h, Flags::BILINEAR)?,
@@ -116,16 +246,11 @@ impl LiveDecoder {
 
         Ok(Self {
             path: path.clone(), ictx, decoder, video_idx,
-            // seek_ts is where we ASKED to seek, not where FFmpeg actually landed.
-            // The actual landing position is the nearest keyframe, which can be seconds
-            // before seek_ts. Initialising last_pts to seek_ts - 1 ensures that
-            // advance_to() fires correctly when called with target == seek_ts, since
-            // the check is tpts > last_pts (strictly greater).
             last_pts: seek_ts.saturating_sub(1), tb_num, tb_den, out_w, out_h, scaler,
             decoder_fmt: dec_fmt, decoder_w: dec_w, decoder_h: dec_h,
             skip_until_pts: 0,
-            // [Opt 1] Pre-allocate frame buffer at the exact output size.
             frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
+            hw_device_ctx,
         })
     }
 
@@ -170,6 +295,21 @@ impl LiveDecoder {
                 }
                 self.skip_until_pts = 0; // reached target — disable skip
                 let ts_secs = self.pts_to_secs(pts);
+                // Transfer GPU surface to CPU if this is a hardware frame.
+                let decoded = ensure_cpu_frame(decoded);
+                // Rebuild the SwsContext if the actual decoded format differs
+                // from what was recorded at open() — happens on the first frame
+                // after D3D11VA transfer (D3D11 → NV12) and for AVCC streams.
+                let actual_fmt = decoded.format();
+                if actual_fmt != self.decoder_fmt {
+                    if let Ok(new_sws) = SwsContext::get(
+                        actual_fmt, self.decoder_w, self.decoder_h,
+                        Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                    ) {
+                        self.scaler     = new_sws;
+                        self.decoder_fmt = actual_fmt;
+                    }
+                }
                 let mut out = ffmpeg::util::frame::video::Video::empty();
                 if self.scaler.run(&decoded, &mut out).is_err() { return None; }
                 let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
@@ -213,7 +353,19 @@ impl LiveDecoder {
                 // [Opt 2] Decode-only for all frames before the target PTS.
                 // ~4x faster than decode+scale+alloc for the same set of frames.
                 if pts < target_pts { continue; }
-                // Target reached — scale exactly this one frame and return.
+                // Target reached — transfer GPU surface to CPU if needed,
+                // rebuild scaler if format changed, then scale exactly this frame.
+                let decoded = ensure_cpu_frame(decoded);
+                let actual_fmt = decoded.format();
+                if actual_fmt != self.decoder_fmt {
+                    if let Ok(new_sws) = SwsContext::get(
+                        actual_fmt, self.decoder_w, self.decoder_h,
+                        Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                    ) {
+                        self.scaler      = new_sws;
+                        self.decoder_fmt = actual_fmt;
+                    }
+                }
                 let mut out = ffmpeg::util::frame::video::Video::empty();
                 if self.scaler.run(&decoded, &mut out).is_err() { return None; }
                 let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);

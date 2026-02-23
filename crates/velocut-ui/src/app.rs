@@ -969,7 +969,7 @@ impl VeloCutApp {
     /// Called from `update()` after command processing so ticks see the
     /// freshest state (including commands processed this frame).
     fn tick_modules(&mut self, ctx: &egui::Context) {
-        VideoModule::tick(&self.state, &mut self.context);
+        VideoModule::tick(&self.state, &mut self.context, ctx);
         self.audio.tick(&self.state, &mut self.context);
 
         if self.state.is_playing {

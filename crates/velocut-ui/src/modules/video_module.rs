@@ -184,7 +184,7 @@ impl VideoModule {
 
     // ── tick ──────────────────────────────────────────────────────────────────
     /// 3-layer scrub + playback start/stop. Call every frame from app::update().
-    pub fn tick(state: &ProjectState, ctx: &mut AppContext) {
+    pub fn tick(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context) {
         let just_started = state.is_playing && !ctx.playback.prev_playing;
         let just_stopped = !state.is_playing && ctx.playback.prev_playing;
         ctx.playback.prev_playing = state.is_playing;
@@ -210,18 +210,17 @@ impl VideoModule {
                     ctx.cache.pending_pb_frame = None;
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
-                        let aspect   = state.active_video_ratio();
-                        // Check for an outgoing transition (clip_a → next) or an
-                        // incoming one (prev → clip_b) so the pb thread can blend
-                        // across the cut without an extra start/stop cycle.
+                        // Pass aspect=0.0 → LiveDecoder opens at native source resolution.
+                        // The pb thread is the preview player; it must be full quality.
+                        // crop_uv_rect in preview_module handles any AR mismatch on the GPU.
                         if let Some(spec) = build_incoming_blend_spec(state, clip)
                             .or_else(|| build_blend_spec(state, clip))
                         {
                             eprintln!("[tick] → start_blend_playback alpha_start={:.3}", spec.alpha_start);
-                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, aspect, spec);
+                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, 0.0, spec);
                         } else {
                             eprintln!("[tick] → start_playback (no blend spec — hard cut)");
-                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
+                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, 0.0);
                         }
                     }
                 }
@@ -256,7 +255,7 @@ impl VideoModule {
         let local_t       = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
         let fine_bucket   = (local_t * 4.0) as u32;   // ¼s grid — cache key only
         let coarse_bucket = (local_t / 2.0) as u32;   // 2s grid — prefetch key
-        let fine_key      = (clip.media_id, fine_bucket);
+
 
         // scrub_moved: any position change > ~10ms fires a new decode request.
         // Compare exact f64 ts so every ruler pixel triggers a request, not just
@@ -361,17 +360,35 @@ impl VideoModule {
                 }
             }
         } else {
-            // Layer 3 (150ms idle): precise frame after scrub stops moving.
-            if ctx.cache.frame_cache.contains_key(&clip.media_id) {
-                let idle = ctx.playback.scrub_last_moved
-                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
-                    .unwrap_or(false);
-                if !idle { return; }
-                if ctx.cache.frame_bucket_cache.contains_key(&fine_key) { return; }
-                if let Some(lib) = clip_query::library_entry_for(state, &clip) {
-                    let aspect = state.active_video_ratio();
-                    ctx.media_worker.request_frame(lib.id, lib.path.clone(), fine_bucket as f64 / 4.0, aspect);
+            // Layer 3 (150ms idle): full native-resolution decode after scrub stops.
+            //
+            // We reschedule a repaint from here (not from scrub_moved) so that the
+            // timer is self-sustaining: each tick in the idle-wait state schedules the
+            // next wakeup for exactly the remaining time. This guarantees L3 fires even
+            // if the user never touches the mouse again after releasing the playhead.
+            let idle = match ctx.playback.scrub_last_moved {
+                None => false,
+                Some(moved) => {
+                    let elapsed = moved.elapsed();
+                    if elapsed < std::time::Duration::from_millis(150) {
+                        // Not yet idle — schedule a wakeup for when we will be.
+                        let remaining = std::time::Duration::from_millis(150) - elapsed
+                            + std::time::Duration::from_millis(5); // small buffer
+                        egui_ctx.request_repaint_after(remaining);
+                        false
+                    } else {
+                        true
+                    }
                 }
+            };
+            if !idle { return; }
+            if let Some(lib) = clip_query::library_entry_for(state, &clip) {
+                // Use local_t (exact playhead position), not the quantised fine_bucket,
+                // so the HQ decode lands on the precise frame the user is looking at.
+                ctx.media_worker.request_frame_hq(lib.id, lib.path.clone(), local_t);
+                // Null scrub_last_moved to prevent re-firing every tick while idle.
+                // L3 won't arm again until the playhead moves (scrub_moved sets it).
+                ctx.playback.scrub_last_moved = None;
             }
         }
     }
