@@ -88,12 +88,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - Scaler rebuilt lazily in `next_frame`/`advance_to` if `actual_fmt != decoder_fmt` — happens on first frame after D3D11VA transfer (D3D11→NV12). Only rebuilds once per decoder lifetime.
 - `let mut decoder` required (not `let decoder`) — `hw_device_ctx` is assigned via raw pointer after construction.
 
-**⚠ CURRENT BUG — D3D11VA: app loads and compiles without errors but videos don't play. Static image shown with audio playing in background.** Hwaccel decode path is producing frames that never reach the preview (either `ensure_cpu_frame` transfer failing silently, scaler rebuild not triggering, or hw frames being dropped before promotion to `frame_cache`). **Likely causes to investigate:**
-1. `ensure_cpu_frame` returning the original GPU frame unchanged (transfer fails, format check wrong).
-2. `av_hwframe_transfer_data` succeeding but output format being something `SwsContext` can't handle (e.g. `AV_PIX_FMT_NV12` not matching the scaler's expected input after rebuild).
-3. `hw_device_ctx` being attached after the first packet is already sent — FFmpeg requires `hw_device_ctx` set before `avcodec_open2` (before first `send_packet`). **Most likely root cause** — `LiveDecoder::open` calls `dec_ctx.decoder().video()?` which may internally call `avcodec_open2`, then we set `hw_device_ctx` after. Need to set it on the raw `AVCodecContext*` before opening.
-4. All call sites pass `aspect=0.0` to pb thread but scrub thread also gets `aspect=0.0` for HQ decode — check whether `try_create_d3d11va_device` is being called from too many places and exhausting D3D device slots.
-5. **Quickest diagnostic**: add `eprintln!` for `ensure_cpu_frame` input format and output format, and log whether `av_hwframe_transfer_data` returns success or error code.
+**D3D11VA ordering fix applied.** Root cause was confirmed: `hw_device_ctx` was being set on `(*decoder.as_mut_ptr())` after `dec_ctx.decoder().video()?` had already called `avcodec_open2` internally — FFmpeg silently ignored the late attachment. Fix: added `let mut dec_ctx = dec_ctx;` to make the context mutable, moved `try_create_d3d11va_device()` + `(*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref` to **before** `dec_ctx.decoder().video()?`, and removed the old post-open block. The pre-open log message is now `[hwaccel] D3D11VA attached to decoder context (pre-open)`. The lazy scaler rebuild in `next_frame()`/`advance_to()` handles the D3D11→NV12 format change on the first frame, as before.
 
 `skip_until_pts` field: decode-only burn, ~4× faster than scale. `decode_one_frame_rgba(path,ts)->Result<(Vec<u8>,w,h)>` — one-shot for scrub transition blend (still uses fixed 320px, no hwaccel).
 
@@ -197,7 +192,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - **`LiveDecoder::open` takes 5 args**: `(path, ts, aspect, cached_scaler, forced_size)`. All call sites must pass `None` for `forced_size` except the lazy decoder_b open in the pb thread blend loop, which passes `decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))`.
 - **pb thread always passes `aspect=0.0`** to `LiveDecoder::open` (both Start and StartBlend primary opens, and decoder_b pre-open). Scrub thread passes `aspect=active_video_ratio()` (> 0).
 - **L3 `request_repaint_after` belongs in the `else` branch** (idle wait), not `scrub_moved`. It must be self-rescheduling, not a one-shot.
-- **D3D11VA `hw_device_ctx` must be set before `avcodec_open2`** — currently set after `decoder().video()?` which may already open the codec. This is the likely cause of the static-image-with-audio bug. Fix: set on raw `AVCodecContext*` before the decoder open call, or use `avcodec_alloc_context3` + set hw_device_ctx + `avcodec_open2` manually.
+- **D3D11VA `hw_device_ctx` must be set before `avcodec_open2`** — enforced in `LiveDecoder::open`: `let mut dec_ctx = dec_ctx` then `(*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref` BEFORE `dec_ctx.decoder().video()?`. Never move hwaccel setup to after the decoder open call.
 
 ---
 
@@ -266,7 +261,7 @@ For a transition of duration D between clip_a and clip_b:
 
 **`cannot borrow decoder as mutable`** — `hw_device_ctx` assignment via raw pointer after decoder construction required `let mut decoder`. Fix: change `let decoder` to `let mut decoder` in `LiveDecoder::open`.
 
-**⚠ CURRENT (UNRESOLVED) — D3D11VA: static image with audio** — App compiles and loads. Videos don't play — static image shown, audio plays correctly. Root cause: `hw_device_ctx` is set on `AVCodecContext*` after `dec_ctx.decoder().video()?` which likely calls `avcodec_open2` internally. FFmpeg requires hardware device context to be set **before** codec open. The decoder never initialises hardware acceleration, and the subsequent `ensure_cpu_frame` + scaler path either fails silently or produces empty frames. **Fix direction**: either (a) use lower-level FFmpeg API to set `hw_device_ctx` before `avcodec_open2`, or (b) disable hwaccel entirely and revert `hw_device_ctx` field until the ordering issue is solved. Option (b) is faster — CPU decode at native res is already a major quality improvement over the old 320px decode.
+**D3D11VA: static image with audio — RESOLVED** — Root cause confirmed: `hw_device_ctx` was set on `(*decoder.as_mut_ptr())` after `dec_ctx.decoder().video()?` which calls `avcodec_open2` internally. Fix: `let mut dec_ctx = dec_ctx` + set `(*dec_ctx.as_mut_ptr()).hw_device_ctx` before `.decoder().video()?`. Old post-open block removed. Lazy scaler rebuild in `next_frame()`/`advance_to()` handles D3D11→NV12 format change on first frame.
 
 ---
 
@@ -300,7 +295,6 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 ---
 
 ## Known Future Work
-- **D3D11VA ordering fix**: set `hw_device_ctx` before `avcodec_open2`. Requires lower-level codec init than `dec_ctx.decoder().video()?` provides. May need changes to `ffmpeg-the-third` fork to expose pre-open hook.
 - **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
 - **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
 - **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
@@ -319,4 +313,4 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
 - Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.
-- FFmpeg: custom static build with D3D11VA compiled in. **⚠ D3D11VA currently broken** (static image bug — hw_device_ctx set after codec open). CPU decode path works correctly at native resolution.
+- FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active** — `hw_device_ctx` now set on `dec_ctx` pre-open (before `avcodec_open2`). Lazy scaler rebuild in `next_frame()`/`advance_to()` handles D3D11→NV12 format change on first frame. CPU fallback still available if device init fails.
