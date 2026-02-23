@@ -651,4 +651,16 @@ mod tests {
         let mid = blend_buffers(&a, &b, 0.5);
         assert_eq!(mid, vec![100u8, 100]);
     }
+
+    #[test]
+    fn rgba_yuv_roundtrip_within_tolerance() {
+        let (w, h) = (2, 2);
+        let rgba_in: Vec<u8> = (0..16).map(|i| if i % 4 == 3 { 255 } else { 128 }).collect();
+        let yuv  = rgba_to_yuv420p(&rgba_in, w, h);
+        let rgba_out = yuv420p_to_rgba(&yuv, w, h);
+        for i in (0..rgba_in.len()).step_by(4) {
+            let diff = (rgba_in[i] as i16 - rgba_out[i] as i16).abs();
+            assert!(diff <= 2, "channel {i} roundtrip error {diff} exceeds tolerance");
+        }
+    }
 }

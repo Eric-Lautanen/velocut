@@ -78,9 +78,12 @@ macro_rules! declare_transitions {
 declare_transitions! {
     crossfade::Crossfade       => Crossfade,
     dip_to_black::DipToBlack   => DipToBlack,
+    dip_to_white::DipToWhite   => DipToWhite,
     iris::Iris                 => Iris,
     wipe::Wipe                 => Wipe,
     push::Push                 => Push,
+    barn_doors::BarnDoors      => BarnDoors,
+    clock_wipe::ClockWipe      => ClockWipe,
 }
 
 // ── Serialized project types ──────────────────────────────────────────────────
@@ -168,8 +171,8 @@ pub trait VideoTransition: Send + Sync {
     /// Human-readable label shown in the UI picker (e.g. `"Dissolve"`).
     fn label(&self) -> &'static str;
 
-    /// Emoji badge shown on the timeline clip block when this transition is
-    /// active (e.g. `"🌫️"`). Keep it one glyph wide.
+    /// Glyph shown on the timeline badge. Use a single Unicode geometric character
+    /// (e.g. "○", "◔") — egui's default font does not include emoji.
     fn icon(&self) -> &'static str;
 
     /// Default overlap duration in seconds pre-filled in the UI when the user
@@ -185,6 +188,16 @@ pub trait VideoTransition: Send + Sync {
     /// Implementations should return: `TransitionType::new(self.kind(), duration_secs)`
     fn build(&self, duration_secs: f32) -> TransitionType;
 
+    /// Shortest meaningful duration in seconds. UI should clamp below this.
+    fn min_duration_secs(&self) -> f32 { 0.2 }
+
+    /// Longest meaningful duration in seconds. UI should clamp above this.
+    fn max_duration_secs(&self) -> f32 { 5.0 }
+
+    /// One-sentence description shown in tooltips.
+    /// Empty string = no tooltip.
+    fn description(&self) -> &'static str { "" }
+
     /// Blend `frame_a` and `frame_b` at `alpha` and return the packed result.
     ///
     /// `width` / `height` are luma plane dimensions in pixels.
@@ -198,15 +211,6 @@ pub trait VideoTransition: Send + Sync {
         alpha:   f32,
     ) -> Vec<u8>;
 
-    /// Blend two RGBA frames (`w × h × 4` bytes each) at `alpha`.
-    ///
-    /// The default implementation converts RGBA → YUV420P, calls `apply()`,
-    /// then converts the result back to RGBA.  This means every transition
-    /// automatically works on the live-preview path without any extra code.
-    ///
-    /// Override this method only when you need native RGBA performance for
-    /// preview (e.g. a computationally expensive transition where the YUV
-    /// roundtrip is a measurable bottleneck).
     fn apply_rgba(
         &self,
         frame_a: &[u8],
