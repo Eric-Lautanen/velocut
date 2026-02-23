@@ -9,7 +9,8 @@
 
 use velocut_core::state::ProjectState;
 use velocut_core::commands::EditorCommand;
-use velocut_core::media_types::PlaybackFrame;
+use velocut_core::media_types::{PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
+use velocut_core::transitions::TransitionKind;
 use crate::context::AppContext;
 use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
@@ -178,7 +179,16 @@ impl VideoModule {
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         let aspect   = state.active_video_ratio();
-                        ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
+                        // Check for an outgoing transition (clip_a → next) or an
+                        // incoming one (prev → clip_b) so the pb thread can blend
+                        // across the cut without an extra start/stop cycle.
+                        if let Some(spec) = build_blend_spec(state, clip)
+                            .or_else(|| build_incoming_blend_spec(state, clip))
+                        {
+                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, aspect, spec);
+                        } else {
+                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
+                        }
                     }
                 }
             }
@@ -247,7 +257,24 @@ impl VideoModule {
             }
 
             // Layer 2 (every scrub move): fire exact-timestamp decode request.
-            if let Some(lib) = clip_query::library_entry_for(state, &clip) {
+            // If the playhead is inside a transition zone, decode both clips and
+            // send a blended frame; otherwise request a normal single-clip frame.
+            if let Some(zone) = clip_query::active_transition_at(state) {
+                let path_a = clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
+                let path_b = clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
+                if let (Some(pa), Some(pb)) = (path_a, path_b) {
+                    ctx.media_worker.request_transition_frame(TransitionScrubRequest {
+                        clip_a_id:   zone.clip_a.media_id,
+                        clip_a_path: pa,
+                        clip_a_ts:   zone.clip_a_source_ts,
+                        clip_b_id:   zone.clip_b.media_id,
+                        clip_b_path: pb,
+                        clip_b_ts:   zone.clip_b_source_ts,
+                        alpha:       zone.alpha,
+                        kind:        zone.transition.kind,
+                    });
+                }
+            } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 let aspect = state.active_video_ratio();
                 ctx.media_worker.request_frame(lib.id, lib.path.clone(), local_t, aspect);
             }
@@ -292,4 +319,95 @@ impl EditorModule for VideoModule {
     ) {
         // No panel — driven entirely by tick() and poll_playback().
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a `PlaybackTransitionSpec` for the outgoing transition on `clip`, if any.
+///
+/// Returns `None` when `clip` has no non-Cut transition, when the next V-row clip
+/// cannot be found, or when the next clip's library entry is missing.
+/// Used by `tick()` to pass blend info to `start_blend_playback` so the pb thread
+/// can open clip_b's decoder lazily and blend frames at the boundary.
+fn build_blend_spec(
+    state: &velocut_core::state::ProjectState,
+    clip:  &velocut_core::state::TimelineClip,
+) -> Option<PlaybackTransitionSpec> {
+    // Find a non-Cut transition recorded after this clip.
+    let tr = state.transitions.iter().find(|tr| {
+        tr.after_clip_id == clip.id
+            && tr.kind.kind != TransitionKind::Cut
+    })?;
+
+    // Find the next V-row video clip (butted up against this one's end via snap-to-end).
+    let clip_end = clip.start_time + clip.duration;
+    let next_clip = state.timeline.iter()
+        .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
+        // Snapped clips are exactly adjacent; allow a small epsilon for float drift.
+        .find(|c| (c.start_time - clip_end).abs() < 0.05)?;
+
+    let next_lib = clip_query::library_entry_for(state, next_clip)?;
+
+    // Source timestamp in clip_a at which blending begins.
+    // Transition is centered on the cut: blend starts D/2 before clip_a ends.
+    let blend_start_ts = (clip.source_offset + clip.duration
+        - tr.kind.duration_secs as f64 / 2.0).max(0.0);
+
+    Some(PlaybackTransitionSpec {
+        clip_b_id:           next_clip.media_id,
+        clip_b_path:         next_lib.path.clone(),
+        clip_b_source_start: next_clip.source_offset,
+        blend_start_ts,
+        duration:            tr.kind.duration_secs,
+        kind:                tr.kind.kind,
+        alpha_start:         0.0,  // clip_a side: ramps 0.0 → 0.5 at cut
+        invert_ab:           false,
+    })
+}
+
+/// Build a `PlaybackTransitionSpec` for the *incoming* (clip_b) side of a
+/// centered transition — called when clip_b becomes the active timeline clip
+/// and the playhead is still in the first half-D of clip_b (i.e. the blend
+/// zone has not yet ended).
+///
+/// Uses a direct time-range guard instead of `active_transition_at` to avoid
+/// the early-exit bug in that function when 3+ clips are on the timeline.
+fn build_incoming_blend_spec(
+    state:  &velocut_core::state::ProjectState,
+    clip_b: &velocut_core::state::TimelineClip,
+) -> Option<PlaybackTransitionSpec> {
+    // Find the preceding V-row clip (clip_a).
+    let clip_b_start = clip_b.start_time;
+    let clip_a = state.timeline.iter()
+        .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
+        .find(|c| (c.start_time + c.duration - clip_b_start).abs() < 0.05)?;
+
+    // Find the non-Cut transition recorded after clip_a.
+    let tr = state.transitions.iter().find(|tr| {
+        tr.after_clip_id == clip_a.id
+            && tr.kind.kind != TransitionKind::Cut
+    })?;
+
+    let half_d = tr.kind.duration_secs as f64 / 2.0;
+
+    // Direct in-zone guard: only activate during the incoming half of the zone
+    // [clip_b_start, clip_b_start + D/2).  Seeking mid-clip or starting fresh
+    // will have current_time >> clip_b_start + half_d and returns None here,
+    // keeping normal start_playback behaviour and avoiding a spurious second decoder.
+    if state.current_time >= clip_b.start_time + half_d { return None; }
+
+    let clip_a_lib  = clip_query::library_entry_for(state, clip_a)?;
+    // Secondary decoder: clip_a's tail, starting at the last D/2 of clip_a's source.
+    let clip_a_tail = (clip_a.source_offset + clip_a.duration - half_d).max(0.0);
+
+    Some(PlaybackTransitionSpec {
+        clip_b_id:           clip_a.media_id,       // secondary = clip_a tail
+        clip_b_path:         clip_a_lib.path.clone(),
+        clip_b_source_start: clip_a_tail,
+        blend_start_ts:      clip_b.source_offset,  // blend from clip_b's first frame
+        duration:            tr.kind.duration_secs, // full D; alpha_start offsets into it
+        kind:                tr.kind.kind,
+        alpha_start:         0.5,   // second half: ramps 0.5 → 1.0
+        invert_ab:           true,  // primary=clip_b is "b"; secondary=clip_a is "a"
+    })
 }

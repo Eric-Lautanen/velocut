@@ -161,6 +161,89 @@ pub fn playhead_source_timestamp(state: &ProjectState) -> Option<(f64, &LibraryC
     Some((tc.source_offset + offset, lib))
 }
 
+// ── Transition zone detection ─────────────────────────────────────────────────
+
+/// Returned when `state.current_time` is inside a transition blend zone.
+/// Callers use this to request a blended preview frame instead of a single-clip frame.
+pub struct TransitionZone<'a> {
+    /// The outgoing clip (frame_a in the transition — the one ending).
+    pub clip_a: &'a TimelineClip,
+    /// The incoming clip (frame_b — the one starting).
+    pub clip_b: &'a TimelineClip,
+    /// The transition parameters (kind + duration_secs).
+    pub transition: velocut_core::transitions::TransitionType,
+    /// Blend factor: 0.0 = fully clip_a, 1.0 = fully clip_b.
+    pub alpha: f32,
+    /// Source-file timestamp to decode from clip_a at this alpha.
+    pub clip_a_source_ts: f64,
+    /// Source-file timestamp to decode from clip_b at this alpha.
+    pub clip_b_source_ts: f64,
+}
+
+/// Returns blend info if `state.current_time` is inside a transition zone, else `None`.
+///
+/// A transition of duration D between clip_a and clip_b is centered on the cut
+/// point — the zone is [clip_a_end − D/2, clip_a_end + D/2).
+/// Only considers V-row clips (even track_row, non-extracted-audio).
+///
+/// `alpha` = 0.0 at zone start (pure clip_a), 1.0 at zone end (pure clip_b).
+pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> {
+    let t = state.current_time;
+
+    // Collect V-row video clips, sorted by timeline position.
+    let mut v_clips: Vec<&TimelineClip> = state.timeline.iter()
+        .filter(|c| c.track_row % 2 == 0 && !is_extracted_audio_clip(c))
+        .collect();
+    if v_clips.len() < 2 { return None; }
+    v_clips.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
+
+    for pair in v_clips.windows(2) {
+        let clip_a = pair[0];
+        let clip_b = pair[1];
+
+        // Look for a non-Cut transition recorded after clip_a.
+        // Use if-let + continue instead of ? so a missing transition on one pair
+        // doesn't abort the entire search — other pairs may still have one.
+        let tr = match state.transitions.iter()
+            .find(|tr| tr.after_clip_id == clip_a.id)
+        {
+            Some(tr) => tr,
+            None     => continue,
+        };
+        if tr.kind.kind == velocut_core::transitions::TransitionKind::Cut { continue; }
+
+        let d = tr.kind.duration_secs as f64;
+        if d <= 0.0 { continue; }
+
+        // Zone is centered on the cut point: [clip_a_end − D/2, clip_a_end + D/2).
+        let clip_a_end = clip_a.start_time + clip_a.duration;
+        let half_d     = d / 2.0;
+        let zone_start = clip_a_end - half_d;
+        let zone_end   = clip_a_end + half_d;
+
+        if t < zone_start || t >= zone_end { continue; }
+
+        let local_blend = t - zone_start;                          // 0.0 .. D
+        let alpha       = (local_blend / d).clamp(0.0, 1.0) as f32;
+
+        // Source timestamps (centered on cut):
+        //   clip_a: last D/2 of its source playing out over the full zone
+        //   clip_b: first D/2 of its source starting at source_offset
+        let clip_a_source_ts = (clip_a.source_offset + clip_a.duration - half_d + local_blend).max(0.0);
+        let clip_b_source_ts = (clip_b.source_offset + local_blend).max(0.0);
+
+        return Some(TransitionZone {
+            clip_a,
+            clip_b,
+            transition: tr.kind.clone(),  // TransitionType is Clone; tr is a shared ref
+            alpha,
+            clip_a_source_ts,
+            clip_b_source_ts,
+        });
+    }
+    None
+}
+
 // ── Audio playback helper ─────────────────────────────────────────────────────
 
 /// Return the clip that should be providing audio at `time`.

@@ -1,150 +1,213 @@
 # VeloCut — AI Dev Reference
 
-> Read fully before editing. Invariants = load-bearing. Check Debugging History before diagnosing frame/playback issues.
+> Read fully before editing. Invariants are load-bearing. Check Debugging History before diagnosing frame/playback issues.
 
 ## AI Dev Workflow
-
-Codebase is ~10K lines across many files. Follow these rules on every session:
-
-- **Always ask for the file before touching it.** Never guess at contents or make edits based on error messages alone — request the upload first.
-- **Use `str_replace` for all edits to existing files.** Never rewrite a whole file. Make surgical targeted replacements only. One `str_replace` call per logical change.
-- **`grep` the uploaded file first** to find all instances of a pattern before editing, so nothing is missed.
-- **Verify with a final `grep`** after edits to confirm no stale calls remain.
+- **Always ask for the file before touching it.** Never guess contents or edit from error messages alone.
+- **`str_replace` for all edits.** Never rewrite whole files. One call per logical change.
+- **`grep` first** to find all instances before editing. **`grep` after** to confirm no stale calls.
 
 ---
 
 ## Stack
-
-Rust desktop app, Windows MINGW64, Cargo workspace.
-Deps: `eframe`/`egui` 0.33, `ffmpeg-the-third` 4 (forked → `eric-lautanen/velocut-ffmpeg-the-third` branch `master` — owns this fork long-term, do not blindly rebase upstream), `crossbeam-channel` 0.5, `rodio` 0.21.1, `rfd` 0.14, `uuid` 1.10, `serde` 1.0, `png` 0.18.1.
-
-FFmpeg: custom static build, MINGW64, linked via fork. Fork exposes flush control upstream lacks. Changes in encode/decode may also need fork changes + `Cargo.toml` version bump.
-
-ffmpeg-the-third 4 API: no `Stream::codec()` — use `Context::from_parameters(stream.parameters())` for decoders, `Context::new_with_codec(codec)` for encoders. `set_parameters()` needs `AsPtr<AVCodecParameters>` — copy via `avcodec_parameters_from_context` FFI. `packets()` → `Result<(Stream, Packet), Error>` — always destructure with `?`. `set_frame_rate` needs explicit `Rational`.
+Rust desktop, Windows MINGW64, Cargo workspace.
+Deps: `eframe`/`egui` 0.33, `ffmpeg-the-third` 4 (fork `eric-lautanen/velocut-ffmpeg-the-third` — owns long-term, do not blindly rebase upstream), `crossbeam-channel` 0.5, `rodio` 0.21.1, `rfd` 0.14, `uuid` 1.10, `serde` 1.0, `png` 0.18.1.
+FFmpeg: custom static build, MINGW64. Fork exposes flush control upstream lacks. Encode/decode changes may need fork changes + `Cargo.toml` bump.
+ffmpeg-the-third 4 API: no `Stream::codec()` — use `Context::from_parameters(stream.parameters())` for decoders, `Context::new_with_codec(codec)` for encoders. `set_parameters()` needs `AsPtr<AVCodecParameters>` via `avcodec_parameters_from_context` FFI. `packets()` → `Result<(Stream, Packet), Error>` — always destructure with `?`. `set_frame_rate` needs explicit `Rational`.
 
 ---
 
 ## Workspace
-
 ```
 velocut/
-  Cargo.toml
   crates/
     velocut-core/    no UI, no FFmpeg
     velocut-media/   FFmpeg workers, no egui
     velocut-ui/      egui app + binary
 ```
-
 Dep rules: ui → core + media; media → core; core/media → no egui.
 
 ---
 
 ## velocut-core/src/
 
-**`lib.rs`** — `pub mod commands, helpers, media_types, state, transitions`. `transitions` is a folder (`transitions/mod.rs`).
+**`commands.rs`** — `EditorCommand` enum. Processed by `app.rs::process_command()` post-UI.
+Key variants: `SetTransition { after_clip_id, kind: TransitionType }`, `RemoveTransition(Uuid)`, `SetCrossfadeDuration(f32)`, `ClearProject` (8-step), `PushUndoSnapshot`, `Undo`, `Redo`, `ExtractAudioTrack(Uuid)`, `SetClipVolume { id, volume }`, `RenderMP4 { filename, width, height, fps }`, `CancelEncode(Uuid)`, `ClearEncodeStatus`, `SaveFrameToDisk`, `RequestSaveFramePicker`.
 
-**`commands.rs`** — `EditorCommand` enum. Every user action; processed by `app.rs::process_command()` post-UI pass.
-Key variants: `SetTransition { after_clip_id: Uuid, kind: TransitionType }`, `RemoveTransition(Uuid)`, `SetCrossfadeDuration(f32)`, `ClearProject` (8-step teardown), `PushUndoSnapshot`, `Undo`, `Redo`, `ExtractAudioTrack(Uuid)`, `SetClipVolume { id, volume }`, `RenderMP4 { filename, width, height, fps }`, `CancelEncode(Uuid)`, `ClearEncodeStatus`, `SaveFrameToDisk`, `RequestSaveFramePicker`.
+**`state.rs`** — `ProjectState` (serde). Fields: `library: Vec<LibraryClip>`, `timeline: Vec<TimelineClip>`, `transitions: Vec<TimelineTransition>`, playback fields, zoom, AR, selected IDs. `#[serde(skip)]` runtime: `pending_probes/extracts/audio_cleanup/save_pick`, `save_status`, encode fields. Key methods: `add_to_timeline` (snap-to-zero + snap-to-end), `total_duration`, `active_video_ratio`. `TimelineClip` has `volume: f32` (default 1.0), `audio_muted: bool`, `linked_clip_id: Option<Uuid>`.
 
-**`state.rs`** — `ProjectState` (serde). Fields: `library: Vec<LibraryClip>`, `timeline: Vec<TimelineClip>`, `transitions: Vec<TimelineTransition>`, playback fields, zoom, AR, selected IDs. `#[serde(skip)]` runtime: `pending_probes/extracts/audio_cleanup/save_pick`, `save_status`, encode fields (`encode_job`, `encode_progress`, `encode_done`, `encode_error`). Key methods: `add_to_timeline` (snap-to-zero + snap-to-end), `total_duration`, `active_video_ratio`. `TimelineClip` has `volume: f32` (default 1.0), `audio_muted: bool`, `linked_clip_id: Option<Uuid>`.
+**`media_types.rs`** — `MediaResult` variants: `Duration, Thumbnail, Waveform, VideoSize, VideoFrame, FrameSaved, AudioPath, Error, EncodeProgress { job_id, frame, total_frames }, EncodeDone { job_id, path }, EncodeError { job_id, msg }`. `PlaybackFrame { data: Vec<u8>, timestamp: f64, id, width, height }` for dedicated pb channel.
+`TransitionScrubRequest { clip_a_id, clip_a_path, clip_a_ts, clip_b_id, clip_b_path, clip_b_ts, alpha: f32, kind: TransitionKind }` — sent from video_module scrub path for blend decode.
+`PlaybackTransitionSpec { clip_b_id, clip_b_path, clip_b_source_start: f64, blend_start_ts: f64, duration: f32, kind: TransitionKind, alpha_start: f32, invert_ab: bool }` — passed to `start_blend_playback`. `alpha_start=0.0/invert_ab=false` for clip_a side; `alpha_start=0.5/invert_ab=true` for clip_b side. `invert_ab` swaps a/b in `blend_rgba_transition` call so primary decoder (clip_b) maps to the "b" argument correctly.
 
-**`media_types.rs`** — `MediaResult` variants: `AudioPath, Duration, Thumbnail, Waveform, VideoSize, FrameSaved, VideoFrame, Error, EncodeProgress { job_id, frame, total_frames }, EncodeDone { job_id, path }, EncodeError { job_id, msg }`. Also `PlaybackFrame { data: Vec<u8>, timestamp: f64 }` for dedicated pb channel.
-
-**`helpers/mod.rs`** — `pub mod geometry, time`.
-**`helpers/time.rs`** — `format_time(s) -> MM:SS:FF` (ruler), `format_duration(s) -> H:MM:SS/M:SS/S.Xs` (library).
-**`helpers/geometry.rs`** — `aspect_ratio_value(ar) -> f32`, `aspect_ratio_label(ar) -> &str`.
+**`helpers/`** — `time.rs`: `format_time(s)->MM:SS:FF`, `format_duration(s)`. `geometry.rs`: `aspect_ratio_value`, `aspect_ratio_label`.
 
 **`transitions/mod.rs`** — Three layers:
-1. **Serialized types**: `TransitionKind` (`Copy` enum — **generated by `declare_transitions!` macro**, always includes `Cut` plus one variant per registered transition). `TransitionType` is a **plain struct** `{ kind: TransitionKind, duration_secs: f32 }` — NOT an enum. Every transition shares the same parameter shape so no new variants are ever needed here. Constructors: `TransitionType::new(kind, duration_secs)`, `TransitionType::cut()`. Access fields directly: `t.kind`, `t.duration_secs` — **no `.kind()` or `.duration_secs()` methods**. `TimelineTransition { after_clip_id, kind: TransitionType }` (in `ProjectState.transitions`). `ClipTransition { after_clip_index, kind: TransitionType }` (encode-only, not serialized). **Never rename/remove `TransitionKind` variants — they are written to project files.**
-2. **`VideoTransition` trait**: `kind() -> TransitionKind`, `label() -> &'static str`, `icon() -> &'static str` (badge emoji — must include `U+FE0F` variation selector), `default_duration_secs() -> f32`, `build(duration_secs) -> TransitionType` — impl should return `TransitionType::new(self.kind(), duration_secs)` (**UI always calls this, never constructs `TransitionType` directly**), `apply(frame_a: &[u8], frame_b: &[u8], width: u32, height: u32, alpha: f32) -> Vec<u8>` (packed YUV420P blend, once per frame, all inner loops inside impl).
-3. **Registry**: driven by `declare_transitions!` macro — **true single add-point**. Syntax: `module::Struct => KindVariant,`. Macro generates: `mod` declaration, the entire `TransitionKind` enum, and `make_entries()` vec. `registered() -> Vec<Box<dyn VideoTransition>>` (stable-ordered, for UI). `registry() -> HashMap<TransitionKind, Box<dyn VideoTransition>>` (O(1), for encode/preview). `Cut` has no registry entry — callers short-circuit on `TransitionKind::Cut`. Current registrations: `crossfade::Crossfade => Crossfade`, `dip_to_black::DipToBlack => DipToBlack`, `iris::Iris => Iris`, `wipe::Wipe => Wipe`, `push::Push => Push`.
-`pub mod helpers` declared explicitly (not via macro — it's a utility module, not a transition).
+1. **Serialized**: `TransitionKind` (`Copy` enum, **generated by `declare_transitions!`**, always includes `Cut`). `TransitionType` is **plain struct** `{ kind: TransitionKind, duration_secs: f32 }` — NOT an enum. Constructors: `TransitionType::new(kind, dur)`, `TransitionType::cut()`. Access fields directly: `t.kind`, `t.duration_secs` — **no method calls**. `TimelineTransition { after_clip_id, kind: TransitionType }`. **Never rename/remove `TransitionKind` variants — serialized to project files.**
+2. **`VideoTransition` trait**: `kind`, `label`, `icon` (must include `U+FE0F`), `default_duration_secs`, `build(dur)->TransitionType` (always `TransitionType::new(self.kind(), dur)`), `apply(frame_a, frame_b, w, h, alpha)->Vec<u8>` (packed YUV420P).
+3. **Registry**: `declare_transitions!` macro — true single add-point. Generates: mod declaration, `TransitionKind` enum, `make_entries()`. `registered()->Vec<Box<dyn VideoTransition>>` (UI), `registry()->HashMap<TransitionKind,Box<dyn VideoTransition>>` (encode O(1)). `Cut` has no entry — callers short-circuit on `Cut`. Current: `crossfade::Crossfade=>Crossfade`, `dip_to_black::DipToBlack=>DipToBlack`, `iris::Iris=>Iris`, `wipe::Wipe=>Wipe`, `push::Push=>Push`.
 
-**`transitions/helpers.rs`** — Pure f32, no FFmpeg. Easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `ease_in_out_sine` (gentler/sinusoidal, softer shoulder than smooth-step), `linear`, `ease_out_bounce`, `ease_in_bounce`, `ease_out_elastic`. `frame_alpha(i, n) -> f32` → `(i+1)/(n+1)` exclusive. `blend_byte(a, b, alpha) -> u8`. `clamp01`, `lerp`. Plane layout: `y_len(w,h)`, `uv_len(w,h)`, `u_offset(w,h)`, `v_offset(w,h)`, `split_planes(buf,w,h) -> (&Y,&U,&V)` (debug-asserts buffer size), `chroma_dims(w,h) -> (u32,u32)` (returns `(w/2,h/2)` — prefer over inlining). Buffer utils: `alloc_frame(w,h) -> Vec<u8>` (zero-filled packed YUV420P), `blend_buffers(a,b,alpha) -> Vec<u8>` (uniform alpha whole-buffer — use for dissolves, not per-pixel wipes). Spatial: `norm_x(x,w)`, `norm_y(y,h)`, `norm_xy(px,py,w,h) -> (f32,f32)` (both axes — prefer over separate calls in 2D effects), `center_dist(nx,ny)` (distance from frame center, for iris), `wipe_alpha(coord, edge, feather)` (direction-agnostic: pass `norm_x` for L→R, `norm_y` for T→B, `1.0-norm_x` for R→L, `center_dist` for iris). Plane sampling: `sample_plane(plane,px,py,w) -> u8` (unchecked, for pre-validated coords in inner loops), `sample_plane_clamped(plane,px:i32,py:i32,w,h) -> u8` (signed coords, clamps to nearest edge pixel — use whenever offset can go negative, e.g. push/slide/warp).
+**`transitions/helpers.rs`** — Easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `ease_in_out_sine`, `linear`, `ease_out_bounce`, `ease_in_bounce`, `ease_out_elastic`. Frame/blend: `frame_alpha(i,n)->f32` `=(i+1)/(n+1)`, `blend_byte(a,b,alpha)->u8`, `blend_buffers`, `alloc_frame`, `clamp01`, `lerp`. Plane layout: `y_len`, `uv_len`, `u_offset`, `v_offset`, `split_planes`, `chroma_dims(w,h)->(w/2,h/2)`. Spatial: `norm_x`, `norm_y`, `norm_xy`, `center_dist`, `wipe_alpha(coord,edge,feather)` (direction-agnostic). Sampling: `sample_plane` (unchecked), `sample_plane_clamped` (signed, clamp — use when offset can go negative).
 
-**`transitions/crossfade.rs`** — `Crossfade`: `label`="Dissolve", `icon`="🌫️" (`U+1F32B U+FE0F` — variation selector required), `build(dur)`→`TransitionType::new(TransitionKind::Crossfade, dur)`, `apply` uses `blend_byte(a,b,ease_in_out(alpha))`. Unit tests run without FFmpeg.
-
-**`transitions/dip_to_black.rs`** — `DipToBlack`: `label`="Dip to Black", `icon`="⬛️", `default_duration_secs`=0.8. First half fades frame_a to black, second half fades frame_b in from black — clips never blend directly. `build(dur)`→`TransitionType::new(TransitionKind::DipToBlack, dur)`.
-
-**`transitions/wipe.rs`** — `Wipe`: `label`="Wipe", `icon`="▶️", `default_duration_secs`=0.5. Left-to-right vertical bar sweeps across, uncovering frame_b from the left. Uses `wipe_alpha` with `FEATHER=0.02` (2 % of width). **Blend arg order is `blend_byte(b, a, wa)`** — wa=0 (left of bar) → frame_b, wa=1 (right of bar) → frame_a. Easing via `ease_in_out`. Each YUV plane processed independently at its native resolution using `norm_x` against the plane's own width.
-
-**`transitions/push.rs`** — `Push`: `label`="Push", `icon`="➡️", `default_duration_secs`=0.4. frame_b slides in from the right, physically displacing frame_a to the left. **Zero blending** — every output pixel is a hard copy from one source, no ghosting. Boundary at `(1−p)×width`, frame_a sampled at `x+shift_a`, frame_b sampled at `x−boundary`. Chroma boundary/shift computed from full-res float before halving (not integer-halved pixel counts). Easing via `ease_in_out_cubic`.
+**Transitions**: `Crossfade` — `blend_byte(a,b,ease_in_out(alpha))`. `DipToBlack` — first half a→black, second half black→b; YUV420P black = Y=0,U=128,V=128, **not all-zeros**. `Wipe` — L→R bar, `blend_byte(b,a,wa)` order, FEATHER=0.02. `Push` — zero blending, hard pixel copy, `ease_in_out_cubic`. `Iris` — circular aperture, `center_dist`, FEATHER=0.05.
 
 ---
 
 ## velocut-media/src/
 
-**`worker.rs`** — `MediaWorker`. Owns: latest-wins condvar scrub slot, playback decode thread (32-frame bounded channel), probe semaphore (max 4), shared result channel `(tx,rx)`, **dedicated scrub channel `(scrub_tx, scrub_rx)` cap=8** (scrub VideoFrames go here, not `rx`), `encode_cancels: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>`.
-Methods: `probe_clip` (duration+thumbnail+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot), `start_playback` (sends Start **before** draining `pb_rx`), `stop_playback` (sends Stop then **drains `pb_rx` to empty** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
+**`worker.rs`** — `MediaWorker`. Owns: latest-wins condvar scrub slot, pb decode thread (32-frame bounded channel), probe semaphore (max 4), shared result channel, **dedicated scrub channel `scrub_rx` cap=8** (scrub VideoFrames bypass shared rx), `encode_cancels: Arc<Mutex<HashMap<Uuid,Arc<AtomicBool>>>>`.
+Methods: `probe_clip` (dur+thumb+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot), `request_transition_frame(TransitionScrubRequest)` (spawns one-shot thread: decode_one_frame_rgba×2, blend, send to scrub_rx keyed by clip_a_id), `start_playback` (sends Start **before** draining pb_rx), `start_blend_playback(id,path,ts,aspect,PlaybackTransitionSpec)` (like start_playback but pb thread opens clip_b decoder lazily and blends), `stop_playback` (sends Stop then **drains pb_rx** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
+Pb thread blend logic: when `ts_secs >= spec.blend_start_ts`, `alpha = (spec.alpha_start + local_t/spec.duration).clamp(0,1)`. If `spec.invert_ab`, calls `blend_rgba_transition(data_b, data, ...)` else `blend_rgba_transition(data, data_b, ...)`. Decoder_b for blend opened lazily on first blend frame. Blend state cleared on Start/Stop/EOF.
+`blend_rgba_transition(a,b,w,h,alpha,kind)` — RGBA in-process blend matching YUV encode-path. All transition kinds implemented.
 
-**`encode.rs`** — `ClipSpec { path, source_offset, duration, volume, skip_audio: bool }`, `EncodeSpec { job_id, clips, width, height, fps, output, transitions: Vec<ClipTransition> }`. `encode_timeline` blocking, own thread.
-Setup: `Context::new_with_codec(h264)`, CRF 18 + preset fast + **`g=fps` (keyframe/sec, critical for scrub)**, **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with`** (MP4 needs SPS/PPS in avcC), **fetch `ost_audio_tb` after `write_header`** (muxer normalizes tb during header write). Copy params via `avcodec_parameters_from_context` FFI.
-`CropScaler`: center-crop SwsContext, no letterbox. Built with `crop_w×crop_h` as source dims. `run()` pre-advances data ptrs to `crop_y` row (`crop_y*ls[0]` Y, `(crop_y/2)*ls[1]` UV) and passes `srcSliceY=0` — **never pass `crop_y` as `srcSliceY` → EINVAL** (only manifests portrait→landscape where `crop_y>0`).
-Transition dispatch: `registry()` built **once** before clip loop. Per-boundary: `entry.kind.kind` (field, not method) for registry key, `entry.kind.duration_secs` (field, not method) for overlap. `apply_transition(&dyn VideoTransition, ...)` calls `transition.apply()` with `frame_alpha(i,n)` — no blend math in `encode.rs`. Decoder-flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
+**`encode.rs`** — `ClipSpec { path, source_offset, duration, volume, skip_audio }`, `EncodeSpec { job_id, clips, width, height, fps, output, transitions: Vec<ClipTransition> }`. `encode_timeline` blocking, own thread. `Context::new_with_codec(h264)`, CRF 18, preset fast, **`g=fps`** (keyframe/sec, critical for scrub), **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with`**, **fetch `ost_audio_tb` after `write_header`**. `CropScaler`: center-crop, pre-advance data ptrs to `crop_y` row, **pass `srcSliceY=0`** (never `crop_y` → EINVAL). Transition dispatch: `registry()` built once before clip loop. Decoder flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
 
-**`decode.rs`** — `LiveDecoder`: stateful per-clip, open+seek on construct. `next_frame()` playback, `advance_to(pts)` forward scrub (decode-only pre-target, scale once on hit ~4× faster), `burn_to_pts()` sync pre-roll. Owns `frame_buf: Vec<u8>` pre-alloc `out_w*out_h*4` (no per-frame alloc). `open(path, ts, aspect, cached_scaler)` — `cached_scaler: Option<(SwsContext, Pixel, u32, u32)>` reused if format+dims match. Pub fields: `decoder_fmt, decoder_w, decoder_h` (reuse key). **`aspect` param is legacy dead parameter — ignored, do not wire up.** **Output always source native AR** (`out_h = 640*src_h/src_w`), downstream consumers crop themselves. `decode_frame()`: one-shot HQ, seeks via `seek_to_secs`.
+**`decode.rs`** — `LiveDecoder`: stateful per-clip. `next_frame()->Option<(Vec<u8>,w,h,ts_secs)>`, `advance_to(pts)` forward scrub, `burn_to_pts(pts)` sync pre-roll. `open(path,ts,aspect,cached_scaler)` — `cached_scaler: Option<(SwsContext,Pixel,u32,u32)>` reused if fmt+dims match. **`aspect` param is dead/ignored — output always source native AR** (`out_h=640*src_h/src_w`). `skip_until_pts` field: decode-only burn, ~4× faster than scale. `decode_one_frame_rgba(path,ts)->Result<(Vec<u8>,w,h)>` — one-shot for scrub transition blend.
 
-**`probe.rs`** — `probe_duration`, `probe_video_size_and_thumbnail`. **SwsContext built lazily from first decoded frame** (not from `decoder.format()`/dims upfront — AVCC reports coded dims e.g. 1088 not 1080; Annex-B has `AV_PIX_FMT_NONE` pre-packet). Matched invariant with GLOBAL_HEADER encoder change.
+**`probe.rs`** — `probe_duration`, `probe_video_size_and_thumbnail`. **SwsContext built lazily from first decoded frame** — never upfront (AVCC reports coded dims; Annex-B has `AV_PIX_FMT_NONE` pre-packet).
 
-**`waveform.rs`** — In-process FFmpeg decode, `WAVEFORM_COLS=4000`, sends Waveform. After semaphore release.
+**`helpers/seek.rs`** — `seek_to_secs(ictx,ts,label)->bool`. Skips if `ts<=0.0` (Windows EPERM). **All seeks must go through here.**
 
-**`audio.rs`** — In-process FFmpeg decode, resample to 44100 Hz stereo f32le, writes `$TEMP/velocut_audio_{uuid}.wav`, sends AudioPath. `cleanup_audio_temp` deletes matching pattern.
-
-**`helpers/seek.rs`** — `seek_to_secs(ictx, ts, label) -> bool`. Skips seek if `ts<=0.0` (Windows EPERM on fresh ctx at offset 0). Soft-fails on EPERM. **All seeks must go through here.**
-
-**`helpers/yuv.rs`** — Packed (stride-free) YUV420P buffers. Layout: `[Y: w*h][U: uv_w*uv_h][V: uv_w*uv_h]`. `extract_yuv(frame,w,h,uv_w,uv_h) -> Vec<u8>` (strips stride), `write_yuv(packed, frame, ...)` (inverse), `blend_yuv_frame(a,b,alpha) -> Vec<u8>` (still available but no longer called from `encode.rs` directly — blending delegated to `VideoTransition::apply()`).
+**`helpers/yuv.rs`** — Packed (stride-free) YUV420P. `extract_yuv`, `write_yuv`, `blend_yuv_frame` (available, but blending delegated to `VideoTransition::apply()`).
 
 ---
 
 ## velocut-ui/src/
 
-**`app.rs`** — `VeloCutApp`. Concrete module fields (no dyn trait Vec): `library, preview, timeline, export, audio, video, pending_cmds`.
-`process_command()`: `RenderMP4` → `begin_render()` (opens save dialog, sorts timeline, **filters `is_extracted_audio_clip`**, builds `ClipSpec`s, for V-row `audio_muted=true` calls `linked_audio_clip` for effective_volume). `CancelEncode` sets AtomicBool only (state clears when `EncodeError{msg:"cancelled"}` arrives). `ClearEncodeStatus` zeros 4 encode fields. `ClearProject` **8-step order**: (1) queue WAV paths to `pending_audio_cleanup` before wiping library, (2) `stop_playback()`+drain `pb_rx`, (3) drop `audio_sinks`, (4) `cache.clear_all()`, (5) `playback.reset()`, (6) clear `library/timeline/transitions/time/playing/selections`, (7) zero encode fields, (8) clear `undo/redo` stacks + `sync_undo_len()`.
-`SetPlayhead`: updates `current_time`, clears audio_sinks + `pending_pb_frame`. If playing: `stop_playback()` + reset `playback_media_id` + `prev_playing=false` → tick sees `just_started=true` next frame → fresh `start_playback` at correct pos.
-`restore_snapshot()`: after undo/redo, re-queues probes for any library clip with empty `waveform_peaks` (snapshot may predate probe return).
-`poll_media()`: cleanup → probes/extracts → save dialog → `VideoModule::poll_playback` → `AppContext::ingest_media_results`.
-`update()`: layout panels → `preview.current_frame` from cache → drain `pending_cmds` → tick modules → `current_time += stable_dt` → `request_repaint()` during encode.
+**`app.rs`** — `VeloCutApp`. Concrete module fields: `library, preview, timeline, export, audio, video, pending_cmds`.
+`process_command()`: `RenderMP4`→`begin_render()` (dialog, sort, filter `is_extracted_audio_clip`, build ClipSpecs; for `audio_muted` V-row uses `linked_audio_clip` volume). `CancelEncode` sets AtomicBool only. `ClearProject` **8-step**: (1) queue WAV paths to `pending_audio_cleanup`, (2) `stop_playback()`+drain pb_rx, (3) drop audio_sinks, (4) `cache.clear_all()`, (5) `playback.reset()`, (6) clear library/timeline/transitions/time/playing/selections, (7) zero encode fields, (8) clear undo/redo + `sync_undo_len()`.
+`SetPlayhead`: updates `current_time`, clears audio_sinks + `pending_pb_frame`. If playing: `stop_playback()`+reset `playback_media_id`+`prev_playing=false` → tick sees `just_started=true` → fresh `start_playback`.
+`restore_snapshot()`: re-queues probes for clips with empty `waveform_peaks`.
+`poll_media()`: cleanup→probes/extracts→save dialog→`VideoModule::poll_playback`→`AppContext::ingest_media_results`.
+`update()`: layout→`preview.current_frame` from cache→drain cmds→tick modules→`current_time += stable_dt`→`request_repaint()` during encode.
 
-**`context.rs`** — `AppContext`. Fields: `media_worker`, scrub tracking (`last_frame_req: Option<(Uuid,f64)>` exact ts, `scrub_coarse_req`, `scrub_last_moved`), playback tracking (`playback_media_id`, `prev_playing`, `audio_was_playing`), `thumbnail_cache`, `frame_cache`, `frame_bucket_cache` (capped `MAX_FRAME_CACHE_BYTES`≈192 MB, evicts 32 furthest from playhead via O(N) `select_nth_unstable_by_key`, values are `(TextureHandle, usize)` byte size for accurate budget), `pending_pb_frame`, `audio_stream`, `audio_sinks`.
-`ingest_media_results()`: drains `scrub_rx` **first** then shared `rx` — maintain this order. Calls `ingest_video_frame()` for both (bucket insert + eviction + `frame_cache` write). `CacheContext::clear_all()` drops all 4 caches + resets byte counter. `PlaybackContext::reset()` resets 6 tracking fields.
+**`context.rs`** — `AppContext`. Scrub: `last_frame_req: Option<(Uuid,f64)>` exact ts, `scrub_coarse_req`, `scrub_last_moved`. Playback: `playback_media_id`, `prev_playing`, `audio_was_playing`. Caches: `thumbnail_cache`, `frame_cache`, `frame_bucket_cache` (capped `MAX_FRAME_CACHE_BYTES`≈192 MB, evicts 32 furthest via `select_nth_unstable_by_key`, values `(TextureHandle,usize)`), `pending_pb_frame`. Audio: `audio_stream`, `audio_sinks`.
+`ingest_media_results()`: drain `scrub_rx` **first** then shared `rx`. `CacheContext::clear_all()` drops all 4 caches + resets byte counter. `PlaybackContext::reset()` resets 6 fields.
 
-**`theme.rs`** — Color constants + `configure_style()`.
+**`helpers/clip_query.rs`** — `timeline_clip`, `selected_timeline_clip`, `clip_at_time`, `library_clip`, `library_entry_for`, `selected_clip_library_entry`, `is_extracted_audio_clip(clip)` = `track_row%2==1 && linked_clip_id.is_some()`, `linked_audio_clip(state,video_clip)`, `active_audio_clip(state,t)` (A-row first, V-row fallback skipping muted), `playhead_source_timestamp(state)->Option<(f64,&LibraryClip)>`.
+`active_transition_at(state)->Option<TransitionZone>` — zone centered on cut: **`[clip_a_end−D/2, clip_a_end+D/2)`**. `TransitionZone { clip_a, clip_b, transition, alpha, clip_a_source_ts, clip_b_source_ts }`. **Uses `match...continue` (not `?`) in the pair loop** — `?` would abort the whole function if any earlier clip pair lacks a transition (3+ clip bug). `clip_a_source_ts = clip_a.source_offset + clip_a.duration − D/2 + local_blend`. `clip_b_source_ts = clip_b.source_offset + local_blend`.
 
-**`helpers/clip_query.rs`** — `timeline_clip`, `selected_timeline_clip`, `clip_at_time`, `library_clip`, `library_entry_for`, `selected_clip_library_entry`, **`is_extracted_audio_clip(clip)` = `track_row%2==1 && linked_clip_id.is_some()`**, `linked_audio_clip(state, video_clip)`.
+**`modules/library.rs`** — `LibraryModule { multi_selection: HashSet<Uuid> }`. **Not a unit struct — `LibraryModule::new()` in a `let` before struct literal.** Grid: `chunks(cols)+ui.horizontal()` — **do NOT use `horizontal_wrapped` or `egui::Grid` without explicit column count inside `ScrollArea::vertical()`** (unbounded width measurement, never wraps). `DND_PAYLOAD` written once on drag start only.
 
-**`helpers/format.rs`** — `truncate(s, max) -> &str` (UTF-8 safe). Time/duration formatting lives in core.
+**`modules/video_module.rs`** — Unit struct. `tick()` + `poll_playback()` + `active_media_id()` static.
+`poll_playback()`: PTS-gated single-slot → `pending_pb_frame` → `frame_cache` when PTS due (±1 frame, not older than 3s). **Clip-transition eviction at very top** before frame_cache is read by preview. `request_repaint()` after promotion (background thread, not input event).
+`tick()` playback mode: on `just_started || clip_changed`, calls `build_blend_spec(state,clip)` (outgoing transition) then `.or_else(||build_incoming_blend_spec(state,clip))` (incoming). Uses `start_blend_playback` if either returns `Some`, else `start_playback`.
+`build_blend_spec`: finds non-Cut transition after clip_a + next V-row clip → `PlaybackTransitionSpec { blend_start_ts = clip_a.source_offset + clip_a.duration − D/2, alpha_start: 0.0, invert_ab: false }`.
+`build_incoming_blend_spec`: finds preceding clip_a + its transition → **direct time guard**: `if state.current_time >= clip_b.start_time + half_d { return None; }` (do NOT use `active_transition_at` as guard — has the pair-loop `?` bug) → `PlaybackTransitionSpec { clip_b_* fields carry clip_a tail decoder (clip_a.source_offset + clip_a.duration − D/2), blend_start_ts = clip_b.source_offset, alpha_start: 0.5, invert_ab: true }`.
+`tick()` scrub: L1 nearest bucket (0ms), L2 exact decode every drag px, L2b coarse 2s prefetch, L3 precise 150ms idle. In L2, if `active_transition_at` returns Some → `request_transition_frame`; else → `request_frame`.
+`frame_bucket_cache` eviction — exactly 3 sites:
+1. Scrub clip change: `retain(|(id,_),_| *id != prev_id)`
+2. Playback stop (`just_stopped`): `clear()`
+3. Playhead in empty space: `retain` against `last_frame_req.prev_id`
 
-**`modules/library.rs`** — `LibraryModule { multi_selection: HashSet<Uuid> }`. **Not a unit struct — init with `LibraryModule::new()` in a `let` before struct literal** (parser misreads `TypeName::method()` in struct literal position). Card grid, multi-select, drag-to-timeline, right-click menu. Grid uses manual `chunks(cols)+ui.horizontal()` per row — **do NOT use `horizontal_wrapped` or `egui::Grid` inside `ScrollArea::vertical()`** (unbounded width measurement pass, never wraps). `multi_selection` is UI-only, not serialized. `visible_ids: HashSet<Uuid>` drives progressive probe dispatch (visible clips probe first).
+**`modules/timeline.rs`** — `{ transition_popup, transition_popup_just_opened, vol_popup, vol_popup_just_opened, last_scrub_emitted_time: f64 }`. Transition badges: `kind()!=Cut` (not Crossfade-specific), skip `track_row%2==1`. Popup fully registry-driven. Volume popup: dB readout, vertical slider −60..+6 dB. `draw_waveform()` scales peaks by `clip.volume`. Scrub dedup: `|t-last|<1/30s` skips emit. `fit_label(text,max_px)` from `helpers/format.rs` (6.5px/char heuristic).
 
-**`modules/preview_module.rs`** — `current_frame: Option<TextureHandle>` set by app.rs pre-`ui()`. Renders frame → thumbnail → name+spinner. Transport bar, volume slider, timecode via `format_time`.
+**`modules/audio_module.rs`** — `{ exhausted: HashSet<Uuid> }`. `tick()` only. Top of every playing tick: diff `audio_sinks.keys()` vs timeline IDs, drop stale (handles undo during playback). `exhausted` cleared whenever `audio_sinks` cleared.
 
-**`modules/timeline.rs`** — `TimelineModule { transition_popup, transition_popup_just_opened, vol_popup, vol_popup_just_opened, last_scrub_emitted_time: f64 }`.
-Timeline: ruler, 4 lanes (V1/A1/V2/A2), clip blocks (thumbnail strips + waveforms), playhead.
-DnD: reads `DND_PAYLOAD`, clears if no pointer button down.
-**Transition badges**: `has_transition = kind()!=Cut` (not Crossfade-specific). Badge icon from `registry().get(kind).icon()`. Popup is **fully registry-driven**: button row = `for entry in registered()` loop; Cut always first as hardcoded remove action. Duration slider shows for any non-Cut; calls `entry.build(dur)` — **never constructs `TransitionType` variants directly**. `_just_opened` flag suppresses same-frame close for both popups.
-**Volume popup**: speaker badge → floating Area 64×150px. dB readout (`allocate_ui` 64×13, clamped min/max-width so box doesn't resize), vertical slider (−60 to +6 dB, `add_sized([22,110])`), "0 dB" label. `SetClipVolume` on change.
-`draw_waveform()` scales peaks by `clip.volume`.
-Clip type detection: `is_extracted_audio_clip(clip)`.
-**Scrub dedup**: `last_scrub_emitted_time` skips emit if `|t-last|<1/30s`; `drag_started`/`clicked` always emit.
-Clip name labels: `fit_label(text, max_px)` at bottom of file (6.5px/char heuristic) — **do NOT use `layout_no_wrap`/`glyph_width`, they need `&mut Fonts`**.
+**`modules/export_module.rs`** — `{ filename, quality: QualityPreset, fps, export_aspect, clear_confirm_at }`. Quality = short-side px. Two-stage Reset (5s countdown). Three states: Idle / Encoding (progress + Stop) / Done (green, 5s auto-dismiss) / Error.
 
-**`modules/export_module.rs`** — `{ filename, quality: QualityPreset, fps, export_aspect, clear_confirm_at }`. Quality = short-side px (480/720/1080/1440/2160), dims rounded to even. `is_encoding` computed once at top of `ui()`. Header: label left, two-stage **⊘ Reset** right (`clear_confirm_at` arms 5s countdown as amber `"⚠ Xs?"`, second click fires `ClearProject`, disabled during encode). Three states: Idle / Encoding (progress bar + Stop) / Done (green banner, 5s auto-dismiss via `ui.memory` temp key) / Error.
+**`modules/preview_module.rs`** — `current_frame: Option<TextureHandle>` set by app.rs pre-`ui()`. UV crop helper `crop_uv_rect` for center-crop to project AR. Transport bar with custom-painted buttons.
 
-**`modules/audio_module.rs`** — `{ exhausted: HashSet<Uuid> }`. `tick()` only. Manages rodio Sinks. **Top of every playing tick: diff `audio_sinks.keys()` vs current timeline IDs, drop stale** (handles undo during playback). `exhausted` prevents `File::open` per-tick on short WAVs — **cleared whenever `audio_sinks` is cleared** (playhead set, stop, undo, ClearProject) to avoid blocking re-added clips.
+---
 
-**`modules/video_module.rs`** — Unit struct. `tick()` + `poll_playback()`. `active_media_id()` static.
-`poll_playback()`: PTS-gated single-slot → `pending_pb_frame` → `frame_cache` when `current_time >= frame.pts` (±1 frame, not older than 3s). `request_repaint()` after promotion is non-redundant (background thread, not input event). **Clip-transition eviction at top before any other logic** (before UI reads `frame_cache`).
-`tick()`: playback → restart decode on clip change. Scrub → L1 nearest bucket (0ms), L2 exact-ts every drag px, L2b coarse 2s prefetch, L3 precise frame 150ms idle debounce. Scrub suppressed during playback. Both paths use `clip_at_time(state,...)`.
-**`frame_bucket_cache` eviction** — 3 sites, all via `retain` or `clear`, no external crates:
-1. Scrub clip change (`prev_id != clip.media_id`) — `retain(|(id,_),_| *id != prev_id)`
-2. Playback stop (`just_stopped`) — `frame_bucket_cache.clear()`
-3. Playhead moves to empty space (`current_clip` is None) — `retain` against `last_frame_req.prev_id`
-Never add a 4th eviction site without updating this list.
+## Architecture Invariants
+
+- Modules: `&ProjectState` read-only + emit `EditorCommand` only.
+- `ingest_media_results()` sole translation layer. Drain `scrub_rx` before `rx` always.
+- Audio: `audio_module.rs::tick()` only. No rodio sinks elsewhere.
+- Scrub/playback decode: `video_module.rs` only. No frame decode logic in app.rs.
+- Encode state: `ProjectState` `#[serde(skip)]`. Armed in `begin_render`. Updated in `ingest_media_results`. Zeroed by `ClearEncodeStatus` only.
+- `CancelEncode` sets AtomicBool only. State clears via `EncodeError{msg:"cancelled"}` through normal channel.
+- Playback: PTS-gated `pending_pb_frame`. One frame promoted per tick. Never drain full `pb_rx` in one tick.
+- `stable_dt` master clock. `current_time += stable_dt`. Never advance from frame timestamps.
+- Probe semaphore (max 4) gates duration+thumbnail only. Waveform+audio run after `drop(_guard)`.
+- `frame_bucket_cache` byte-capped. **Always via `insert_bucket_frame`** — never write directly. Evicted at exactly 3 sites in `video_module.rs::tick()`.
+- DnD: `DND_PAYLOAD` written on drag start only. Cleared by TimelineModule on drop or no pointer down.
+- PTS comparisons always in seconds. Raw PTS only for seek target calc.
+- All seeks via `helpers::seek::seek_to_secs`. Never `ictx.seek()` directly.
+- **Never use project AR to size decode output.** Source native AR always. Consumers crop themselves.
+- **Never pass `crop_y` as `srcSliceY`.** Pre-advance data ptrs, pass 0.
+- **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with` for MP4.** Both encoders.
+- **Fetch `ost_audio_tb` after `write_header`.**
+- **`VideoFrame::new(...)` not `VideoFrame::empty()` as sws_scale dst.**
+- **`opts.set("g", fps)` for NLE-friendly GOP.**
+- **SwsContext in `probe.rs` built lazily from first decoded frame.**
+- **Registry is UI source of truth for transitions.** Never match specific `TransitionKind` variants in timeline.rs rendering. UI always calls `entry.build(dur)`.
+- **`TransitionType` is a struct, not an enum.** Access `t.kind`, `t.duration_secs` directly.
+- **`TransitionKind` generated by `declare_transitions!`.** Never edit manually.
+- **`TransitionKind` variants serialized — never rename/remove without migration.**
+- **`LibraryModule` not a unit struct.** `let library = LibraryModule::new();` before struct literal.
+- `ClearProject` 8-step order is load-bearing.
+- `active_transition_at` uses `match...continue` not `?` in pair loop — `?` aborts entire search on first pair with no transition (breaks 3+ clip projects).
+- `build_incoming_blend_spec` uses direct time-range guard (`current_time >= clip_b.start_time + half_d`), NOT `active_transition_at` as guard.
+- **`egui::Options::reduce_texture_memory` — do not enable.** Causes +20 MB idle overhead. Only beneficial for no-re-upload texture workloads; scrub/playback re-uploads every frame.
+
+---
+
+## Frame Lifetime (exec order per tick)
+```
+poll_media() → poll_playback() [frame_cache WRITES, clip-transition eviction]
+update() → preview.current_frame = frame_cache.get() [READ]
+         → panels render
+         → tick() [more evictions, one frame late]
+         → current_time += stable_dt
+```
+Cache roles: `frame_cache` = keyed by media_id, one entry (currently shown). `frame_bucket_cache` = `(media_id,bucket)`, rolling, byte-capped. `pending_pb_frame` = single-slot between pb channel and frame_cache.
+
+---
+
+## Transition Zone (centered on cut)
+
+For a transition of duration D between clip_a and clip_b:
+- **Zone**: `[clip_a_end − D/2, clip_a_end + D/2)`
+- **clip_a half** (playhead in clip_a's timeline range): pb thread starts with `build_blend_spec` → `blend_start_ts = clip_a.source_offset + clip_a.duration − D/2`, `alpha_start=0.0`, `invert_ab=false`. Secondary decoder = clip_b from `clip_b.source_offset`.
+- **clip_b half** (playhead crosses into clip_b's timeline range): `clip_changed` fires in tick() → `build_incoming_blend_spec` → guard `current_time < clip_b.start_time + D/2` → `blend_start_ts = clip_b.source_offset`, `alpha_start=0.5`, `invert_ab=true`. Secondary decoder = clip_a tail from `clip_a.source_offset + clip_a.duration − D/2`.
+- Alpha over full zone: `alpha = alpha_start + local_t / D`, 0.0→1.0 across D seconds.
+- `invert_ab=true` → worker calls `blend_rgba_transition(data_b[secondary], data[primary], ...)` so clip_a is always "a" and clip_b is always "b" regardless of which is the main decoder.
+
+---
+
+## Debugging History
+
+**Ghost frame at clip boundary** — stale scrub frame shown for one tick. Fix: clip-transition eviction at top of `poll_playback()` before all other logic.
+
+**3× speed playback** — draining full pb_rx in one tick. Fix: `pending_pb_frame` single-slot.
+
+**`horizontal_wrapped`/Grid refuses to wrap in ScrollArea** — ScrollArea gives unbounded horizontal space. Fix: `egui::Grid::new(...).num_columns(N)` — wraps by column index. Transitions popup uses `num_columns(5)` with `col` counter.
+
+**Export MP4 tail freeze** — three causes: wrong PTS units, `out_frame_idx` gated on frame_written, no audio ceiling. Fix: capture `frame_pts` before `rescale_ts`, unconditional `out_frame_idx+=1` after `send_frame`, `pts_secs>=clip_end` guards in demuxer and audio-decoder flush.
+
+**Video freezes after seek then jumps** — `burn_to_pts` ~600ms; first frame rejected by too-tight lower bound. Fix: 3.0s lower bound in `poll_playback()` Step 3.
+
+**Waveform blank after undo of Extract Audio** — snapshot predates probe return. Fix: `restore_snapshot()` re-queues probes for empty `waveform_peaks`.
+
+**Phantom audio after undo during playback** — Sink not dropped on undo. Fix: diff `audio_sinks` vs timeline IDs at top of every playing tick.
+
+**Extracted audio duplicating in export** — A-row clips built into ClipSpec. Fix: filter `is_extracted_audio_clip`. For `audio_muted` V-row, use `linked_audio_clip` volume.
+
+**Exported clip fails re-import (AVERROR_INVALIDDATA)** — missing `AV_CODEC_FLAG_GLOBAL_HEADER`. Fix: set flag before `open_as_with` on both encoders.
+
+**Exported thumbnail/duration not loading** — SwsContext built upfront; AVCC reports coded dims, Annex-B has `AV_PIX_FMT_NONE`. Fix: lazy SwsContext from first decoded frame in `probe.rs`.
+
+**Choppy scrub on re-imported exports** — default `keyint=250` (~8s GOP). Fix: `opts.set("g", fps)`.
+
+**Windows EPERM on seek** — `avformat_seek_file` returns EPERM with `max_ts=0`. Fix: `seek_to_secs` skips if `ts<=0.0`.
+
+**CropScaler EINVAL on portrait→landscape** — passing `srcSliceY=crop_y`. Fix: pre-advance data ptrs, pass `srcSliceY=0`.
+
+**Mixed-AR clips stretched** — decode used project AR. Fix: `out_h=640*src_h/src_w` always.
+
+**Dip-to-black showed green** — YUV420P black needs U=V=128, not 0. Fix: blend Y toward 0, U/V toward 128.
+
+**Transition fires D seconds early (full zone inside clip_a)** — zone was `[clip_a_end−D, clip_a_end)`. Fix: center on cut → `[clip_a_end−D/2, clip_a_end+D/2)`. Update `blend_start_ts` to use `D/2`.
+
+**Transition second half hard-cuts** — `clip_changed` fires on clip_b start → `start_playback` replaces blend. Fix: `build_incoming_blend_spec` with `alpha_start=0.5, invert_ab=true`; direct time guard instead of `active_transition_at` guard.
+
+**`active_transition_at` returns None with 3+ clips** — `?` operator on transition find exits entire function at first pair with no transition. Fix: `match...{ None => continue }` in pair loop.
 
 ---
 
 ## Adding a Feature
-
 1. `EditorCommand` variant in `commands.rs`
 2. `modules/mymodule.rs` impl `EditorModule`
 3. `pub mod mymodule` in `modules/mod.rs`
@@ -154,357 +217,41 @@ Never add a 4th eviction site without updating this list.
 7. New `MediaResult` variants → `media_types.rs` + `ingest_media_results()` only
 
 ## Adding a Transition
-
-1. Create `transitions/myname.rs`, impl `VideoTransition` (5 methods: `kind`, `label`, `icon`, `build`, `apply`). `build` must return `TransitionType::new(self.kind(), duration_secs)`.
-2. Add ONE line to `declare_transitions!` in `mod.rs`: `myname::MyTransition => MyKind,`
-
-That's it. `TransitionKind` variant, registry, badge, tooltip, popup button, slider, encode, preview — all auto. Zero other file changes needed.
-
----
-
-## Architecture Invariants
-
-- Modules: `&ProjectState` read-only + emit `EditorCommand` only. Never mutate state directly.
-- `ingest_media_results()` sole translation layer. Drain `scrub_rx` before `rx` always.
-- `preview.current_frame` set by app.rs pre-`ui()`. `thumbnail_cache` write-only from `ingest_media_results`.
-- Audio: `audio_module.rs::tick()` only. No rodio sinks elsewhere.
-- Scrub/playback: `video_module.rs` only. No frame decode logic in app.rs.
-- Encode state in `ProjectState` `#[serde(skip)]`. Armed in `begin_render`. Updated in `ingest_media_results`. Zeroed by `ClearEncodeStatus`. Nowhere else.
-- `CancelEncode` sets AtomicBool only. State clears via `EncodeError{msg:"cancelled"}` through normal channel.
-- `last_frame_req` = `Option<(Uuid, f64)>` exact ts, not bucket index. Fires on every drag px.
-- Playback: PTS-gated `pending_pb_frame`. One frame promoted per tick. Never drain full `pb_rx` in one tick.
-- `stable_dt` master clock. `current_time += stable_dt`. Never advance from frame timestamps.
-- Probe semaphore (max 4) gates duration+thumbnail only. Waveform+audio after `drop(_guard)`.
-- `frame_bucket_cache` byte-capped. **Always via `insert_bucket_frame`** — never write directly. Evicts 32 furthest O(N). **Evicted at 3 sites in `video_module.rs::tick()`** — clip change, stop, empty space. See `video_module.rs` entry for details.
-- DnD: `DND_PAYLOAD` written by LibraryModule on drag, cleared by TimelineModule on drop or when no pointer button down.
-- PTS comparisons in `decode.rs` always in seconds. Raw PTS only for seek target calc.
-- All seeks via `helpers::seek::seek_to_secs`. Never `ictx.seek()` directly.
-- **Never use project AR to size decode output.** Source native AR always. Both downstream consumers (preview UV crop, `CropScaler`) need undistorted source and crop themselves.
-- **Never pass `crop_y` as `srcSliceY` to sws_scale.** Pre-advance data ptrs, pass 0.
-- **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with` for MP4.** Both video and audio encoders.
-- **Fetch `ost_audio_tb` after `write_header`.**
-- **`VideoFrame::new(...)` not `VideoFrame::empty()` as sws_scale dst.**
-- **`opts.set("g", fps)` for NLE-friendly GOP.**
-- **SwsContext in `probe.rs` built lazily from first decoded frame.** Matched invariant with GLOBAL_HEADER.
-- **Registry is UI source of truth for transitions.** `timeline.rs` never matches specific `TransitionKind` variants for rendering. UI always calls `entry.build(dur)`, never constructs `TransitionType` directly.
-- **`TransitionType` is a struct, not an enum.** Fields: `kind: TransitionKind`, `duration_secs: f32`. Access as `t.kind` and `t.duration_secs` — no method calls. Constructors: `TransitionType::new(kind, secs)`, `TransitionType::cut()`. **Never add per-transition variants here.**
-- **`TransitionKind` is generated by `declare_transitions!`.** Never edit it manually. To add a variant, add a line to the macro.
-- **`TransitionKind` variants are serialized — never rename/remove without migration.**
-- **`LibraryModule` not a unit struct.** `let library = LibraryModule::new();` before struct literal.
-- `multi_selection` on `LibraryModule`, not `ProjectState`. Not serialized.
-- New temp file → `state.pending_audio_cleanup`. New thread → `MediaWorker::shutdown()`.
-- `ClearProject` 8-step order is load-bearing. See app.rs entry.
-- Stale sinks evicted at top of every playing tick in `audio_module.rs`.
-
----
-
-## Frame Lifetime
-
-Exec order per tick:
-```
-poll_media() → poll_playback() [frame_cache WRITES]
-update() → preview.current_frame = frame_cache.get() [READ]
-         → panels render
-         → tick() [more evictions, one frame late]
-         → current_time += stable_dt
-```
-
-Evictions that must fire before render → `poll_playback()`. Clip-transition eviction is in `poll_playback()` top for this reason.
-
-Cache roles:
-- `frame_cache`: keyed by `media_id`, one entry, currently shown texture.
-- `frame_bucket_cache`: `(media_id, bucket_index)`, rolling, byte-capped 192 MB.
-- `pending_pb_frame`: single-slot between pb channel and `frame_cache`.
-
----
-
-## Debugging History
-
-**Ghost frame at clip boundary during playback** — stale scrub frame in `frame_cache[new_clip.media_id]` shown for one tick because eviction was in `tick()` (one frame late). Fix: clip-transition eviction at top of `poll_playback()` before all other logic. If regresses: check eviction fires before `preview.current_frame` is set.
-
-**3× speed playback** — draining full `pb_rx` in one tick. Fix: `pending_pb_frame` single-slot, promote one frame/tick when PTS due.
-
-**`horizontal_wrapped`/auto-Grid refuses to wrap in `ScrollArea`** — `ScrollArea::vertical()` gives the inner Ui unbounded horizontal space during measurement; `horizontal_wrapped` and `Grid` without an explicit column count both conclude no wrap is needed. Fix: use `egui::Grid::new(...).num_columns(N)` — wraps by column index, not available width, so it works correctly inside a ScrollArea. **`horizontal_wrapped` and column-free `Grid` are broken in this context.** The transitions popup uses `Grid::new("transition_grid").num_columns(5)` with a `col` counter calling `ui.end_row()` every 5 items.
-
-**Export MP4 tail freeze (video shorter than audio)** — three causes: (1) `out_frame_idx` read from post-`rescale_ts` packet PTS (wrong units), (2) `out_frame_idx += 1` gated on `frame_written` (under-counted due to B-frame lookahead), (3) no audio ceiling in `encode_clip` so drain_fifo eagerly wrote 2s+ overrun before post-encode trim could catch it. Fixes: capture `frame_pts` before `rescale_ts`, unconditional `out_frame_idx += 1` after `send_frame` in decoder-flush, `pts_secs >= clip_end` guards in demuxer audio branch and audio-decoder flush. If regresses: check `out_frame_idx` units (must be frame-count/`1/fps`), check audio ceiling guards in both locations.
-
-**Video freezes after seek then jumps** — `burn_to_pts` takes 600ms+ on long GOPs; `current_time` advances via `stable_dt`; first frame PTS T arrives but `local_t` is `T+burn_time`; old 3.0s lower-bound too tight. Fix: 3.0s lower bound in `poll_playback()` Step 3. If regresses: check `too_old` guard threshold.
-
-**Waveform blank after undo of Extract Audio** — snapshot taken before probe returned → `waveform_peaks=[]`. Fix: `restore_snapshot()` re-queues probes for clips with empty peaks. If regresses: check re-queue happens after `pending_probes` is moved from live state.
-
-**Phantom audio after undo during playback** — rodio Sink keyed by clip UUID not dropped when clip removed via undo. Fix: diff `audio_sinks.keys()` vs timeline IDs at top of every playing tick. If regresses: confirm eviction runs unconditionally before `active_clip` search.
-
-**Extracted audio duplicating in export** — `begin_render()` built `ClipSpec` for every clip including A-row extracted clips (same source/offset/duration as V-row → double video+audio). Fix: filter `is_extracted_audio_clip`. For `audio_muted` V-row, use `linked_audio_clip` volume. If regresses: check A-row filter and effective_volume link traversal.
-
-**Exported clip fails re-import (`AVERROR_INVALIDDATA`)** — missing `AV_CODEC_FLAG_GLOBAL_HEADER` → empty `avcC` box. Fix: set flag before `open_as_with` on both encoders. Matched pair with lazy `SwsContext` in probe.rs.
-
-**Exported clip thumbnail/duration not loading on re-import** — `SwsContext` built upfront from `decoder.format()`/dims: AVCC reports coded dims (1088 not 1080), Annex-B has `AV_PIX_FMT_NONE`. Fix: lazy SwsContext from first decoded frame in `probe.rs`. Matched pair with GLOBAL_HEADER encoder fix.
-
-**Choppy scrub on re-imported exports** — libx264 default `keyint=250` (~8s GOP), scrub burns 8× more frames per seek. Fix: `opts.set("g", fps)` → 1 keyframe/sec. If regresses: check `g` option and `spec.fps` is integer fps.
-
-**Windows EPERM on seek** — `avformat_seek_file` returns EPERM on Windows with `max_ts=0` on fresh ctx. Fix: `seek_to_secs` skips seek if `ts<=0.0`, soft-fails on EPERM. Never call `ictx.seek()` directly.
-
-**`CropScaler::run` EINVAL (-22) on portrait→landscape** — passing `srcSliceY=crop_y` makes `crop_y+crop_h>crop_h`. Fix: pre-advance data ptrs to `crop_y` row, pass `srcSliceY=0`. Only manifests when `crop_y>0` (portrait source, landscape output).
-
-**Mixed-AR clips stretched** — decode used project AR (`out_h = 640/aspect`), pre-distorting source. Both `crop_uv_rect` and `CropScaler` received already-distorted input. Fix: `out_h = 640*src_h/src_w`, source native AR always. If regresses: check `decode.rs` `open()` and `decode_frame()` use `src_h/src_w`, not project aspect.
-
----
-
-## Resource Lifecycle
-
-- **TextureHandle** (all caches): dropping = GPU free. `frame_bucket_cache` write only via `insert_bucket_frame` to keep byte budget accurate. Evicted at 3 sites in `tick()` — TextureHandles dropped immediately on eviction, GPU memory returns to baseline within that tick.
-- **Audio temp WAVs** (`$TEMP/velocut_audio_{uuid}.wav`): created by `audio.rs::extract_audio`, queued in `state.pending_audio_cleanup`, deleted by `poll_media()`. Must be queued before library wipe in `ClearProject`.
-- **Rodio sinks**: `audio_module.rs::tick()` only.
-- **`LiveDecoder` (FFmpeg ictx + decoder)**: dropped when `start_playback` replaces it on pb thread.
-- **Encode cancel flags**: inserted on `start_encode`, removed by encode thread on exit (finish/error/cancel). `shutdown()` sets all + clears map.
-- **Probe semaphore**: RAII guard. No early return inside semaphore scope without explicit `drop(_guard)`.
-
----
-
-## Known Future Work
-
-- **Lower-res bucket frames** (high impact): store at ≤640px wide (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB budget. Full-res only on L3 precise frame. Needs downscale pass in scrub decode + resolution flag on bucket entry.
-- **Velocity-scaled L2b prefetch**: currently fixed 2s window. Scale to 8–10s on fast fling, 1s backward. Track scrub velocity in `timeline.rs` (delta time/wall-clock, smoothed 3–5 frames).
-- **Hover prefetch**: emit `RequestScrubPrefetch(hover_time)` at L2b priority on hover before drag starts. Same code path, different trigger.
-- **Hover cursor frame preview**: small thumbnail above cursor on hover (not dragging, not playing). Read-only lookup in `frame_bucket_cache` by `(media_id, nearest_bucket_index)`. Pass `&ctx.frame_bucket_cache` read-only into `timeline.rs::ui()`.
-- **`thumbnail_cache` eviction**: evicted on `DeleteLibraryClip` (P10, done). Not evicted on `ClearProject` — `clear_all()` handles that. Fine for typical projects. No action needed unless very large clip counts (100+) show memory pressure.
-- **`egui::Options::reduce_texture_memory`**: tried and reverted — caused +20 MB idle overhead. Do not re-enable without measuring first.
+1. Create `transitions/myname.rs`, impl `VideoTransition` (5 methods). `build` returns `TransitionType::new(self.kind(), duration_secs)`.
+2. Add ONE line to `declare_transitions!`: `myname::MyTransition => MyKind,`
+All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode, preview.
 
 ---
 
 ## Helpers Quick Reference
-
-Use these, never inline:
-- Timeline/library lookups: `crate::helpers::clip_query::{timeline_clip, library_entry_for, clip_at_time, selected_timeline_clip, selected_clip_library_entry, is_extracted_audio_clip, linked_audio_clip}` (`library_clip` is an alias for `library_entry_for` — use `library_entry_for`)
+- Clip lookups: `crate::helpers::clip_query::{timeline_clip, library_entry_for, clip_at_time, selected_timeline_clip, is_extracted_audio_clip, linked_audio_clip, active_audio_clip, active_transition_at, playhead_source_timestamp}`
 - Time display: `velocut_core::helpers::time::{format_time, format_duration}`
 - AR: `velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label}`
-- String truncation: `crate::helpers::format::truncate`
+- String: `crate::helpers::format::{truncate, fit_label}`
 - Seeks: `crate::helpers::seek::seek_to_secs`
-- YUV pack/unpack: `crate::helpers::yuv::{extract_yuv, write_yuv}` (`blend_yuv_frame` available but delegated to `VideoTransition::apply()`)
-- Transition UI: `velocut_core::transitions::{registered, registry}` (`registered()` = Vec for UI iteration, `registry()` = HashMap for O(1) encode lookup)
-- Transition math: `transitions::helpers::{frame_alpha, blend_byte, blend_buffers, alloc_frame, clamp01, lerp}` — easing: `ease_in_out`, `ease_in`, `ease_out`, `ease_in_out_cubic`, `ease_in_out_sine`, `linear`, `ease_out_bounce`, `ease_out_elastic` — plane layout: `split_planes`, `chroma_dims`, `y_len`, `uv_len`, `u_offset`, `v_offset` — spatial: `norm_x`, `norm_y`, `norm_xy`, `center_dist`, `wipe_alpha` — sampling: `sample_plane`, `sample_plane_clamped`
----
-
-## Session Log — Feb 2026
-
-### Bugs Fixed This Session
-
-**Audio extraction was purely visual** — `ExtractAudioTrack` in `app.rs` called `state.extract_audio_track()` and discarded the return value. The A-row clip got `media_id = video_clip.media_id`, so it showed video thumbnails and played video. Fix: after state mutation, create a dedicated `LibraryClip` typed `Audio` (reusing the already-extracted WAV from `lib.audio_path`), push it to the library, and rewire `tc.media_id` on the A-row clip to the new audio entry. Files: `app.rs`.
-
-**Deleting video clip left stale frame in preview** — `frame_cache` and `frame_bucket_cache` were never evicted on `DeleteTimelineClip`. Fix: capture `deleted_media_id` before `retain()`, check if any remaining clip still references it, and if not: remove from both caches and set `preview.current_frame = None`. Files: `app.rs`.
-
-**Transition badges appearing on audio rows** — `timeline.rs` transition badge loop ran for all 4 track rows. Fix: `if track_row % 2 == 1 { continue; }` — one line, skips A1(1) and A2(3). Files: `timeline.rs`.
-
-**Dip-to-black transition showed green instead of black** — YUV420P black is Y=0, U=128, V=128. The original code blended all bytes toward 0, sending chroma to 0 which is fully saturated green. Fix: added `y_len` import, split luma vs chroma ranges using `luma_len = y_len(width, height) as usize`, blend Y toward 0 and U/V toward 128 via `blend_to_black` / `blend_from_black` closures. Also renamed `_width`/`_height` params to `width`/`height` (were unused before the fix). Files: `dip_to_black.rs`.
+- YUV: `crate::helpers::yuv::{extract_yuv, write_yuv}`
+- Transition UI: `velocut_core::transitions::{registered, registry}`
+- Transition math: `transitions::helpers::{frame_alpha, blend_byte, blend_buffers, alloc_frame, ease_in_out, ease_in_out_cubic, ease_in_out_sine, split_planes, chroma_dims, norm_xy, center_dist, wipe_alpha, sample_plane, sample_plane_clamped}`
+- Logging: `crate::helpers::log::vlog` / `velocut_log!()` macro
 
 ---
 
-## Current App State (Feb 2026)
+## Known Future Work
+- **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
+- **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
+- **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
+- **[P16] `SaveFrameToDisk` UUID lookup**: currently O(N) PathBuf comparison. Carry Uuid in command variant. Low priority (cold path).
+- **Move `begin_render` to `export_module`**: blocked until `EditorModule::ui()` gains `&mut AppContext` or command-callback.
 
-- Workspace: `velocut-core` / `velocut-media` / `velocut-ui`, ~10K lines total
-- UI: 4-panel layout (library left, preview center, export right, timeline bottom), custom title bar, no-decoration window
+---
+
+## Current State (Feb 2026)
+- ~10K lines, 4-panel layout (library / preview / export / timeline), custom title bar
 - Transitions: Crossfade, Dip-to-Black, Iris, Wipe, Push — registry-driven, zero hardcoding
-- Audio extraction: fully functional — dedicated audio library entry, correct WAV playback, no video thumbnails on A-row
-- Undo/redo: 50-snapshot depth, ProjectState clone-based
+- Transition preview: centered zone, both halves blend correctly (clip_a fades out, clip_b fades in)
+- Audio extraction: dedicated audio library entry, correct WAV playback
+- Undo/redo: 50-snapshot, VecDeque
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
-- Scrub: 3-layer (L1 cached bucket, L2 exact decode, L3 idle precise), dedicated scrub_rx channel
-- Playback: PTS-gated single-slot, stable_dt clock master
-- Memory: ~90 MB idle, ~120 MB peak active, returns to baseline on stop. `frame_bucket_cache` eviction at 3 sites. No leaks observed in normal use.
-
----
-
-## UI Crate Improvement Backlog (Prioritized)
-
-### 🔴 HIGH — Performance / Correctness
-
-**[P1] Replace `sort_by(partial_cmp().unwrap())` with `sort_unstable_by(f64::total_cmp)`**
-- Files: `app.rs:568`, `app.rs:647`, `timeline.rs:934`
-- `partial_cmp` returns `None` for NaN — `unwrap()` panics if any `start_time` is NaN (possible after malformed project load). `sort_unstable_by` avoids the stable-sort allocation, `f64::total_cmp` is panic-free.
-- Fix: `clips.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));`
-
-**[P2] Replace `undo_stack.remove(0)` with `VecDeque`**
-- File: `app.rs`
-- `Vec::remove(0)` shifts all 50 entries every time the cap is hit — O(N) memcpy. Use `VecDeque<ProjectState>` with `pop_front()`. Both stacks. Change type, change `push` → `push_back`, `pop` → `pop_back`, cap check uses `len()` same as before.
-
-**[P3] Adopt `clip_query` helpers in `video_module.rs` and `audio_module.rs`**
-- `video_module.rs` has 4 inline `state.library.iter().find(|m| m.id == clip.media_id)` calls (lines 181, 242, 251, 264) — these run every tick at 60fps. Replace with `clip_query::library_entry_for(state, clip)`.
-- `audio_module.rs` has 2 inline finds (lines 172, 180). Line 172 is the two-chain active-clip search — this could become a new helper `clip_query::active_audio_clip(state, t)` (see P7).
-- `context.rs:ingest_video_frame` does `state.timeline.iter().find(|c| c.media_id == id)` for bucket fallback — use `clip_query::clip_at_time` or a new `clip_for_media_id` helper.
-
-**[P4] Fix `MAX_FRAME_CACHE_BYTES` comment/value mismatch**
-- File: `context.rs:30`
-- Comment says "192 MB" but constant is `256 * 1024 * 1024`. Either update the constant to `192 * 1024 * 1024` or update the comment. The SPEEDRUNAI.md also says 192 MB. Decide on one value and sync all three.
-
-**[P5] Batch `request_repaint()` calls in `ingest_media_results`**
-- File: `context.rs`
-- Currently called after `Duration`, `Thumbnail`, `Waveform`, `FrameSaved`, `VideoFrame`, and each encode result. `VideoSize` doesn't call it but probably should. More importantly, draining 10 results in one frame calls it up to 10 times — egui deduplicates these but it's still noise. Call `ctx.request_repaint()` once at the end of `ingest_media_results` if any result was processed, using a `mut any_repaint = false` flag.
-
-### 🟡 MEDIUM — Architecture / Maintainability
-
-**[P6] Extract `AspectRatio::from_ratio(f32) -> AspectRatio` into `state.rs`**
-- File: `app.rs:265–283`
-- 18-line if-else chain with magic float tolerances (0.05, 0.10) embedded inside `process_command`. This logic belongs in `state.rs` next to `AspectRatio` and `active_video_ratio()`. A `from_ratio` associated fn lets the `AddToTimeline` handler become 3 lines and the logic is testable.
-
-**[P7] Add `clip_query::active_audio_clip(state, t)` helper**
-- File: `audio_module.rs:162–179`
-- The two-chain A-row-first-then-V-row search is the canonical "what clip provides audio at time t" query. It's currently inlined in `audio_module.rs` and would be useful in other places. Move to `clip_query.rs`, document the priority rule (A-row over V-row), and use it from `audio_module`.
-
-**[P8] Split `EditorModule::ui()` trait signature — remove `_thumb_cache` from modules that don't use it**
-- Files: `export_module.rs`, `audio_module.rs`, `video_module.rs` (all use `_thumb_cache` — prefixed, unused)
-- The trait forces every module to accept `&mut ThumbnailCache` even if it never reads it. Options: (a) make `thumb_cache` an `Option<&mut ThumbnailCache>` — breaking; (b) add a separate `fn uses_thumbnail_cache() -> bool` default false; (c) keep as-is since Rust elides the unused borrow at compile time. Lowest-risk: (c) document that `_thumb_cache` params are intentional and linted away. Medium-effort: add a `Context` struct passed to `ui()` so the signature can evolve without breaking every module.
-
-**[P9] Move `begin_render()` logic out of `app.rs`**
-- File: `app.rs:620–730`
-- `begin_render` is 110 lines in app.rs: opens a file dialog, resolves `ClipSpec`s, maps transitions, starts the encode. This is export logic and belongs in `export_module.rs` or a new `render_builder.rs`. The blocking `FileDialog::save_file()` is fine in `process_command` (runs after UI pass) but the `ClipSpec` construction and transition mapping should be a pure function. Prerequisite: the save dialog note in `poll_media` (line ~715) explains why it lives in app.rs — same issue applies here. Resolved together when `EditorModule::ui()` gains `&mut AppContext` or a command-callback approach.
-
-**[P10] Evict `thumbnail_cache` entries for deleted library clips**
-- File: `context.rs` / `app.rs`
-- `CacheContext::clear_all()` drops everything but clip deletion (`DeleteLibraryClip`) never evicts just that clip's thumbnail. For large projects (100+ imports) this leaks GPU textures indefinitely. Fix: in `DeleteLibraryClip` handler, call `self.context.cache.thumbnail_cache.remove(&id)` after `library.retain()`.
-
-**[P11] `SetCrossfadeDuration` clones entire timeline**
-- File: `app.rs:562`
-- `let mut sorted = self.state.timeline.clone()` to find adjacent pairs. Could collect `&TimelineClip` refs and sort those (stack-allocation of pointers, no data copy), or sort by index. For typical project sizes (~50 clips) the clone is under 10μs but it's still unnecessary.
-
-**[P12] `DND_PAYLOAD` written twice per drag frame**
-- File: `library.rs`
-- `is_dragging` branch (line ~172) writes `DND_PAYLOAD`, then `drag_started_id` branch (line ~235) writes it again. The `is_dragging` write is correct (continuous); the `drag_started` write is redundant since `is_dragging` fires on the very next frame. Consolidate to one write site.
-
-### 🟢 LOW — Polish / Future
-
-**[P13] Replace `eprintln!` in GUI subsystem mode with consistent logging**
-- `audio_module.rs` already routes through `audio_log()` (file-based, works without console). `app.rs` and `context.rs` use raw `eprintln!` which is swallowed on double-click launch. Either route everything through `audio_log` (rename to `velocut_log` or use the `log` crate + a file appender) or at minimum convert the `[export]`, `[media]`, and `[app]` eprintlns to file-log.
-
-**[P14] Move `fit_label` to `helpers/format.rs`**
-- File: `timeline.rs` (bottom)
-- Currently private. SPEEDRUNAI already notes this. Move when a second callsite appears. If the 6.5px/char heuristic is good enough, expose it now so library.rs card labels can use it too (currently library uses egui's built-in `Label::truncate()`).
-
-**[P15] `VeloCutApp::update()` decomposition**
-- File: `app.rs:790–960`
-- `update()` is ~170 lines. Extract `fn render_panels(&mut self, ctx)` (the 5 panel show calls) and `fn tick_modules(&mut self, ctx)` (the VideoModule + audio tick + time advance). Makes the frame loop readable at a glance.
-
-**[P16] `SaveFrameToDisk` looks up by path not UUID**
-- File: `app.rs:611`
-- `self.state.library.iter().find(|l| l.path == path)` compares `PathBuf` values (heap allocation per comparison). Should carry the `Uuid` in the command and look up by ID. Low priority since this code path fires only on explicit frame-export, not per-frame.
-
----
-
-## Session Log — Feb 2026 (cont.) — Memory Management Pass
-
-### Investigation
-
-Identified two structural memory issues via code review:
-
-1. **`frame_bucket_cache` was unbounded** — `HashMap<(Uuid,u32), (TextureHandle,usize)>` accumulated one entry per ¼s scrubbed, forever. Each entry holds a live `TextureHandle` keeping GPU memory allocated. Scrubbing through a long clip or switching clips repeatedly caused permanent memory growth.
-
-2. **`ThumbnailCache` has no eviction** — still true, noted but acceptable for typical project sizes. `DeleteLibraryClip` was already fixed to call `thumbnail_cache.remove` (P10 from prior session).
-
-### What Was Tried and Reverted
-
-**`egui_extras` `reduce_texture_memory = true`** (one-line flag in `main.rs`) — Drops CPU-side RGBA data after GPU upload. Reverted: caused +20 MB at idle compared to baseline. egui's bookkeeping overhead without the CPU copy exceeded the savings. **Do not re-enable without benchmarking.** This flag is only beneficial if you're texture-thrashing with no re-upload; the scrub/playback workload does re-upload on every new frame.
-
-### Fix Applied — `frame_bucket_cache` eviction (3 sites in `video_module.rs`)
-
-No new crates. Pure `HashMap::retain` + `clear`:
-
-**Site 1 — Scrub clip change** (inside `if prev_id != clip.media_id`):
-```rust
-ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
-```
-
-**Site 2 — Playback stop** (`just_stopped` block):
-```rust
-ctx.cache.frame_bucket_cache.clear();
-```
-
-**Site 3 — Playhead moves to empty space** (`current_clip` is None):
-```rust
-if let Some((prev_id, _)) = ctx.playback.last_frame_req {
-    ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
-}
-```
-
-### Memory Profile (Post-Fix, 6 clips library + 6 clips timeline)
-
-- **Idle baseline**: ~90 MB
-- **Peak during active scrub/playback**: ~120 MB
-- **After scrub stops / playback stops**: returns to ~90 MB
-
-The 30 MB delta is the legitimate working set (frame textures in flight). Memory now tracks actual workload — not a leak. Considered resolved.
-
-**Sub-500 MB total for a full video editor with real-time FFmpeg decode, GPU texture management, rodio audio, and egui UI is healthy.**
-
-### Updated File Index
-
-| File | Changed | Notes |
-|------|---------|-------|
-| `src/modules/video_module.rs` | This session | 3-site `frame_bucket_cache` eviction added |
-
----
-
-## Session Log — Feb 2026 (cont.) — Medium/Low Priority Pass
-
-### Items Completed This Session
-
-**[P6] `AspectRatio::from_ratio(f32)` added to `state.rs`**
-Moved the 18-line `if-else` chain with float tolerances (0.05/0.10) out of `app.rs::process_command(AddToTimeline)` into `impl AspectRatio { pub fn from_ratio(r: f32) -> Self }`. Handler now reads `AspectRatio::from_ratio(r)` — one line. Logic is now testable independently.
-
-**[P7] `clip_query::active_audio_clip(state, t)` added to `clip_query.rs`**
-Canonical "what clip provides audio at time t" query with A-row priority rule documented and implemented once. `audio_module.rs` two-chain inline search replaced with single `clip_query::active_audio_clip(state, t)` call. Future audio consumers use the same helper automatically.
-
-**[P8] `EditorModule` trait `thumb_cache` param documented in `modules/mod.rs`**
-Added doc comment explaining why every `ui()` impl receives `&mut ThumbnailCache` even when unused (uniformity, trivial dispatch). Points future maintainers toward a `UiContext` struct as the evolution path if the signature needs to grow.
-
-**[P9] `build_encode_plan` pure function extracted from `begin_render` in `app.rs`**
-`begin_render` was 100+ lines. The ClipSpec construction, filtered-timeline extraction, and transition index mapping are now in a free function `build_encode_plan(state, sorted: &[&TimelineClip]) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>)>`. Returns `None` on empty — caller logs and aborts. `begin_render` now owns only: dialog, sort, plan call, EncodeSpec assembly, state arming, worker dispatch.
-
-**[P10] Thumbnail evicted on `DeleteLibraryClip` in `app.rs`**
-`self.context.cache.thumbnail_cache.remove(&id)` added after `library.retain()`. Deleted clips no longer leak GPU texture memory for the session lifetime.
-
-**[P11] `SetCrossfadeDuration` no longer clones timeline data**
-`let mut sorted = self.state.timeline.clone()` → `let mut sorted: Vec<&TimelineClip> = self.state.timeline.iter().collect()`. Only pointers allocated, no clip data copied. Same fix applied to `begin_render` (was also cloning before the sort).
-
-**[P12] `DND_PAYLOAD` written once per drag in `library.rs`**
-Removed the write inside the `is_dragging` branch (fires every frame during drag). The canonical write in `drag_started_id` (fires on drag start) is the single correct site. Added comment explaining why the continuous write was redundant.
-
-**[P13] Unified logging via `helpers/log.rs` + `velocut_log!` macro**
-New `log.rs` in helpers: `pub fn vlog(msg: &str)` writes to `%TEMP%/velocut.log` with Unix timestamp. New `velocut_log!($($arg:tt)*)` macro formats like `eprintln!` and routes through `vlog`. `audio_module.rs` private `audio_log` replaced with `use crate::helpers::log::vlog as audio_log` — single log file now. `app.rs` and `context.rs` `eprintln!` calls migrated to `velocut_log!`. New file `helpers/mod.rs` updated with `pub mod log`.
-
-**[P14] `fit_label` moved to `helpers/format.rs`**
-`fit_label(text, max_px)` was a private fn at the bottom of `timeline.rs`. Moved to `format.rs` as `pub fn fit_label`, with doc comment and unit tests (short, zero-budget, truncated cases). `timeline.rs` updated to `use crate::helpers::format::{truncate, fit_label}` and private copy removed.
-
-**[P15] `update()` decomposed into `render_panels` + `tick_modules`**
-`update()` was ~170 lines. Extracted:
-- `fn render_panels(&mut self, ctx)` — title bar, 4 panels, encode modal
-- `fn tick_modules(&mut self, ctx)` — VideoModule::tick, audio tick, playback clock advance, encode repaint
-
-`update()` body is now ~50 lines: memory wipe guard, startup size check, drag-drop, poll_media, render_panels, command drain, tick_modules.
-
-**[P16] Skipped — blocked on `commands.rs`**
-`SaveFrameToDisk { path, timestamp }` should carry a `Uuid` instead of `PathBuf` to avoid O(N) path-string comparison per call. Requires changing the `EditorCommand` enum variant in `velocut-core/src/commands.rs` (not uploaded). Deferred to next session when commands.rs is available.
-
----
-
-## Updated File Index (velocut-ui)
-
-| File | Last Changed | Notes |
-|------|-------------|-------|
-| `src/app.rs` | This session | VecDeque undo, sort_unstable, build_encode_plan, AspectRatio::from_ratio, thumbnail evict, velocut_log |
-| `src/context.rs` | This session | 192MB const fix, batched request_repaint, velocut_log |
-| `src/state.rs` | This session | AspectRatio::from_ratio added |
-| `src/helpers/mod.rs` | This session | Added `pub mod log` |
-| `src/helpers/clip_query.rs` | This session | Added active_audio_clip |
-| `src/helpers/format.rs` | This session | Added fit_label with tests |
-| `src/helpers/log.rs` | **New** | vlog + velocut_log! macro |
-| `src/modules/mod.rs` | This session | EditorModule thumb_cache doc |
-| `src/modules/audio_module.rs` | This session | clip_query helpers, active_audio_clip, unified logging |
-| `src/modules/video_module.rs` | This session | clip_query::library_entry_for everywhere, clip_at_time |
-| `src/modules/timeline.rs` | This session | sort_unstable_by, fit_label imported |
-| `src/modules/library.rs` | This session | DND_PAYLOAD single write |
-
----
-
-## Remaining Backlog
-
-**[P16] `SaveFrameToDisk` UUID lookup** — needs `commands.rs` to change enum variant. Low priority (cold path, not per-frame).
-
-**[P9-remainder] Move `begin_render` entirely to `export_module`** — `build_encode_plan` is now extracted. Moving the file dialog + worker dispatch requires `EditorModule::ui()` to receive `&mut AppContext` or a command-callback. Medium effort, revisit when trait signature is up for revision.
+- Scrub: 3-layer (L1 cached, L2 exact, L3 idle), dedicated scrub_rx, transition blend decode
+- Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary
+- Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.

@@ -11,9 +11,9 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use uuid::Uuid;
 
-use velocut_core::media_types::{MediaResult, PlaybackFrame};
+use velocut_core::media_types::{MediaResult, PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
 
-use crate::decode::{LiveDecoder, decode_frame};
+use crate::decode::{LiveDecoder, decode_frame, decode_one_frame_rgba};
 use crate::encode::{EncodeSpec, encode_timeline};
 use crate::probe::{probe_duration, probe_video_size_and_thumbnail};
 use crate::waveform::extract_waveform;
@@ -30,6 +30,9 @@ struct FrameRequest {
 
 enum PlaybackCmd {
     Start { id: Uuid, path: PathBuf, ts: f64, aspect: f32 },
+    /// Like Start but also carries blend info so the pb thread can open a second
+    /// decoder for clip_b and blend frames during the transition zone.
+    StartBlend { id: Uuid, path: PathBuf, ts: f64, aspect: f32, blend: PlaybackTransitionSpec },
     Stop,
 }
 
@@ -55,7 +58,9 @@ pub struct MediaWorker {
     /// request exists at a time; 8 gives headroom for back-to-back requests
     /// during rapid scrub without dropping frames.
     pub scrub_rx: Receiver<MediaResult>,
-    _scrub_tx:    Sender<MediaResult>,
+    /// Sender half kept alive so the channel stays open and cloned into
+    /// `request_transition_frame` threads that need to send blended frames.
+    scrub_tx:    Sender<MediaResult>,
 
     /// Latest-wins slot for on-demand scrub frames.
     frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)>,
@@ -160,10 +165,14 @@ impl MediaWorker {
 
         thread::spawn(move || {
             let mut decoder: Option<(Uuid, LiveDecoder)> = None;
+            // Active transition blend state: spec + lazily-opened clip_b decoder.
+            // Set by StartBlend, cleared by Start / Stop / EOF.
+            let mut blend: Option<(PlaybackTransitionSpec, Option<LiveDecoder>)> = None;
             loop {
                 if let Some((id, ref mut d)) = decoder {
                     match pb_cmd_rx.try_recv() {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
+                            blend = None; // clear any pending transition
                             match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut nd) => {
                                     // burn_to_pts runs synchronously (decode-only, no scale)
@@ -183,7 +192,19 @@ impl MediaWorker {
                             }
                             continue;
                         }
-                        Ok(PlaybackCmd::Stop) => { decoder = None; continue; }
+                        Ok(PlaybackCmd::StartBlend { id: new_id, path, ts, aspect, blend: spec }) => {
+                            blend = Some((spec, None)); // decoder_b opened lazily on first blend frame
+                            match LiveDecoder::open(&path, ts, aspect, None) {
+                                Ok(mut nd) => {
+                                    let tpts = nd.ts_to_pts(ts);
+                                    nd.burn_to_pts(tpts);
+                                    decoder = Some((new_id, nd));
+                                }
+                                Err(e) => { eprintln!("[pb] open (blend): {e}"); decoder = None; blend = None; }
+                            }
+                            continue;
+                        }
+                        Ok(PlaybackCmd::Stop) => { decoder = None; blend = None; continue; }
                         Err(TryRecvError::Disconnected) => return,
                         Err(TryRecvError::Empty) => {}
                     }
@@ -191,14 +212,61 @@ impl MediaWorker {
                     // that IS the rate-limiter, no sleep needed.
                     match d.next_frame() {
                         Some((data, w, h, ts_secs)) => {
-                            let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data };
+                            // Check whether this frame falls inside a transition blend zone.
+                            // Phase 1: read-only borrow to extract blend parameters.
+                            let blend_params = blend.as_ref().and_then(|(spec, _)| {
+                                if ts_secs >= spec.blend_start_ts {
+                                    let local_t = ts_secs - spec.blend_start_ts;
+                                    let alpha   = (spec.alpha_start as f64 + local_t / spec.duration as f64)
+                                        .clamp(0.0, 1.0) as f32;
+                                    Some((spec.clip_b_path.clone(), spec.clip_b_source_start, alpha, spec.kind))
+                                } else {
+                                    None
+                                }
+                            });
+
+                            // Phase 2: mutable access to open decoder_b lazily and blend.
+                            let send_data = if let Some((clip_b_path, clip_b_start, alpha, kind)) = blend_params {
+                                let blended = (|| -> Option<Vec<u8>> {
+                                    if let Some((spec, decoder_b_slot)) = blend.as_mut() {
+                                        let invert = spec.invert_ab;
+                                        if decoder_b_slot.is_none() {
+                                            match LiveDecoder::open(&clip_b_path, clip_b_start, 0.0, None) {
+                                                Ok(mut db) => {
+                                                    let tpts = db.ts_to_pts(clip_b_start);
+                                                    db.burn_to_pts(tpts);
+                                                    *decoder_b_slot = Some(db);
+                                                }
+                                                Err(e) => eprintln!("[pb] blend decoder_b open: {e}"),
+                                            }
+                                        }
+                                        if let Some(db) = decoder_b_slot {
+                                            if let Some((data_b, _, _, _)) = db.next_frame() {
+                                                let blended = if invert {
+                                                    blend_rgba_transition(&data_b, &data, w, h, alpha, kind)
+                                                } else {
+                                                    blend_rgba_transition(&data, &data_b, w, h, alpha, kind)
+                                                };
+                                                return Some(blended);
+                                            }
+                                        }
+                                    }
+                                    None
+                                })();
+                                blended.unwrap_or(data)
+                            } else {
+                                data
+                            };
+
+                            let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data: send_data };
                             if pb_frame_tx.send(f).is_err() { return; }
                         }
-                        None => { decoder = None; } // EOF
+                        None => { decoder = None; blend = None; } // EOF
                     }
                 } else {
                     match pb_cmd_rx.recv() {
                         Ok(PlaybackCmd::Start { id, path, ts, aspect }) => {
+                            blend = None;
                             match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut d) => {
                                     let tpts = d.ts_to_pts(ts);
@@ -208,7 +276,18 @@ impl MediaWorker {
                                 Err(e) => eprintln!("[pb] open: {e}"),
                             }
                         }
-                        Ok(PlaybackCmd::Stop) => {}
+                        Ok(PlaybackCmd::StartBlend { id, path, ts, aspect, blend: spec }) => {
+                            blend = Some((spec, None));
+                            match LiveDecoder::open(&path, ts, aspect, None) {
+                                Ok(mut d) => {
+                                    let tpts = d.ts_to_pts(ts);
+                                    d.burn_to_pts(tpts);
+                                    decoder = Some((id, d));
+                                }
+                                Err(e) => eprintln!("[pb] open (blend): {e}"),
+                            }
+                        }
+                        Ok(PlaybackCmd::Stop) => { blend = None; }
                         Err(_) => return,
                     }
                 }
@@ -216,7 +295,7 @@ impl MediaWorker {
         });
 
         Self {
-            rx, tx, scrub_rx, _scrub_tx: scrub_tx, frame_req, pb_tx, pb_rx,
+            rx, tx, scrub_rx, scrub_tx, frame_req, pb_tx, pb_rx,
             shutdown:       Arc::new(AtomicBool::new(false)),
             probe_sem:      Arc::new((Mutex::new(0), Condvar::new())),
             encode_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -305,6 +384,34 @@ impl MediaWorker {
         cvar.notify_one();
     }
 
+    /// Decode frames from two clips, blend them with the given transition, and
+    /// send the result via the scrub channel (keyed by `req.clip_a_id`).
+    ///
+    /// Spawns a one-shot background thread — does not block the caller.
+    /// The blended frame arrives in `scrub_rx` with `id = clip_a_id` so
+    /// `ingest_video_frame` stores it under the outgoing clip's slot, which is
+    /// what `poll_playback` and the frame_cache expect during the blend zone.
+    pub fn request_transition_frame(&self, req: TransitionScrubRequest) {
+        let scrub_tx = self.scrub_tx.clone();
+        let sd       = self.shutdown.clone();
+        thread::spawn(move || {
+            if sd.load(Ordering::Relaxed) { return; }
+            let (data_a, w, h) = match decode_one_frame_rgba(&req.clip_a_path, req.clip_a_ts) {
+                Ok(f)  => f,
+                Err(e) => { eprintln!("[transition] clip_a decode: {e}"); return; }
+            };
+            if sd.load(Ordering::Relaxed) { return; }
+            let (data_b, _, _) = match decode_one_frame_rgba(&req.clip_b_path, req.clip_b_ts) {
+                Ok(f)  => f,
+                Err(e) => { eprintln!("[transition] clip_b decode: {e}"); return; }
+            };
+            let blended = blend_rgba_transition(&data_a, &data_b, w, h, req.alpha, req.kind);
+            let _ = scrub_tx.send(MediaResult::VideoFrame {
+                id: req.clip_a_id, width: w, height: h, data: blended,
+            });
+        });
+    }
+
     /// Start the dedicated playback pipeline at `ts` seconds into `path`.
     pub fn start_playback(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32) {
         // Send Start BEFORE draining pb_rx.  The pb thread processes the Start
@@ -314,6 +421,25 @@ impl MediaWorker {
         // where the pb thread pushed a stale frame after the drain but before the
         // Start was processed.
         let _ = self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect });
+        while self.pb_rx.try_recv().is_ok() {}
+    }
+
+    /// Like `start_playback` but also informs the playback thread of an upcoming
+    /// transition so it can blend frames at the clip boundary without an extra
+    /// start/stop cycle.
+    ///
+    /// The pb thread opens clip_b's decoder lazily when `ts_secs` in clip_a reaches
+    /// `spec.blend_start_ts`, blends frames until clip_a ends, then continues with
+    /// whatever `Start` command `tick()` sends for clip_b.
+    pub fn start_blend_playback(
+        &self,
+        id:     Uuid,
+        path:   PathBuf,
+        ts:     f64,
+        aspect: f32,
+        blend:  PlaybackTransitionSpec,
+    ) {
+        let _ = self.pb_tx.try_send(PlaybackCmd::StartBlend { id, path, ts, aspect, blend });
         while self.pb_rx.try_recv().is_ok() {}
     }
 
@@ -388,4 +514,136 @@ impl MediaWorker {
             flag.store(true, Ordering::Relaxed);
         }
     }
+}
+
+// ── RGBA transition blending ──────────────────────────────────────────────────
+//
+// Used by both the scrub (request_transition_frame) and playback (pb thread
+// blend loop) paths to produce a blended RGBA frame from two source frames.
+//
+// Implements the same visual effects as the YUV VideoTransition::apply() impls
+// in velocut-core but operates directly in RGBA — no format conversion needed
+// since LiveDecoder / decode_one_frame_rgba already output RGBA.
+//
+// Easing and blend helpers are imported from velocut_core::transitions::helpers
+// so the math is the same code as the encoder uses.
+
+fn blend_rgba_transition(
+    a:     &[u8],
+    b:     &[u8],
+    w:     u32,
+    h:     u32,
+    alpha: f32,
+    kind:  velocut_core::transitions::TransitionKind,
+) -> Vec<u8> {
+    use velocut_core::transitions::TransitionKind;
+    use velocut_core::transitions::helpers::{
+        blend_byte, ease_in_out, ease_in_out_cubic, wipe_alpha,
+    };
+
+    let len = (w * h) as usize * 4;
+    let mut out = vec![0u8; len];
+
+    match kind {
+        TransitionKind::Cut => {
+            out.copy_from_slice(a);
+        }
+
+        TransitionKind::Crossfade => {
+            // Matches crossfade.rs: blend_byte(a, b, ease_in_out(alpha)) per channel.
+            let t = ease_in_out(alpha);
+            for i in 0..len {
+                out[i] = blend_byte(a[i], b[i], t);
+            }
+        }
+
+        TransitionKind::DipToBlack => {
+            // Matches dip_to_black.rs: first half fades a→black, second half black→b.
+            // RGB channels lerp; alpha channel copied unchanged.
+            if alpha < 0.5 {
+                let t = ease_in_out(alpha * 2.0);
+                for i in (0..len).step_by(4) {
+                    out[i]   = (a[i]   as f32 * (1.0 - t)) as u8;
+                    out[i+1] = (a[i+1] as f32 * (1.0 - t)) as u8;
+                    out[i+2] = (a[i+2] as f32 * (1.0 - t)) as u8;
+                    out[i+3] = a[i+3];
+                }
+            } else {
+                let t = ease_in_out((alpha - 0.5) * 2.0);
+                for i in (0..len).step_by(4) {
+                    out[i]   = (b[i]   as f32 * t) as u8;
+                    out[i+1] = (b[i+1] as f32 * t) as u8;
+                    out[i+2] = (b[i+2] as f32 * t) as u8;
+                    out[i+3] = b[i+3];
+                }
+            }
+        }
+
+        TransitionKind::Wipe => {
+            // Matches wipe.rs: left-to-right bar with 2% feather.
+            // blend_byte(b, a, wa): wa=0 (left of bar) → b; wa=1 (right) → a.
+            const FEATHER: f32 = 0.02;
+            let edge = ease_in_out(alpha);
+            for py in 0..h {
+                for px in 0..w {
+                    let nx = px as f32 / w as f32;
+                    let wa = wipe_alpha(nx, edge, FEATHER);
+                    let i  = (py * w + px) as usize * 4;
+                    out[i]   = blend_byte(b[i],   a[i],   wa);
+                    out[i+1] = blend_byte(b[i+1], a[i+1], wa);
+                    out[i+2] = blend_byte(b[i+2], a[i+2], wa);
+                    out[i+3] = 255;
+                }
+            }
+        }
+
+        TransitionKind::Push => {
+            // Matches push.rs: b slides in from right, displacing a to the left.
+            // Zero blending — hard pixel copy, no ghosting.
+            let p        = ease_in_out_cubic(alpha);
+            let boundary = ((1.0 - p) * w as f32) as i32;
+            let shift_a  = (p * w as f32) as i32;
+            for py in 0..h as i32 {
+                for px in 0..w as i32 {
+                    let i = (py * w as i32 + px) as usize * 4;
+                    if px < boundary {
+                        // Clip-a pixel, shifted left by shift_a.
+                        let src_x = (px + shift_a).clamp(0, w as i32 - 1);
+                        let s = (py * w as i32 + src_x) as usize * 4;
+                        out[i..i+4].copy_from_slice(&a[s..s+4]);
+                    } else {
+                        // Clip-b pixel measured from the right edge sweeping in.
+                        let src_x = (px - boundary).clamp(0, w as i32 - 1);
+                        let s = (py * w as i32 + src_x) as usize * 4;
+                        out[i..i+4].copy_from_slice(&b[s..s+4]);
+                    }
+                }
+            }
+        }
+
+        TransitionKind::Iris => {
+            // Matches iris.rs: circular aperture expands from center.
+            // Inside aperture → b; outside → a.
+            // blend_byte(b, a, wa): wa=0 (inside) → b; wa=1 (outside) → a.
+            const FEATHER: f32 = 0.05;
+            let p      = ease_in_out(alpha);
+            // Max radius from center (0.5, 0.5) to corner in normalised [0..1]² space.
+            let max_r  = 0.5f32.hypot(0.5);
+            let radius = p * max_r;
+            for py in 0..h {
+                for px in 0..w {
+                    let nx   = px as f32 / w as f32 - 0.5;
+                    let ny   = py as f32 / h as f32 - 0.5;
+                    let dist = (nx * nx + ny * ny).sqrt();
+                    let wa   = wipe_alpha(dist, radius, FEATHER);
+                    let i    = (py * w + px) as usize * 4;
+                    out[i]   = blend_byte(b[i],   a[i],   wa);
+                    out[i+1] = blend_byte(b[i+1], a[i+1], wa);
+                    out[i+2] = blend_byte(b[i+2], a[i+2], wa);
+                    out[i+3] = 255;
+                }
+            }
+        }
+    }
+    out
 }

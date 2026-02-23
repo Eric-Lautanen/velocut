@@ -384,3 +384,88 @@ fn emit_frame(
     }
     Ok(())
 }
+
+// ── One-shot RGBA frame decode for transition blending ────────────────────────
+
+/// Decode a single RGBA frame at `ts` seconds from `path` and return the raw
+/// pixel data together with the output dimensions.
+///
+/// Matches the LiveDecoder output contract:
+/// - Output width is fixed at 320 px, height derived from native source AR.
+/// - SwsContext is built lazily from the first decoded frame (same invariant
+///   as probe.rs — avoids AVCC coded-dimension / Annex-B format issues).
+/// - Seeks are skipped when `ts <= 0.0` (Windows EPERM guard, matching
+///   `helpers::seek::seek_to_secs`).
+/// - Falls back to the last decoded frame on EOF (same as `decode_frame`).
+///
+/// Used exclusively by `MediaWorker::request_transition_frame` to decode the
+/// two clips that need to be blended for a preview transition.
+pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64) -> Result<(Vec<u8>, u32, u32)> {
+    let mut ictx = input(path)?;
+
+    let (video_idx, seek_ts, tb_num, tb_den, dec_ctx) = {
+        let stream = ictx.streams().best(Type::Video)
+            .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
+        let idx = stream.index();
+        let tb  = stream.time_base();
+        let ts_raw = (ts * tb.denominator() as f64 / tb.numerator() as f64) as i64;
+        let dec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        (idx, ts_raw, tb.numerator() as f64, tb.denominator() as f64, dec_ctx)
+    };
+
+    // Honour the seek_to_secs invariant: skip seek at ts=0 (Windows EPERM).
+    if seek_ts > 0 {
+        let _ = ictx.seek(seek_ts, ..=seek_ts);
+    }
+
+    let mut decoder = dec_ctx.decoder().video()?;
+    let raw_w = decoder.width().max(2);
+    let raw_h = decoder.height().max(2);
+    let out_w: u32 = 320;
+    let out_h: u32 = ((out_w as f32 * raw_h as f32 / raw_w as f32) as u32).max(2) & !1;
+
+    // Lazy SwsContext — built from first decoded frame, not from decoder metadata.
+    // Matches probe.rs: AVCC codecs report coded dims (e.g. 1088 ≠ 1080) before
+    // the first packet; Annex-B has AV_PIX_FMT_NONE until then.
+    let mut scaler: Option<SwsContext> = None;
+    let mut last_good: Option<Vec<u8>> = None;
+
+    for (stream, packet) in ictx.packets().flatten() {
+        if stream.index() != video_idx { continue; }
+        if decoder.send_packet(&packet).is_err() { continue; }
+        let mut decoded = ffmpeg::util::frame::video::Video::empty();
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            if scaler.is_none() {
+                scaler = Some(SwsContext::get(
+                    decoded.format(), decoded.width(), decoded.height(),
+                    Pixel::RGBA, out_w, out_h, Flags::BILINEAR,
+                )?);
+            }
+            let mut out_frame = ffmpeg::util::frame::video::Video::empty();
+            scaler.as_mut().unwrap().run(&decoded, &mut out_frame)?;
+
+            // Strip stride padding into a dense buffer.
+            let stride    = out_frame.stride(0);
+            let raw       = out_frame.data(0);
+            let row_bytes = out_w as usize * 4;
+            let mut buf   = Vec::with_capacity(row_bytes * out_h as usize);
+            for row in 0..out_h as usize {
+                buf.extend_from_slice(&raw[row * stride..row * stride + row_bytes]);
+            }
+            last_good = Some(buf.clone());
+
+            // Skip frames that landed before the target due to keyframe-aligned seek.
+            if let Some(pts) = decoded.pts() {
+                let pts_secs = pts as f64 * tb_num / tb_den;
+                if pts_secs < ts - (1.0 / 60.0) { continue; }
+            }
+            return Ok((buf, out_w, out_h));
+        }
+    }
+
+    // EOF before target — return the last frame we scaled (matches decode_frame behaviour).
+    if let Some(buf) = last_good {
+        return Ok((buf, out_w, out_h));
+    }
+    Err(anyhow::anyhow!("no frame found at t={ts:.3}"))
+}
