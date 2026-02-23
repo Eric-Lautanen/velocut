@@ -300,7 +300,7 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Transition math: `transitions::helpers::{frame_alpha, blend_byte, blend_buffers, alloc_frame, ease_in_out, ease_in_out_cubic, ease_in_out_sine, split_planes, chroma_dims, norm_xy, center_dist, wipe_alpha, sample_plane, sample_plane_clamped}`
 - Logging: `crate::helpers::log::vlog` / `velocut_log!()` macro
 
----
+---    
 
 ## Known Future Work
 - **wgpu GPU compute blend** *(high value, medium effort)*: replace `blend_rgba_transition` CPU path with a WGSL compute shader dispatched from the pb thread. eframe 0.33 already owns a wgpu `Device`+`Queue` — expose them via `Arc` at `MediaWorker::new()`. Upload both NV12 frames as textures, blend in shader (NV12→RGBA in one pass), output a `wgpu::Texture` returned via `register_native_texture` instead of `Vec<u8>`. Touches: `worker.rs`, `media_types.rs` (`PlaybackFrame` gains texture-ID variant), `context.rs`, `video_module.rs`, `preview_module.rs`. **Do not attempt until rayon interim is in place.** Raw Vulkan (`ash`) is excessive for this use case — stay on wgpu.
