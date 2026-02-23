@@ -197,6 +197,30 @@ pub trait VideoTransition: Send + Sync {
         height:  u32,
         alpha:   f32,
     ) -> Vec<u8>;
+
+    /// Blend two RGBA frames (`w × h × 4` bytes each) at `alpha`.
+    ///
+    /// The default implementation converts RGBA → YUV420P, calls `apply()`,
+    /// then converts the result back to RGBA.  This means every transition
+    /// automatically works on the live-preview path without any extra code.
+    ///
+    /// Override this method only when you need native RGBA performance for
+    /// preview (e.g. a computationally expensive transition where the YUV
+    /// roundtrip is a measurable bottleneck).
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width:   u32,
+        height:  u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use crate::transitions::helpers::{rgba_to_yuv420p, yuv420p_to_rgba};
+        let yuv_a = rgba_to_yuv420p(frame_a, width, height);
+        let yuv_b = rgba_to_yuv420p(frame_b, width, height);
+        let yuv_out = self.apply(&yuv_a, &yuv_b, width, height, alpha);
+        yuv420p_to_rgba(&yuv_out, width, height)
+    }
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────

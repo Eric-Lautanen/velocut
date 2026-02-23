@@ -369,6 +369,106 @@ pub fn alloc_frame(w: u32, h: u32) -> Vec<u8> {
     vec![0u8; y_len(w, h) + uv_len(w, h) * 2]
 }
 
+/// Convert a packed RGBA frame (`w × h × 4` bytes) into a packed YUV420P frame.
+///
+/// Uses BT.601 full-range coefficients — appropriate for preview/display paths.
+/// Chroma (U, V) is 4:2:0 subsampled by averaging each 2×2 luma block.
+///
+/// Output layout: `[Y: w×h][U: (w/2)×(h/2)][V: (w/2)×(h/2)]`
+///
+/// Panics in debug builds if `rgba.len() != w * h * 4`.
+pub fn rgba_to_yuv420p(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    debug_assert_eq!(
+        rgba.len(), (w * h * 4) as usize,
+        "rgba_to_yuv420p: expected {} bytes, got {}", w * h * 4, rgba.len()
+    );
+    let yw = w as usize;
+    let yh = h as usize;
+    let uw = yw / 2;
+    let uh = yh / 2;
+
+    let mut out = vec![0u8; yw * yh + uw * uh * 2];
+    let (y_plane, uv) = out.split_at_mut(yw * yh);
+    let (u_plane, v_plane) = uv.split_at_mut(uw * uh);
+
+    for py in 0..yh {
+        for px in 0..yw {
+            let s = (py * yw + px) * 4;
+            let r = rgba[s]     as f32;
+            let g = rgba[s + 1] as f32;
+            let b = rgba[s + 2] as f32;
+            // BT.601 full-range luma
+            y_plane[py * yw + px] = ( 0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+        }
+    }
+
+    // Chroma: average over each 2×2 block
+    for cy in 0..uh {
+        for cx in 0..uw {
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            for dy in 0..2usize {
+                for dx in 0..2usize {
+                    let s = ((cy * 2 + dy) * yw + (cx * 2 + dx)) * 4;
+                    let r = rgba[s]     as f32;
+                    let g = rgba[s + 1] as f32;
+                    let b = rgba[s + 2] as f32;
+                    sum_u += -0.168736 * r - 0.331264 * g + 0.500000 * b + 128.0;
+                    sum_v +=  0.500000 * r - 0.418688 * g - 0.081312 * b + 128.0;
+                }
+            }
+            u_plane[cy * uw + cx] = (sum_u * 0.25).round().clamp(0.0, 255.0) as u8;
+            v_plane[cy * uw + cx] = (sum_v * 0.25).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    out
+}
+
+/// Convert a packed YUV420P frame into a packed RGBA frame (`w × h × 4` bytes).
+///
+/// Uses BT.601 full-range coefficients — the inverse of `rgba_to_yuv420p`.
+/// Alpha channel is set to 255 (fully opaque) for every pixel.
+///
+/// Input layout: `[Y: w×h][U: (w/2)×(h/2)][V: (w/2)×(h/2)]`
+///
+/// Panics in debug builds if `yuv.len() != w*h + (w/2)*(h/2)*2`.
+pub fn yuv420p_to_rgba(yuv: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let yw  = w as usize;
+    let yh  = h as usize;
+    let uw  = yw / 2;
+    debug_assert_eq!(
+        yuv.len(), yw * yh + uw * (yh / 2) * 2,
+        "yuv420p_to_rgba: unexpected buffer length {}", yuv.len()
+    );
+
+    let y_plane = &yuv[..yw * yh];
+    let u_plane = &yuv[yw * yh..yw * yh + uw * (yh / 2)];
+    let v_plane = &yuv[yw * yh + uw * (yh / 2)..];
+
+    let mut rgba = vec![255u8; yw * yh * 4];
+
+    for py in 0..yh {
+        for px in 0..yw {
+            let y = y_plane[py * yw + px] as f32;
+            let u = u_plane[(py / 2) * uw + px / 2] as f32 - 128.0;
+            let v = v_plane[(py / 2) * uw + px / 2] as f32 - 128.0;
+
+            let r = (y + 1.402000 * v).round().clamp(0.0, 255.0) as u8;
+            let g = (y - 0.344136 * u - 0.714136 * v).round().clamp(0.0, 255.0) as u8;
+            let b = (y + 1.772000 * u).round().clamp(0.0, 255.0) as u8;
+
+            let d = (py * yw + px) * 4;
+            rgba[d]     = r;
+            rgba[d + 1] = g;
+            rgba[d + 2] = b;
+            // rgba[d + 3] already 255
+        }
+    }
+
+    rgba
+}
+
 /// Blend two equal-length byte slices at a uniform `alpha` ∈ [0.0, 1.0].
 ///
 /// `alpha = 0.0` → 100 % `a`, `alpha = 1.0` → 100 % `b`.

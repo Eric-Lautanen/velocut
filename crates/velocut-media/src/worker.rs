@@ -1083,17 +1083,12 @@ fn crop_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<
     out
 }
 
+
 // ── RGBA transition blending ──────────────────────────────────────────────────
 //
-// Used by both the scrub (request_transition_frame) and playback (pb thread
-// blend loop) paths to produce a blended RGBA frame from two source frames.
-//
-// Implements the same visual effects as the YUV VideoTransition::apply() impls
-// in velocut-core but operates directly in RGBA — no format conversion needed
-// since LiveDecoder / decode_one_frame_rgba already output RGBA.
-//
-// Easing and blend helpers are imported from velocut_core::transitions::helpers
-// so the math is the same code as the encoder uses.
+// Delegates to VideoTransition::apply_rgba() via the registry — no transition
+// logic lives here.  To add a new transition, create its .rs file and add one
+// line to declare_transitions! in mod.rs.  Nothing in this file needs to change.
 
 fn blend_rgba_transition(
     a:     &[u8],
@@ -1103,114 +1098,14 @@ fn blend_rgba_transition(
     alpha: f32,
     kind:  velocut_core::transitions::TransitionKind,
 ) -> Vec<u8> {
-    use velocut_core::transitions::TransitionKind;
-    use velocut_core::transitions::helpers::{
-        blend_byte, ease_in_out, ease_in_out_cubic, wipe_alpha,
-    };
+    use velocut_core::transitions::{TransitionKind, registry};
 
-    let len = (w * h) as usize * 4;
-    let mut out = vec![0u8; len];
-
-    match kind {
-        TransitionKind::Cut => {
-            out.copy_from_slice(a);
-        }
-
-        TransitionKind::Crossfade => {
-            // Matches crossfade.rs: blend_byte(a, b, ease_in_out(alpha)) per channel.
-            let t = ease_in_out(alpha);
-            for i in 0..len {
-                out[i] = blend_byte(a[i], b[i], t);
-            }
-        }
-
-        TransitionKind::DipToBlack => {
-            // Matches dip_to_black.rs: first half fades a→black, second half black→b.
-            // RGB channels lerp; alpha channel copied unchanged.
-            if alpha < 0.5 {
-                let t = ease_in_out(alpha * 2.0);
-                for i in (0..len).step_by(4) {
-                    out[i]   = (a[i]   as f32 * (1.0 - t)) as u8;
-                    out[i+1] = (a[i+1] as f32 * (1.0 - t)) as u8;
-                    out[i+2] = (a[i+2] as f32 * (1.0 - t)) as u8;
-                    out[i+3] = a[i+3];
-                }
-            } else {
-                let t = ease_in_out((alpha - 0.5) * 2.0);
-                for i in (0..len).step_by(4) {
-                    out[i]   = (b[i]   as f32 * t) as u8;
-                    out[i+1] = (b[i+1] as f32 * t) as u8;
-                    out[i+2] = (b[i+2] as f32 * t) as u8;
-                    out[i+3] = b[i+3];
-                }
-            }
-        }
-
-        TransitionKind::Wipe => {
-            // Matches wipe.rs: left-to-right bar with 2% feather.
-            // blend_byte(b, a, wa): wa=0 (left of bar) → b; wa=1 (right) → a.
-            const FEATHER: f32 = 0.02;
-            let edge = ease_in_out(alpha);
-            for py in 0..h {
-                for px in 0..w {
-                    let nx = px as f32 / w as f32;
-                    let wa = wipe_alpha(nx, edge, FEATHER);
-                    let i  = (py * w + px) as usize * 4;
-                    out[i]   = blend_byte(b[i],   a[i],   wa);
-                    out[i+1] = blend_byte(b[i+1], a[i+1], wa);
-                    out[i+2] = blend_byte(b[i+2], a[i+2], wa);
-                    out[i+3] = 255;
-                }
-            }
-        }
-
-        TransitionKind::Push => {
-            // Matches push.rs: b slides in from right, displacing a to the left.
-            // Zero blending — hard pixel copy, no ghosting.
-            let p        = ease_in_out_cubic(alpha);
-            let boundary = ((1.0 - p) * w as f32) as i32;
-            let shift_a  = (p * w as f32) as i32;
-            for py in 0..h as i32 {
-                for px in 0..w as i32 {
-                    let i = (py * w as i32 + px) as usize * 4;
-                    if px < boundary {
-                        // Clip-a pixel, shifted left by shift_a.
-                        let src_x = (px + shift_a).clamp(0, w as i32 - 1);
-                        let s = (py * w as i32 + src_x) as usize * 4;
-                        out[i..i+4].copy_from_slice(&a[s..s+4]);
-                    } else {
-                        // Clip-b pixel measured from the right edge sweeping in.
-                        let src_x = (px - boundary).clamp(0, w as i32 - 1);
-                        let s = (py * w as i32 + src_x) as usize * 4;
-                        out[i..i+4].copy_from_slice(&b[s..s+4]);
-                    }
-                }
-            }
-        }
-
-        TransitionKind::Iris => {
-            // Matches iris.rs: circular aperture expands from center.
-            // Inside aperture → b; outside → a.
-            // blend_byte(b, a, wa): wa=0 (inside) → b; wa=1 (outside) → a.
-            const FEATHER: f32 = 0.05;
-            let p      = ease_in_out(alpha);
-            // Max radius from center (0.5, 0.5) to corner in normalised [0..1]² space.
-            let max_r  = 0.5f32.hypot(0.5);
-            let radius = p * max_r;
-            for py in 0..h {
-                for px in 0..w {
-                    let nx   = px as f32 / w as f32 - 0.5;
-                    let ny   = py as f32 / h as f32 - 0.5;
-                    let dist = (nx * nx + ny * ny).sqrt();
-                    let wa   = wipe_alpha(dist, radius, FEATHER);
-                    let i    = (py * w + px) as usize * 4;
-                    out[i]   = blend_byte(b[i],   a[i],   wa);
-                    out[i+1] = blend_byte(b[i+1], a[i+1], wa);
-                    out[i+2] = blend_byte(b[i+2], a[i+2], wa);
-                    out[i+3] = 255;
-                }
-            }
-        }
+    if kind == TransitionKind::Cut {
+        return a.to_vec();
     }
-    out
+
+    registry()
+        .remove(&kind)
+        .expect("blend_rgba_transition: unregistered TransitionKind — add it to declare_transitions!")
+        .apply_rgba(a, b, w, h, alpha)
 }
