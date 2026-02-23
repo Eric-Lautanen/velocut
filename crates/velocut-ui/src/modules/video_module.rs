@@ -382,12 +382,32 @@ impl VideoModule {
                 }
             };
             if !idle { return; }
-            if let Some(lib) = clip_query::library_entry_for(state, &clip) {
+            // L3: check for transition zone exactly as L2 does.
+            // Inside a zone: request_transition_frame_hq decodes both clips at
+            // native resolution and blends them, replacing the 320-px scrub thumb
+            // with a full-quality blended frame once the user stops scrubbing.
+            // Outside a zone: request_frame_hq as before.
+            let zone_hq = clip_query::active_transition_at(state);
+            if let Some(zone) = zone_hq {
+                let path_a = clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
+                let path_b = clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
+                if let (Some(pa), Some(pb)) = (path_a, path_b) {
+                    ctx.media_worker.request_transition_frame_hq(TransitionScrubRequest {
+                        clip_a_id:   clip.media_id,
+                        clip_a_path: pa,
+                        clip_a_ts:   zone.clip_a_source_ts,
+                        clip_b_id:   zone.clip_b.media_id,
+                        clip_b_path: pb,
+                        clip_b_ts:   zone.clip_b_source_ts,
+                        alpha:       zone.alpha,
+                        kind:        zone.transition.kind,
+                    });
+                    ctx.playback.scrub_last_moved = None;
+                }
+            } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 // Use local_t (exact playhead position), not the quantised fine_bucket,
                 // so the HQ decode lands on the precise frame the user is looking at.
                 ctx.media_worker.request_frame_hq(lib.id, lib.path.clone(), local_t);
-                // Null scrub_last_moved to prevent re-firing every tick while idle.
-                // L3 won't arm again until the playhead moves (scrub_moved sets it).
                 ctx.playback.scrub_last_moved = None;
             }
         }

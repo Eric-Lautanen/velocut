@@ -689,17 +689,20 @@ fn emit_frame(
 /// Decode a single RGBA frame at `ts` seconds from `path` and return the raw
 /// pixel data together with the output dimensions.
 ///
-/// Matches the LiveDecoder output contract:
-/// - Output width is fixed at 320 px, height derived from native source AR.
+/// `aspect` follows the same convention as `LiveDecoder::open`:
+/// - `aspect > 0`  → scrub mode: output width fixed at 320 px, height from source AR.
+/// - `aspect <= 0` → HQ / L3-idle mode: native source resolution, no downscale.
+///
+/// Other invariants:
 /// - SwsContext is built lazily from the first decoded frame (same invariant
 ///   as probe.rs — avoids AVCC coded-dimension / Annex-B format issues).
 /// - Seeks are skipped when `ts <= 0.0` (Windows EPERM guard, matching
 ///   `helpers::seek::seek_to_secs`).
 /// - Falls back to the last decoded frame on EOF (same as `decode_frame`).
 ///
-/// Used exclusively by `MediaWorker::request_transition_frame` to decode the
-/// two clips that need to be blended for a preview transition.
-pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64) -> Result<(Vec<u8>, u32, u32)> {
+/// Used by `MediaWorker::request_transition_frame` (320 px scrub) and
+/// `MediaWorker::request_transition_frame_hq` (native res, L3 idle).
+pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64, aspect: f32) -> Result<(Vec<u8>, u32, u32)> {
     let mut ictx = input(path)?;
 
     let (video_idx, seek_ts, tb_num, tb_den, dec_ctx) = {
@@ -720,8 +723,15 @@ pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64) -> Result<(Vec<u8>, u32, u
     let mut decoder = dec_ctx.decoder().video()?;
     let raw_w = decoder.width().max(2);
     let raw_h = decoder.height().max(2);
-    let out_w: u32 = 320;
-    let out_h: u32 = ((out_w as f32 * raw_h as f32 / raw_w as f32) as u32).max(2) & !1;
+    // aspect > 0: 320-px scrub (fast, low-res).  aspect <= 0: native source
+    // dimensions (HQ, used by L3-idle transition blend).
+    let (out_w, out_h): (u32, u32) = if aspect > 0.0 {
+        let w: u32 = 320;
+        let h: u32 = ((w as f32 * raw_h as f32 / raw_w.max(1) as f32) as u32).max(2) & !1;
+        (w, h)
+    } else {
+        (raw_w, raw_h)
+    };
 
     // Lazy SwsContext — built from first decoded frame, not from decoder metadata.
     // Matches probe.rs: AVCC codecs report coded dims (e.g. 1088 ≠ 1080) before
