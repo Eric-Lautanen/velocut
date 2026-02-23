@@ -165,14 +165,17 @@ impl MediaWorker {
 
         thread::spawn(move || {
             let mut decoder: Option<(Uuid, LiveDecoder)> = None;
-            // Active transition blend state: spec + lazily-opened clip_b decoder.
-            // Set by StartBlend, cleared by Start / Stop / EOF.
-            let mut blend: Option<(PlaybackTransitionSpec, Option<LiveDecoder>)> = None;
+            // Active transition blend state.
+            // Set by StartBlend, cleared by Start / Stop / primary-EOF / decoder_b-EOF.
+            let mut blend: Option<ActiveBlend> = None;
+            let mut frame_count: u64 = 0;
             loop {
                 if let Some((id, ref mut d)) = decoder {
                     match pb_cmd_rx.try_recv() {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect }) => {
                             blend = None; // clear any pending transition
+                            let t0 = std::time::Instant::now();
+                            eprintln!("[pb] Start received (active), ts={ts:.3}");
                             match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut nd) => {
                                     // burn_to_pts runs synchronously (decode-only, no scale)
@@ -186,6 +189,7 @@ impl MediaWorker {
                                     // gets stuck in pending_pb_frame forever → hard freeze.
                                     let tpts = nd.ts_to_pts(ts);
                                     nd.burn_to_pts(tpts);
+                                    eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
                                     decoder = Some((new_id, nd));
                                 }
                                 Err(e) => { eprintln!("[pb] open: {e}"); decoder = None; }
@@ -193,14 +197,23 @@ impl MediaWorker {
                             continue;
                         }
                         Ok(PlaybackCmd::StartBlend { id: new_id, path, ts, aspect, blend: spec }) => {
-                            blend = Some((spec, None)); // decoder_b opened lazily on first blend frame
+                            // decoder_b is always opened lazily in the frame loop below
+                            // (see ActiveBlend / NOTE block for why eager/async was abandoned).
+                            blend = Some(ActiveBlend { spec, decoder_b: None });
+                            let t0 = std::time::Instant::now();
+                            eprintln!("[pb] StartBlend received (active), ts={ts:.3}");
                             match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut nd) => {
                                     let tpts = nd.ts_to_pts(ts);
                                     nd.burn_to_pts(tpts);
+                                    eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
                                     decoder = Some((new_id, nd));
                                 }
-                                Err(e) => { eprintln!("[pb] open (blend): {e}"); decoder = None; blend = None; }
+                                Err(e) => {
+                                    eprintln!("[pb] open (blend): {e}");
+                                    decoder = None;
+                                    blend   = None; // Bug 3 fix: clear orphaned blend on primary failure
+                                }
                             }
                             continue;
                         }
@@ -214,54 +227,92 @@ impl MediaWorker {
                         Some((data, w, h, ts_secs)) => {
                             // Check whether this frame falls inside a transition blend zone.
                             // Phase 1: read-only borrow to extract blend parameters.
-                            let blend_params = blend.as_ref().and_then(|(spec, _)| {
-                                if ts_secs >= spec.blend_start_ts {
-                                    let local_t = ts_secs - spec.blend_start_ts;
-                                    let alpha   = (spec.alpha_start as f64 + local_t / spec.duration as f64)
+                            let blend_params = blend.as_ref().and_then(|b| {
+                                if ts_secs >= b.spec.blend_start_ts {
+                                    let local_t = ts_secs - b.spec.blend_start_ts;
+                                    let alpha   = (b.spec.alpha_start as f64 + local_t / b.spec.duration as f64)
                                         .clamp(0.0, 1.0) as f32;
-                                    Some((spec.clip_b_path.clone(), spec.clip_b_source_start, alpha, spec.kind))
+                                    Some((b.spec.clip_b_path.clone(), b.spec.clip_b_source_start, alpha, b.spec.kind))
                                 } else {
                                     None
                                 }
                             });
 
                             // Phase 2: mutable access to open decoder_b lazily and blend.
+                            // decoder_b_exhausted is set inside the closure (which
+                            // holds a mutable borrow on blend) and acted on after it
+                            // returns, clearing blend so we never call next_frame() on
+                            // a dead decoder again.
+                            let mut decoder_b_exhausted = false;
                             let send_data = if let Some((clip_b_path, clip_b_start, alpha, kind)) = blend_params {
                                 let blended = (|| -> Option<Vec<u8>> {
-                                    if let Some((spec, decoder_b_slot)) = blend.as_mut() {
-                                        let invert = spec.invert_ab;
-                                        if decoder_b_slot.is_none() {
+                                    if let Some(b) = blend.as_mut() {
+                                        let invert = b.spec.invert_ab;
+                                        if b.decoder_b.is_none() {
                                             match LiveDecoder::open(&clip_b_path, clip_b_start, 0.0, None) {
                                                 Ok(mut db) => {
+                                                    // Use skip_until_pts (decode-only, ~4x faster than
+                                                    // burn_to_pts) for decoder_b.  decoder_b frames are
+                                                    // used only for blending and never go through
+                                                    // poll_playback's lower-bound timestamp check, so
+                                                    // the lazy-skip path is safe here.
                                                     let tpts = db.ts_to_pts(clip_b_start);
-                                                    db.burn_to_pts(tpts);
-                                                    *decoder_b_slot = Some(db);
+                                                    db.skip_until_pts = tpts;
+                                                    b.decoder_b = Some(db);
                                                 }
                                                 Err(e) => eprintln!("[pb] blend decoder_b open: {e}"),
                                             }
                                         }
-                                        if let Some(db) = decoder_b_slot {
-                                            if let Some((data_b, _, _, _)) = db.next_frame() {
+                                        if let Some(db) = b.decoder_b.as_mut() {
+                                            if let Some((data_b, wb, hb, _)) = db.next_frame() {
+                                                // Bug 2 fix: guard against mismatched dimensions
+                                                // (different-AR clips).  A size mismatch would cause
+                                                // an out-of-bounds read inside blend_rgba_transition
+                                                // which indexes both buffers up to w*h*4 derived from
+                                                // the primary decoder — causing a panic that kills the
+                                                // pb thread and makes the project unplayable.
+                                                if data_b.len() != data.len() || wb != w || hb != h {
+                                                    eprintln!(
+                                                        "[pb] blend size mismatch — primary {}×{} ({} B)                                                          vs decoder_b {}×{} ({} B); skipping blend",
+                                                        w, h, data.len(), wb, hb, data_b.len()
+                                                    );
+                                                    return None; // fall through to unblended primary frame
+                                                }
                                                 let blended = if invert {
                                                     blend_rgba_transition(&data_b, &data, w, h, alpha, kind)
                                                 } else {
                                                     blend_rgba_transition(&data, &data_b, w, h, alpha, kind)
                                                 };
                                                 return Some(blended);
+                                            } else {
+                                                // decoder_b hit EOF — transition complete.
+                                                // Signal outer scope to clear blend so we never
+                                                // call next_frame() on this dead decoder again.
+                                                decoder_b_exhausted = true;
                                             }
                                         }
                                     }
                                     None
                                 })();
+                                // Must run after closure releases its borrow on blend.
+                                if decoder_b_exhausted { blend = None; }
                                 blended.unwrap_or(data)
                             } else {
                                 data
                             };
 
                             let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data: send_data };
+                            frame_count += 1;
+                            if frame_count % 60 == 0 {
+                                eprintln!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
+                            }
                             if pb_frame_tx.send(f).is_err() { return; }
                         }
-                        None => { decoder = None; blend = None; } // EOF
+                        None => {
+                            eprintln!("[pb] primary decoder EOF, clearing decoder + blend");
+                            decoder = None;
+                            blend   = None;
+                        }
                     }
                 } else {
                     match pb_cmd_rx.recv() {
@@ -277,14 +328,24 @@ impl MediaWorker {
                             }
                         }
                         Ok(PlaybackCmd::StartBlend { id, path, ts, aspect, blend: spec }) => {
-                            blend = Some((spec, None));
+                            // decoder_b is always opened lazily in the frame loop
+                            // (see ActiveBlend / NOTE block for why eager/async was abandoned).
+                            blend = Some(ActiveBlend { spec, decoder_b: None });
+                            let t0 = std::time::Instant::now();
+                            eprintln!("[pb] StartBlend received (idle), ts={ts:.3}");
                             match LiveDecoder::open(&path, ts, aspect, None) {
                                 Ok(mut d) => {
                                     let tpts = d.ts_to_pts(ts);
                                     d.burn_to_pts(tpts);
+                                    eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
                                     decoder = Some((id, d));
                                 }
-                                Err(e) => eprintln!("[pb] open (blend): {e}"),
+                                Err(e) => {
+                                    eprintln!("[pb] open (blend, idle): {e}");
+                                    // Bug 3 fix: blend was set just above; clear it here so we
+                                    // do not hold a dangling blend with no primary decoder.
+                                    blend = None;
+                                }
                             }
                         }
                         Ok(PlaybackCmd::Stop) => { blend = None; }
@@ -420,7 +481,9 @@ impl MediaWorker {
         // from the previous session.  The old order (drain then send) had a window
         // where the pb thread pushed a stale frame after the drain but before the
         // Start was processed.
-        let _ = self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect });
+        if self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect }).is_err() {
+            eprintln!("[pb] start_playback: command channel full — Start dropped. This is a bug.");
+        }
         while self.pb_rx.try_recv().is_ok() {}
     }
 
@@ -439,7 +502,9 @@ impl MediaWorker {
         aspect: f32,
         blend:  PlaybackTransitionSpec,
     ) {
-        let _ = self.pb_tx.try_send(PlaybackCmd::StartBlend { id, path, ts, aspect, blend });
+        if self.pb_tx.try_send(PlaybackCmd::StartBlend { id, path, ts, aspect, blend }).is_err() {
+            eprintln!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
+        }
         while self.pb_rx.try_recv().is_ok() {}
     }
 
@@ -515,6 +580,31 @@ impl MediaWorker {
         }
     }
 }
+
+// ── Blend decoder helpers ─────────────────────────────────────────────────────
+
+/// All state for an active blend zone inside the pb thread.
+///
+/// Replaces the raw `(PlaybackTransitionSpec, Option<LiveDecoder>)` tuple.
+struct ActiveBlend {
+    spec:      velocut_core::media_types::PlaybackTransitionSpec,
+    /// The secondary decoder, opened lazily when the blend zone is first reached.
+    decoder_b: Option<LiveDecoder>,
+}
+
+// NOTE — why there is no eager/async decoder_b pre-open:
+//
+// A previous attempt tried to open decoder_b on a background thread concurrently
+// with the primary burn, passing it back via a crossbeam channel.  This does not
+// compile: `LiveDecoder` contains `ffmpeg::software::scaling::Context` which wraps
+// `*mut SwsContext` and is not `Send`.  FFmpeg context objects must stay on the
+// thread that created them.
+//
+// The lazy-open path in the frame loop minimises the stall by using
+// `skip_until_pts` (decode-only, ~4x faster than `burn_to_pts`) for decoder_b.
+// decoder_b frames are used only for blending and are never checked against
+// `poll_playback`'s lower-bound timestamp gate, so the lazy-skip is safe here
+// even though it cannot be used for the primary decoder.
 
 // ── RGBA transition blending ──────────────────────────────────────────────────
 //

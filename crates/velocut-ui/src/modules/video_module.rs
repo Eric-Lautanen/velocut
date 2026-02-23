@@ -182,8 +182,8 @@ impl VideoModule {
                         // Check for an outgoing transition (clip_a → next) or an
                         // incoming one (prev → clip_b) so the pb thread can blend
                         // across the cut without an extra start/stop cycle.
-                        if let Some(spec) = build_blend_spec(state, clip)
-                            .or_else(|| build_incoming_blend_spec(state, clip))
+                        if let Some(spec) = build_incoming_blend_spec(state, clip)
+                            .or_else(|| build_blend_spec(state, clip))
                         {
                             ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, aspect, spec);
                         } else {
