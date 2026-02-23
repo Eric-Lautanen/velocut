@@ -56,16 +56,54 @@ Key variants: `SetTransition { after_clip_id, kind: TransitionType }`, `RemoveTr
 ## velocut-media/src/
 
 **`worker.rs`** — `MediaWorker`. Owns: latest-wins condvar scrub slot, pb decode thread (32-frame bounded channel), probe semaphore (max 4), shared result channel, **dedicated scrub channel `scrub_rx` cap=8** (scrub VideoFrames bypass shared rx), `encode_cancels: Arc<Mutex<HashMap<Uuid,Arc<AtomicBool>>>>`.
-Methods: `probe_clip` (dur+thumb+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot), `request_transition_frame(TransitionScrubRequest)` (spawns one-shot thread: decode_one_frame_rgba×2, blend, send to scrub_rx keyed by clip_a_id), `start_playback` (sends Start **before** draining pb_rx — logs loudly if try_send fails), `start_blend_playback(id,path,ts,aspect,PlaybackTransitionSpec)` (sends StartBlend **before** draining pb_rx — logs loudly if try_send fails), `stop_playback` (sends Stop then **drains pb_rx** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
-**`ActiveBlend` struct** (pb thread internal): `{ spec: PlaybackTransitionSpec, aspect: f32, decoder_b: Option<LiveDecoder> }` — `decoder_b` is always opened **lazily** at blend zone entry in the frame loop. **No eager/async pre-open**: `LiveDecoder` contains `ffmpeg::software::scaling::Context` (`*mut SwsContext`) which is not `Send` — cannot cross thread boundaries. Lazy open uses `skip_until_pts` (decode-only, ~4× faster than `burn_to_pts`) for decoder_b only; safe because decoder_b frames are never checked against `poll_playback`'s lower-bound timestamp gate. **⚠ NOTE: `aspect` param is dead/ignored in `LiveDecoder::open`** — output always native AR (`out_h=640*src_h/src_w`). Dimension mismatch on mixed-AR timelines not fixed at decoder level; fix must be in blend step (see unresolved bugs).
+Methods: `probe_clip` (dur+thumb+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot — sends `aspect > 0` = scrub/low-res), `request_frame_hq(id,path,ts)` (**NEW** — spawns one-shot thread calling `decode_frame` with `aspect=0.0`; result goes to `scrub_rx` so UI picks it up via low-latency path; used by L3 idle decode), `request_transition_frame(TransitionScrubRequest)` (spawns one-shot thread: decode_one_frame_rgba×2, blend, send to scrub_rx keyed by clip_a_id), `start_playback` (sends Start **before** draining pb_rx — logs loudly if try_send fails), `start_blend_playback(id,path,ts,aspect,PlaybackTransitionSpec)` (sends StartBlend **before** draining pb_rx — logs loudly if try_send fails), `stop_playback` (sends Stop then **drains pb_rx** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
+**`ActiveBlend` struct** (pb thread internal): `{ spec: PlaybackTransitionSpec, aspect: f32, decoder_b: Option<LiveDecoder> }` — `decoder_b` is always opened **lazily** at blend zone entry in the frame loop. **No eager/async pre-open**: `LiveDecoder` contains `ffmpeg::software::scaling::Context` (`*mut SwsContext`) which is not `Send` — cannot cross thread boundaries. Lazy open uses `skip_until_pts` (decode-only, ~4× faster than `burn_to_pts`) for decoder_b only; safe because decoder_b frames are never checked against `poll_playback`'s lower-bound timestamp gate.
+**decoder_b forced_size**: When opening decoder_b lazily, `primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))` is passed as `forced_size` to `LiveDecoder::open`. This ensures both decoders produce identically-sized RGBA buffers even when clips have different native resolutions — prevents the blend size mismatch guard from skipping all blend frames.
 Pb thread state also includes `held_blend: Option<Vec<u8>>` — the last successfully produced blended frame. Cleared on every Start/StartBlend/Stop/primary-EOF so it never bleeds across sessions.
-Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {..., decoder_b: None })`, clears `held_blend`, then opens+burns the **primary** decoder (same as Start). In frame loop: when `ts_secs >= spec.blend_start_ts`, `alpha = (alpha_start + local_t/duration).clamp(0,1)`. Lazy decoder_b open: set `db.skip_until_pts = tpts` then push to `b.decoder_b`. While `skip_until_pts > 0` (still_burning), `next_frame()` returns None in chunks of MAX_SKIP_PACKETS=60 (~30ms each) — during this window the frame loop sends `held_blend` (last blended frame, frozen) instead of raw primary. **Never send raw primary during still_burning** — that flashes the transition effect away for each skip chunk. Once burn completes, normal blend resumes and `held_blend` is updated each frame. Dimension guard: `data_b.len() != data.len() || wb != w || hb != h` → log + fall through to unblended frame. `decoder_b_exhausted` flag (set inside mutable-borrow closure, acted on after) clears `blend` at EOF. If `spec.invert_ab`, calls `blend_rgba_transition(data_b, data, ...)` else `blend_rgba_transition(data, data_b, ...)`. Blend cleared on Start/Stop/primary-EOF/decoder_b-EOF.
+Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {..., decoder_b: None })`, clears `held_blend`, then opens+burns the **primary** decoder (same as Start). In frame loop: when `ts_secs >= spec.blend_start_ts`, `alpha = (alpha_start + local_t/duration).clamp(0,1)`. Lazy decoder_b open: set `db.skip_until_pts = tpts` then push to `b.decoder_b`. While `skip_until_pts > 0` (still_burning), `next_frame()` returns None in chunks of MAX_SKIP_PACKETS=60 (~30ms each) — during this window the frame loop sends `held_blend` (last blended frame, frozen) instead of raw primary. **Never send raw primary during still_burning** — that flashes the transition effect away for each skip chunk. Once burn completes, normal blend resumes and `held_blend` is updated each frame. Dimension guard: `data_b.len() != data.len() || wb != w || hb != h` → log + fall through to unblended frame (should never trigger now that forced_size is passed). `decoder_b_exhausted` flag (set inside mutable-borrow closure, acted on after) clears `blend` at EOF. If `spec.invert_ab`, calls `blend_rgba_transition(data_b, data, ...)` else `blend_rgba_transition(data, data_b, ...)`. Blend cleared on Start/Stop/primary-EOF/decoder_b-EOF.
+
 **Instrumentation** (all `eprintln!`): Start/StartBlend received with ts, primary burn elapsed ms, frame #N every 60 frames with ts, primary EOF. `[tick]` logs: clip_changed event with current_time/clip.start_time/media_ids, which branch taken (start_blend_playback vs start_playback with alpha_start). `[blend_in]` logs: guard values (current_time, clip_b_start, elapsed, half_d, duration, kind), GUARD TRIGGERED message when returning None, returning Some with alpha_start/clip_a_tail/clip_b.source_offset.
 `blend_rgba_transition(a,b,w,h,alpha,kind)` — RGBA in-process blend matching YUV encode-path. All transition kinds implemented.
 
 **`encode.rs`** — `ClipSpec { path, source_offset, duration, volume, skip_audio }`, `EncodeSpec { job_id, clips, width, height, fps, output, transitions: Vec<ClipTransition> }`. `encode_timeline` blocking, own thread. `Context::new_with_codec(h264)`, CRF 18, preset fast, **`g=fps`** (keyframe/sec, critical for scrub), **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with`**, **fetch `ost_audio_tb` after `write_header`**. `CropScaler`: center-crop, pre-advance data ptrs to `crop_y` row, **pass `srcSliceY=0`** (never `crop_y` → EINVAL). Transition dispatch: `registry()` built once before clip loop. Decoder flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
 
-**`decode.rs`** — `LiveDecoder`: stateful per-clip. `next_frame()->Option<(Vec<u8>,w,h,ts_secs)>`, `advance_to(pts)` forward scrub, `burn_to_pts(pts)` sync pre-roll. `open(path,ts,aspect,cached_scaler)` — `cached_scaler: Option<(SwsContext,Pixel,u32,u32)>` reused if fmt+dims match. **`aspect` param is dead/ignored — output always source native AR** (`out_h=640*src_h/src_w`). `skip_until_pts` field: decode-only burn, ~4× faster than scale. `decode_one_frame_rgba(path,ts)->Result<(Vec<u8>,w,h)>` — one-shot for scrub transition blend.
+**`decode.rs`** — `LiveDecoder`: stateful per-clip. `next_frame()->Option<(Vec<u8>,w,h,ts_secs)>`, `advance_to(pts)` forward scrub, `burn_to_pts(pts)` sync pre-roll.
+
+`open(path, ts, aspect, cached_scaler, forced_size)` — **5 args now**:
+- `cached_scaler: Option<(SwsContext,Pixel,u32,u32)>` reused if fmt+dims match.
+- `forced_size: Option<(u32,u32)>` — highest priority override; used by decoder_b to match primary's exact output dims.
+- `aspect > 0` → scrub mode: fixed 320px wide, native source AR height. Low-res intentionally — L1/L2 only.
+- `aspect <= 0` → HQ/playback mode: native source resolution, no downscale. **pb thread always passes 0.0.**
+
+**Resolution rules** (in priority order):
+1. `forced_size` overrides everything — decoder_b always uses this.
+2. `aspect > 0` → 320px scrub decode.
+3. `aspect <= 0` → native source resolution.
+
+**`hw_device_ctx: Option<HwDeviceCtx>`** field added to `LiveDecoder`. D3D11VA hardware acceleration:
+- `HwDeviceCtx` RAII wrapper — calls `av_buffer_unref` on drop. Prevents device context leak on every scrub reset.
+- `try_create_d3d11va_device()` — creates `AV_HWDEVICE_TYPE_D3D11VA` device, returns `None` on failure (silent CPU fallback). Prints `[hwaccel] D3D11VA device created` on success.
+- Only enabled when `aspect <= 0.0` (playback/HQ). Scrub decoders (320px, short-lived, skip 99% of frames) skip hwaccel — PCIe transfer overhead not worth it.
+- `ensure_cpu_frame(frame)` — calls `av_hwframe_transfer_data` only when format is `AV_PIX_FMT_D3D11` (172) or `AV_PIX_FMT_D3D11VA_VLD` (113). CPU frames pass through untouched.
+- Scaler rebuilt lazily in `next_frame`/`advance_to` if `actual_fmt != decoder_fmt` — happens on first frame after D3D11VA transfer (D3D11→NV12). Only rebuilds once per decoder lifetime.
+- `let mut decoder` required (not `let decoder`) — `hw_device_ctx` is assigned via raw pointer after construction.
+
+**⚠ CURRENT BUG — D3D11VA: app loads and compiles without errors but videos don't play. Static image shown with audio playing in background.** Hwaccel decode path is producing frames that never reach the preview (either `ensure_cpu_frame` transfer failing silently, scaler rebuild not triggering, or hw frames being dropped before promotion to `frame_cache`). **Likely causes to investigate:**
+1. `ensure_cpu_frame` returning the original GPU frame unchanged (transfer fails, format check wrong).
+2. `av_hwframe_transfer_data` succeeding but output format being something `SwsContext` can't handle (e.g. `AV_PIX_FMT_NV12` not matching the scaler's expected input after rebuild).
+3. `hw_device_ctx` being attached after the first packet is already sent — FFmpeg requires `hw_device_ctx` set before `avcodec_open2` (before first `send_packet`). **Most likely root cause** — `LiveDecoder::open` calls `dec_ctx.decoder().video()?` which may internally call `avcodec_open2`, then we set `hw_device_ctx` after. Need to set it on the raw `AVCodecContext*` before opening.
+4. All call sites pass `aspect=0.0` to pb thread but scrub thread also gets `aspect=0.0` for HQ decode — check whether `try_create_d3d11va_device` is being called from too many places and exhausting D3D device slots.
+5. **Quickest diagnostic**: add `eprintln!` for `ensure_cpu_frame` input format and output format, and log whether `av_hwframe_transfer_data` returns success or error code.
+
+`skip_until_pts` field: decode-only burn, ~4× faster than scale. `decode_one_frame_rgba(path,ts)->Result<(Vec<u8>,w,h)>` — one-shot for scrub transition blend (still uses fixed 320px, no hwaccel).
+
+**FFmpeg configure (D3D11VA build)**:
+- Removed `--disable-d3d11va`, added `--enable-d3d11va`
+- Added `--enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,vp9_d3d11va,vp9_d3d11va2,av1_d3d11va,av1_d3d11va2,mpeg2_d3d11va,mpeg2_d3d11va2,mpeg4_d3d11va`
+- Added `-ld3d11 -ldxgi` to `--extra-ldflags`
+- `d3d11.dll`/`dxgi.dll` are Windows system DLLs — link against MinGW import libs (`/mingw64/lib/libd3d11.a`, `/mingw64/lib/libdxgi.a`), no bundling needed
+- If import libs missing: `pacman -S mingw-w64-x86_64-headers`
+- **Do NOT use backtick comments** (`` `# comment` ``) in the configure script — bash executes them as subshells, passes empty strings as args, configure exits silently
 
 **`probe.rs`** — `probe_duration`, `probe_video_size_and_thumbnail`. **SwsContext built lazily from first decoded frame** — never upfront (AVCC reports coded dims; Annex-B has `AV_PIX_FMT_NONE` pre-packet).
 
@@ -83,6 +121,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 `restore_snapshot()`: re-queues probes for clips with empty `waveform_peaks`.
 `poll_media()`: cleanup→probes/extracts→save dialog→`VideoModule::poll_playback`→`AppContext::ingest_media_results`.
 `update()`: layout→`preview.current_frame` from cache→drain cmds→tick modules→`current_time += stable_dt`→`request_repaint()` during encode.
+**`tick()` call site**: `VideoModule::tick(&self.state, &mut self.context, ctx)` — **3 args**, egui `ctx: &egui::Context` required as third arg (added this session).
 
 **`context.rs`** — `AppContext`. Scrub: `last_frame_req: Option<(Uuid,f64)>` exact ts, `scrub_coarse_req`, `scrub_last_moved`. Playback: `playback_media_id`, `prev_playing`, `audio_was_playing`. Caches: `thumbnail_cache`, `frame_cache`, `frame_bucket_cache` (capped `MAX_FRAME_CACHE_BYTES`≈192 MB, evicts 32 furthest via `select_nth_unstable_by_key`, values `(TextureHandle,usize)`), `pending_pb_frame`. Audio: `audio_stream`, `audio_sinks`.
 `ingest_media_results()`: drain `scrub_rx` **first** then shared `rx`. `CacheContext::clear_all()` drops all 4 caches + resets byte counter. `PlaybackContext::reset()` resets 6 fields.
@@ -92,25 +131,33 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 
 **`modules/library.rs`** — `LibraryModule { multi_selection: HashSet<Uuid> }`. **Not a unit struct — `LibraryModule::new()` in a `let` before struct literal.** Grid: `chunks(cols)+ui.horizontal()` — **do NOT use `horizontal_wrapped` or `egui::Grid` without explicit column count inside `ScrollArea::vertical()`** (unbounded width measurement, never wraps). `DND_PAYLOAD` written once on drag start only.
 
-**`modules/video_module.rs`** — Unit struct. `tick()` + `poll_playback()` + `active_media_id()` static.
+**`modules/video_module.rs`** — Unit struct. `tick(state, ctx, egui_ctx)` (**3 args — egui_ctx added this session**) + `poll_playback()` + `active_media_id()` static.
 `poll_playback()`: PTS-gated single-slot → `pending_pb_frame` → `frame_cache` when PTS due (±1 frame, not older than 3s). **Clip-transition eviction at very top** before frame_cache is read by preview. `request_repaint()` after promotion (background thread, not input event).
+
+**3-layer scrub** (current state after this session's fixes):
+- **L1 (0ms)**: nearest bucket cache hit, shown immediately on any drag pixel
+- **L2 (every move)**: `request_frame(aspect=active_video_ratio)` → 320px decode, fast
+- **L2b (per 2s)**: coarse prefetch ahead of scrub head
+- **L3 (150ms idle)**: `request_frame_hq(id, path, local_t)` — native resolution via `decode_frame(aspect=0.0)`, result arrives via `scrub_rx`. **Does NOT check `frame_cache` or `frame_bucket_cache`** — those checks permanently blocked L3 (frame_cache empty on first load; frame_bucket_cache always has L2's 320px entry under same key). After firing, sets `scrub_last_moved = None` to prevent re-firing every tick. Re-arms when playhead moves (scrub_moved sets `scrub_last_moved = Some(now)`).
+
+**L3 repaint scheduling**: done in the `else` (not-scrub-moved) branch. Each tick while waiting computes `remaining = 150ms - elapsed + 5ms` and calls `egui_ctx.request_repaint_after(remaining)` — self-rescheduling until threshold crossed. **Do NOT put `request_repaint_after` in `scrub_moved` branch** — that's a one-shot bet that fails if the repaint fires slightly early or egui drops it.
+
+**`tick()` playback mode**: passes `aspect=0.0` to both `start_playback` and `start_blend_playback` → `LiveDecoder` opens at native resolution → full quality in preview player. `crop_uv_rect` in `preview_module` handles any AR mismatch on the GPU at zero cost.
+
 `tick()` playback mode: on `just_started || clip_changed`, calls `build_incoming_blend_spec(state,clip)` first then `.or_else(||build_blend_spec(state,clip))`. **Order is critical** — `build_blend_spec` has no time guard and returns `Some` for any clip with an outgoing transition; it must be the fallback or it shadows the incoming spec. `build_incoming_blend_spec` has a direct time guard (`current_time < clip_b.start_time + D/2`) and safely returns `None` once the incoming zone has passed. Uses `start_blend_playback` if either returns `Some`, else `start_playback`.
 `build_blend_spec`: finds non-Cut transition after clip_a + next V-row clip → `PlaybackTransitionSpec { blend_start_ts = clip_a.source_offset + clip_a.duration − D/2, alpha_start: 0.0, invert_ab: false }`.
 `build_incoming_blend_spec`: finds preceding clip_a + its transition → **direct time guard**: `if elapsed >= half_d + TWO_FRAMES { return None; }` where `elapsed = current_time - clip_b.start_time` and `TWO_FRAMES = 2.0/30.0` (67ms buffer for stable_dt overshoot — **NOT** bare `half_d`; old bare guard was the root cause of the clip_b hard-cut bug). Returns None with logging on any failure path (clip_a not found, no transition, guard triggered). → `PlaybackTransitionSpec { clip_b_* fields carry clip_a tail decoder (clip_a.source_offset + clip_a.duration − D/2), blend_start_ts = clip_b.source_offset, alpha_start = 0.5 [FLAT — do NOT make dynamic], invert_ab: true }`.
-**⚠ CRITICAL — alpha_start must be exactly 0.5, never `0.5 + elapsed/D`**: The pb thread formula is `alpha = alpha_start + local_t/duration`. `blend_start_ts = clip_b.source_offset`, and the primary decoder is burned to `source_offset + elapsed`, so the first `ts_secs` from `next_frame()` is already `≈ source_offset + elapsed`, making `local_t ≈ elapsed` on frame 1. The elapsed offset is already in `local_t` — adding it again to `alpha_start` double-counts it and causes a visible iris/wipe size jump at the clip_b handoff. Flat `0.5` is correct.
+**⚠ CRITICAL — alpha_start must be exactly 0.5, never `0.5 + elapsed/D`**: The pb thread formula is `alpha = alpha_start + local_t/D`. `blend_start_ts = clip_b.source_offset`, and the primary decoder is burned to `source_offset + elapsed`, so the first `ts_secs` from `next_frame()` is already `≈ source_offset + elapsed`, making `local_t ≈ elapsed` on frame 1. The elapsed offset is already in `local_t` — adding it again to `alpha_start` double-counts it and causes a visible iris/wipe size jump at the clip_b handoff. Flat `0.5` is correct.
 `tick()` scrub: L1 nearest bucket (0ms), L2 exact decode every drag px, L2b coarse 2s prefetch, L3 precise 150ms idle. In L2, if `active_transition_at` returns Some → `request_transition_frame`; else → `request_frame`.
 `frame_bucket_cache` eviction — exactly 3 sites:
 1. Scrub clip change: `retain(|(id,_),_| *id != prev_id)`
 2. Playback stop (`just_stopped`): `clear()`
 3. Playhead in empty space: `retain` against `last_frame_req.prev_id`
 
-**`modules/timeline.rs`** — `{ transition_popup, transition_popup_just_opened, vol_popup, vol_popup_just_opened, last_scrub_emitted_time: f64 }`. Transition badges: `kind()!=Cut` (not Crossfade-specific), skip `track_row%2==1`. Popup fully registry-driven. Volume popup: dB readout, vertical slider −60..+6 dB. `draw_waveform()` scales peaks by `clip.volume`. Scrub dedup: `|t-last|<1/30s` skips emit. `fit_label(text,max_px)` from `helpers/format.rs` (6.5px/char heuristic).
-
-**`modules/audio_module.rs`** — `{ exhausted: HashSet<Uuid>, sink_has_played: HashSet<Uuid>, sink_created_at: HashMap<Uuid,Instant>, stream_warmup_ticks: u8 }`. `tick()` only. Top of every playing tick: diff `audio_sinks.keys()` vs timeline IDs, drop stale (handles undo during playback). Stream created lazily on first tick (WASAPI needs message loop running). `stream_warmup_ticks=5` after stream creation — no sinks until warmup passes (~83ms). `MIN_PLAY_SECS=1.5` guard: don't mark exhausted until sink has been alive ≥1.5s AND `sink_has_played` confirms it was non-empty at least once (prevents transient `empty()` false-positive in release builds). All tracking state cleared together when `audio_sinks` is cleared.
-
 **`modules/export_module.rs`** — `{ filename, quality: QualityPreset, fps, export_aspect, clear_confirm_at }`. Quality = short-side px. Two-stage Reset (5s countdown). Three states: Idle / Encoding (progress + Stop) / Done (green, 5s auto-dismiss) / Error.
 
 **`modules/preview_module.rs`** — `current_frame: Option<TextureHandle>` set by app.rs pre-`ui()`. UV crop helper `crop_uv_rect` for center-crop to project AR. Transport bar with custom-painted buttons.
+`crop_uv_rect(tex_w, tex_h, target_ar)` — GPU-side center-crop. Returns `(0,0)→(1,1)` when ARs match (no overhead). Handles mixed-AR clips where source native AR ≠ project AR without any CPU scaling. This is the correct layer for AR handling — **never use project AR to size decoder output**.
 
 ---
 
@@ -129,7 +176,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - DnD: `DND_PAYLOAD` written on drag start only. Cleared by TimelineModule on drop or no pointer down.
 - PTS comparisons always in seconds. Raw PTS only for seek target calc.
 - All seeks via `helpers::seek::seek_to_secs`. Never `ictx.seek()` directly.
-- **Never use project AR to size decode output.** Source native AR always. Consumers crop themselves.
+- **Never use project AR to size decoder output.** Source native AR always. `crop_uv_rect` in preview_module handles mismatch on GPU.
 - **Never pass `crop_y` as `srcSliceY`.** Pre-advance data ptrs, pass 0.
 - **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with` for MP4.** Both encoders.
 - **Fetch `ost_audio_tb` after `write_header`.**
@@ -147,6 +194,10 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - **`alpha_start` in `build_incoming_blend_spec` is always `0.5` (flat).** Never make it dynamic (`0.5 + elapsed/D`). The pb thread formula `alpha = alpha_start + local_t/D` already has elapsed baked into `local_t` because the primary decoder burns to `source_offset + elapsed` — making `alpha_start` dynamic double-counts elapsed and causes a visible effect-size pop.
 - **`held_blend` in pb thread cleared on every Start/StartBlend/Stop/primary-EOF.** Never let it bleed across blend sessions. Updated on each successful `blend_rgba_transition` call. Used as fallback only during `still_burning` skip window — never used as default output.
 - **`egui::Options::reduce_texture_memory` — do not enable.** Causes +20 MB idle overhead. Only beneficial for no-re-upload texture workloads; scrub/playback re-uploads every frame.
+- **`LiveDecoder::open` takes 5 args**: `(path, ts, aspect, cached_scaler, forced_size)`. All call sites must pass `None` for `forced_size` except the lazy decoder_b open in the pb thread blend loop, which passes `decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))`.
+- **pb thread always passes `aspect=0.0`** to `LiveDecoder::open` (both Start and StartBlend primary opens, and decoder_b pre-open). Scrub thread passes `aspect=active_video_ratio()` (> 0).
+- **L3 `request_repaint_after` belongs in the `else` branch** (idle wait), not `scrub_moved`. It must be self-rescheduling, not a one-shot.
+- **D3D11VA `hw_device_ctx` must be set before `avcodec_open2`** — currently set after `decoder().video()?` which may already open the codec. This is the likely cause of the static-image-with-audio bug. Fix: set on raw `AVCodecContext*` before the decoder open call, or use `avcodec_alloc_context3` + set hw_device_ctx + `avcodec_open2` manually.
 
 ---
 
@@ -201,46 +252,21 @@ For a transition of duration D between clip_a and clip_b:
 
 **CropScaler EINVAL on portrait→landscape** — passing `srcSliceY=crop_y`. Fix: pre-advance data ptrs, pass `srcSliceY=0`.
 
-**Mixed-AR clips stretched** — decode used project AR. Fix: `out_h=640*src_h/src_w` always.
+**Mixed-AR clips blurry in preview (all landscape/square ARs)** — `LiveDecoder` always output 320px wide × native AR height. For 16:9 project with portrait source, `crop_uv_rect` carves a `320×180` sliver from `320×568` texture (32% of pixels). Fix: two-tier resolution. `aspect > 0` → 320px scrub. `aspect <= 0` → native resolution. pb thread passes `0.0`. L3 uses `request_frame_hq` (`decode_frame` with `aspect=0.0`).
 
-**Dip-to-black showed green** — YUV420P black needs U=V=128, not 0. Fix: blend Y toward 0, U/V toward 128.
+**L3 never firing (scrub stays blurry after stopping)** — Two bugs: (1) `frame_bucket_cache` check: L2's 320px result stored there under same `fine_key` — check always true, always blocked L3. (2) `frame_cache` check: on first clip placement, L2 async, cache empty, L3 blocked. Fix: remove both guards. Use `scrub_last_moved = None` as one-shot debounce instead.
 
-**Transition fires D seconds early (full zone inside clip_a)** — zone was `[clip_a_end−D, clip_a_end)`. Fix: center on cut → `[clip_a_end−D/2, clip_a_end+D/2)`. Update `blend_start_ts` to use `D/2`.
+**L3 not firing without mouse movement** — `request_repaint_after` was in `scrub_moved` branch (one-shot). If that repaint fired slightly early or was dropped, nothing rescheduled it. Fix: move repaint scheduling to `else` branch. Each tick computes exact remaining time and reschedules — self-sustaining chain until threshold crossed.
 
-**pb thread freeze at clip_b start** — `open_decoder_b_if_immediate` burned decoder_b synchronously in the StartBlend handler while pb_rx was already empty (drained by `start_blend_playback`). For large-GOP sources, combined open+burn exceeded 1s → visible freeze. Fix: removed eager open; decoder_b is always opened lazily at blend zone entry using `db.skip_until_pts = tpts` (~4× faster than `burn_to_pts`). Async thread approach tried and rejected: `LiveDecoder` is not `Send` (`*mut SwsContext` inside `SwsContext`).
+**`tick()` missing `egui_ctx` arg** — `request_repaint_after` needed inside tick. Fix: add `egui_ctx: &egui::Context` as third param. Update call site in `app.rs`: `VideoModule::tick(&self.state, &mut self.context, ctx)`.
 
-**Project unplayable after transition stop/restart** — orphaned `blend` state: in the StartBlend idle-branch, primary `LiveDecoder::open` failure set `decoder = None` but left `blend = Some(...)`. On the next `clip_changed`, `playback_media_id` was already updated, so `clip_changed` never fired again; pb thread blocked on `recv()` indefinitely. Fix: `blend = None` added to the `Err` arm of both StartBlend branches (active and idle).
+**Blend size mismatch on mixed-resolution timelines** — clips with different native res (e.g. 1504×832 vs 1376×928) decoded to different sizes. Every blend frame skipped: `[pb] blend size mismatch`. Fix: `forced_size: Option<(u32,u32)>` added to `LiveDecoder::open`. Lazy decoder_b open passes `primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))` — decoder_b rescaled to exactly match primary.
 
-**Silent `try_send` dropping Start/StartBlend** — `let _ = self.pb_tx.try_send(...)` discarded failures silently. Under rapid transitions or stop+start cycles, the cap-4 command channel could be full. Fix: all three public methods (`start_playback`, `start_blend_playback`, `stop_playback`) now `eprintln!` loudly on `try_send` failure.
+**`configure_ffmpeg.sh` ran silently** — backtick comments (`` `# comment` ``) are subshell executions in bash. Each passed an empty string arg to `./configure`, which exited silently. Fix: remove all backtick comments, use plain flat script with `set -e` and `echo` statements.
 
-**Transition second half hard-cuts** — `clip_changed` fires on clip_b start → `start_playback` replaces blend. Fix: `build_incoming_blend_spec` with `alpha_start=0.5, invert_ab=true`; direct time guard instead of `active_transition_at` guard.
+**`cannot borrow decoder as mutable`** — `hw_device_ctx` assignment via raw pointer after decoder construction required `let mut decoder`. Fix: change `let decoder` to `let mut decoder` in `LiveDecoder::open`.
 
-**`active_transition_at` returns None with 3+ clips** — `?` operator on transition find exits entire function at first pair with no transition. Fix: `match...{ None => continue }` in pair loop.
-
-**`build_blend_spec` shadows `build_incoming_blend_spec` (or_else ordering)** — `build_blend_spec` has no time guard; any clip with an outgoing transition returns `Some` immediately, hiding the incoming spec. Fix: swap order in `tick()` to `build_incoming_blend_spec(..).or_else(|| build_blend_spec(..))`. `build_incoming_blend_spec` has a direct time guard and returns `None` once the playhead clears the incoming zone, safely falling through to the outgoing spec.
-
-**`build_incoming_blend_spec` guard firing on normal playback (bare `half_d`)** — `current_time >= clip_b.start_time + half_d` triggered on a single late tick. Any stable_dt spike or frame drop pushed elapsed past bare half_d → returned `None` → `start_playback` → hard cut on clip_b. Confirmed via `[blend_in] GUARD TRIGGERED` log. Fix: guard is `elapsed >= half_d + TWO_FRAMES` (TWO_FRAMES = 2/30 ≈ 67ms). Now returns Some with correct alpha_start during normal playback.
-
-**`alpha_start` hardcoded 0.5 causing sync drift on late clip_changed** — If tick() fired 30ms after the cut point, blend would start at alpha=0.5 ignoring elapsed time, causing a tiny visual discontinuity. Attempted fix: `alpha_start = clamp(0.5 + elapsed/duration, 0.5, 1.0)`. **This was later found to be wrong** — see "alpha_start double-counting" resolved entry. Correct value is flat 0.5; elapsed is already implicit in local_t.
-
-**decoder_b size mismatch on mixed-AR timelines (passing aspect to LiveDecoder)** — Attempted fix: add `aspect: f32` to `ActiveBlend`, pass project AR to `LiveDecoder::open` for decoder_b. Did not work: `aspect` param is dead/ignored in `LiveDecoder::open` (always native AR, by design). Real fix is in blend step: crop decoder_b RGBA output to primary dimensions before calling `blend_rgba_transition`. See unresolved section.
-
-**✅ RESOLVED — pb thread freeze at clip_b + unplayable after stop/restart** — Root causes identified and fixed:
-- `open_decoder_b_if_immediate` ran synchronously on the pb thread, burning through the GOP while pb_rx was empty (just drained by `start_blend_playback`), causing a visible freeze. Fix: removed eager open entirely; decoder_b is now always opened lazily at blend zone entry using `skip_until_pts` (~4× faster). Async thread approach was attempted but rejected — `LiveDecoder` is not `Send` (`*mut SwsContext`).
-- Primary open failure in StartBlend idle-branch did not clear `blend`, leaving orphaned blend state with no primary decoder. Fix: `blend = None` added to Err arm in both StartBlend branches.
-- `try_send` failures for Start/StartBlend were silent. Fix: both now `eprintln!` loudly on failure.
-- Instrumentation added: Start/StartBlend received with ts, burn elapsed ms, frame #N every 60 frames, EOF.
-
-**✅ RESOLVED — `build_incoming_blend_spec` guard firing on normal playback** — Old guard `current_time >= clip_b.start_time + half_d` triggered on any single late tick (stable_dt overshoot, frame drop). For a 1s half_d, a 16ms overshoot at 60fps was enough. Fix: guard is now `elapsed >= half_d + TWO_FRAMES` (67ms buffer). Confirmed via `[blend_in]` logs: guard no longer fires during normal playback; `build_incoming_blend_spec` now returns `Some` with correct `alpha_start`.
-
-**✅ RESOLVED — `alpha_start` double-counting elapsed causing iris/wipe size jump at clip_b handoff** — Root cause: `build_incoming_blend_spec` set `alpha_start = clamp(0.5 + elapsed/duration, 0.5, 1.0)` to compensate for late `clip_changed`. But the pb thread formula is `alpha = alpha_start + local_t/duration`, and `local_t = ts_secs - blend_start_ts`. Since the primary decoder was burned to `source_offset + elapsed`, the first `ts_secs` is already `≈ source_offset + elapsed`, so `local_t ≈ elapsed` on frame 1 — elapsed was already in `local_t`. The dynamic `alpha_start` double-counted it, causing `alpha ≈ 0.5 + 2×elapsed/D` on the first frame — a visible pop at the steepest part of `ease_in_out`. Fix: `alpha_start = 0.5` (flat). The `local_t` ramp naturally accounts for elapsed from frame 1 onward.
-
-**✅ RESOLVED — transition effect disappearing for 1-3 frames at clip_b start (still_burning flash)** — Root cause: while decoder_b's `skip_until_pts` burn was in progress, `next_frame()` returned None in MAX_SKIP_PACKETS=60 chunks (~30ms each). The `still_burning` path fell through to `blended.unwrap_or(data)` = raw unblended primary frame — no iris circle, no wipe bar, etc. — for every burn chunk. Fix: `held_blend: Option<Vec<u8>>` added to pb thread state. On successful blend: `held_blend = Some(result.clone())`. During `still_burning`: use `held_blend` (frozen last blended frame) instead of raw primary. Frozen blended frame for ~60ms is invisible; flashing the effect away is not. `held_blend` cleared on every Start/StartBlend/Stop/primary-EOF.
-
-**✅ RESOLVED — ~500ms pause at clip boundary on clip_b incoming blend** — Root cause: previous fix pre-opened decoder_b synchronously with `burn_to_pts` inside the `StartBlend` handler. decoder_b for `invert_ab=true` is clip_a tail — potentially deep into a long file — so the synchronous burn could take 300-500ms, blocking the pb thread and emptying `pb_rx` → UI freeze. Fix: reverted to lazy open + `skip_until_pts`; the `held_blend` frozen-frame mechanism makes the skip window invisible so no raw-primary flash occurs.
-
-**⚠ UNRESOLVED — clip_b different-AR: jump cut after clip_a transition** — Confirmed via logs: `[pb] blend size mismatch — primary 320×176 vs decoder_b 320×214; skipping blend` on every frame for the full blend zone. `aspect` param is dead/ignored in `LiveDecoder::open` — output is always native AR. Fix must be in the **blend step**, not the decoder.
-**Fix direction**: In the blend phase-2 closure, after `db.next_frame()` returns `(data_b, wb, hb, _)`, if `wb != w || hb != h`, call `crop_rgba(&data_b, wb, hb, w, h)` before `blend_rgba_transition`. `crop_rgba` already exists in `worker.rs` (used by `request_transition_frame`). Only allocates when dims differ — same-AR clips hit the existing fast path unchanged.
+**⚠ CURRENT (UNRESOLVED) — D3D11VA: static image with audio** — App compiles and loads. Videos don't play — static image shown, audio plays correctly. Root cause: `hw_device_ctx` is set on `AVCodecContext*` after `dec_ctx.decoder().video()?` which likely calls `avcodec_open2` internally. FFmpeg requires hardware device context to be set **before** codec open. The decoder never initialises hardware acceleration, and the subsequent `ensure_cpu_frame` + scaler path either fails silently or produces empty frames. **Fix direction**: either (a) use lower-level FFmpeg API to set `hw_device_ctx` before `avcodec_open2`, or (b) disable hwaccel entirely and revert `hw_device_ctx` field until the ordering issue is solved. Option (b) is faster — CPU decode at native res is already a major quality improvement over the old 320px decode.
 
 ---
 
@@ -274,6 +300,7 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 ---
 
 ## Known Future Work
+- **D3D11VA ordering fix**: set `hw_device_ctx` before `avcodec_open2`. Requires lower-level codec init than `dec_ctx.decoder().video()?` provides. May need changes to `ffmpeg-the-third` fork to expose pre-open hook.
 - **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
 - **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
 - **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
@@ -285,10 +312,11 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 ## Current State (Feb 2026)
 - ~10K lines, 4-panel layout (library / preview / export / timeline), custom title bar
 - Transitions: Crossfade, Dip-to-Black, Iris, Wipe, Push — registry-driven, zero hardcoding
-- Transition preview: scrub blend correct (both halves). Live playback blend: both clip_a and clip_b halves work correctly for same-AR clips. One remaining bug: different-AR clips get a jump cut for the full blend zone (decoder_b output dims mismatch primary — `crop_rgba` fix needed in blend step, see unresolved section).
+- Transition preview: scrub blend correct (both halves). Live playback blend: both clip_a and clip_b halves work correctly for same-AR clips. Mixed-res clips: forced_size fix applied — decoder_b now matches primary dimensions.
+- Preview quality: 3-layer scrub (L1 cached 320px, L2 exact 320px, L3 idle HQ native-res). Playback at native resolution. AR mismatch handled by GPU-side `crop_uv_rect`.
 - Audio extraction: dedicated audio library entry, correct WAV playback
 - Undo/redo: 50-snapshot, VecDeque
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
-- Scrub: 3-layer (L1 cached, L2 exact, L3 idle), dedicated scrub_rx, transition blend decode
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
 - Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.
+- FFmpeg: custom static build with D3D11VA compiled in. **⚠ D3D11VA currently broken** (static image bug — hw_device_ctx set after codec open). CPU decode path works correctly at native resolution.
