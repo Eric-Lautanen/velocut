@@ -134,6 +134,43 @@ impl VideoTransition for Push {
 
         out
     }
+
+    /// Direct RGBA push — same displacement logic as `apply`, no YUV round-trip.
+    /// Pure pixel copy: no blending, no color math. Rayon over rows.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width:   u32,
+        _height: u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "Push::apply_rgba — frame size mismatch");
+        let p        = ease_in_out_cubic(alpha);
+        let boundary = ((1.0 - p) * width as f32).round() as usize;
+        let shift_a  = (p * width as f32).round() as usize;
+        let w        = width as usize;
+        let row_bytes = w * 4;
+        let mut out  = vec![0u8; frame_a.len()];
+        out.par_chunks_mut(row_bytes)
+            .zip(frame_a.par_chunks(row_bytes))
+            .zip(frame_b.par_chunks(row_bytes))
+            .for_each(|((o_row, a_row), b_row)| {
+                for px in 0..w {
+                    let base = px * 4;
+                    if px < boundary {
+                        let src_x = (px + shift_a).min(w - 1);
+                        o_row[base..base + 4].copy_from_slice(&a_row[src_x * 4..src_x * 4 + 4]);
+                    } else {
+                        let src_x = px - boundary;
+                        o_row[base..base + 4].copy_from_slice(&b_row[src_x * 4..src_x * 4 + 4]);
+                    }
+                }
+            });
+        out
+    }
 }
 
 #[cfg(test)]

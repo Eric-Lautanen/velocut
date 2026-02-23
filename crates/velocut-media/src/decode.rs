@@ -51,6 +51,7 @@ pub struct LiveDecoder {
     /// D3D11VA hardware device context.  Some when hwaccel init succeeded;
     /// None when unavailable or init failed (automatic CPU fallback).
     /// Kept alive for the lifetime of the decoder — FFmpeg ref-counts it internally.
+    #[allow(dead_code)]
     hw_device_ctx: Option<HwDeviceCtx>,
 }
 

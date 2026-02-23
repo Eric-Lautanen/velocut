@@ -108,6 +108,48 @@ impl VideoTransition for BarnDoors {
 
         out
     }
+
+    /// Direct RGBA barn doors — same center-split displacement as `apply`, no YUV round-trip.
+    /// Pure pixel copy: no blending, no color math. Rayon over rows.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width:   u32,
+        _height: u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "BarnDoors::apply_rgba — frame size mismatch");
+        let t     = ease_in_out_cubic(alpha);
+        let slide = (t * width as f32 * 0.5).round() as usize;
+        let half  = (width / 2) as usize;
+        let w     = width as usize;
+        let row_bytes = w * 4;
+        let mut out = vec![0u8; frame_a.len()];
+        out.par_chunks_mut(row_bytes)
+            .zip(frame_a.par_chunks(row_bytes))
+            .zip(frame_b.par_chunks(row_bytes))
+            .for_each(|((o_row, a_row), b_row)| {
+                for px in 0..w {
+                    let base = px * 4;
+                    if px + slide < half {
+                        // Left door — sample frame_a shifted right by slide
+                        let src_x = (px + slide).min(w - 1);
+                        o_row[base..base + 4].copy_from_slice(&a_row[src_x * 4..src_x * 4 + 4]);
+                    } else if px >= half + slide {
+                        // Right door — sample frame_a shifted left by slide
+                        let src_x = px.saturating_sub(slide);
+                        o_row[base..base + 4].copy_from_slice(&a_row[src_x * 4..src_x * 4 + 4]);
+                    } else {
+                        // Gap between doors — reveal frame_b
+                        o_row[base..base + 4].copy_from_slice(&b_row[base..base + 4]);
+                    }
+                }
+            });
+        out
+    }
 }
 
 #[cfg(test)]

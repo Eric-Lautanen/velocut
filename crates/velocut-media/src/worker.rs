@@ -375,6 +375,21 @@ impl MediaWorker {
                                 coast_last_primary = Some(data.clone());
                             }
 
+                            // Early-exit: once alpha reaches 1.0 the transition is done.
+                            // Nullify blend_params so the Phase 2 if-let falls straight
+                            // through to raw `data` — bypassing the closure, the
+                            // held_blend streak counter, and any further apply_rgba calls.
+                            // Primary at this point IS clip_b (invert_ab=true path) so
+                            // passing it through unmodified is correct.
+                            let blend_params = if blend_params.as_ref().map(|(_, _, a, _, _)| *a >= 1.0).unwrap_or(false) {
+                                blend      = None;
+                                held_blend = None;
+                                eprintln!("[blend] alpha=1.0 — transition complete, dropping blend");
+                                None
+                            } else {
+                                blend_params
+                            };
+
                             // Phase 2: mutable access to open decoder_b lazily and blend.
                             // decoder_b_exhausted is set inside the closure (which
                             // holds a mutable borrow on blend) and acted on after it

@@ -74,6 +74,44 @@ impl VideoTransition for DipToWhite {
 
         out
     }
+
+    /// Direct RGBA dip-to-white — no YUV round-trip.
+    /// RGBA white = (255, 255, 255, 255). Alpha channel held at 255 throughout.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        _width:  u32,
+        _height: u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "DipToWhite::apply_rgba — frame size mismatch");
+        let mut out = vec![0u8; frame_a.len()];
+        if alpha < 0.5 {
+            let t = ease_in_out(alpha * 2.0);
+            out.par_chunks_mut(4)
+                .zip(frame_a.par_chunks(4))
+                .for_each(|(o, a)| {
+                    o[0] = blend_byte(a[0], 255, t);
+                    o[1] = blend_byte(a[1], 255, t);
+                    o[2] = blend_byte(a[2], 255, t);
+                    o[3] = 255;
+                });
+        } else {
+            let t = ease_in_out((alpha - 0.5) * 2.0);
+            out.par_chunks_mut(4)
+                .zip(frame_b.par_chunks(4))
+                .for_each(|(o, b)| {
+                    o[0] = blend_byte(255, b[0], t);
+                    o[1] = blend_byte(255, b[1], t);
+                    o[2] = blend_byte(255, b[2], t);
+                    o[3] = 255;
+                });
+        }
+        out
+    }
 }
 
 #[cfg(test)]

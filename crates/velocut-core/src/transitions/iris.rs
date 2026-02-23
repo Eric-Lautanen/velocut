@@ -127,6 +127,43 @@ impl VideoTransition for Iris {
 
         out
     }
+
+    /// Direct RGBA iris — same expanding-circle geometry as `apply`, no YUV round-trip.
+    /// Rayon parallelises over rows via `enumerate` so each row knows its `py`.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width:   u32,
+        height:  u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "Iris::apply_rgba — frame size mismatch");
+        let radius    = ease_in_out_cubic(alpha) * MAX_RADIUS;
+        let row_bytes = (width * 4) as usize;
+        let mut out   = vec![0u8; frame_a.len()];
+        out.par_chunks_mut(row_bytes)
+            .zip(frame_a.par_chunks(row_bytes))
+            .zip(frame_b.par_chunks(row_bytes))
+            .enumerate()
+            .for_each(|(py, ((o_row, a_row), b_row))| {
+                let ny = norm_y(py as u32, height);
+                for px in 0..width as usize {
+                    let nx   = norm_x(px as u32, width);
+                    let dist = center_dist(nx, ny);
+                    let a    = wipe_alpha(radius, dist, FEATHER);
+                    let base = px * 4;
+                    // Same convention as apply: blend_byte(ya, yb, a) → a=0→frame_a, a=1→frame_b
+                    o_row[base]     = blend_byte(a_row[base],     b_row[base],     a);
+                    o_row[base + 1] = blend_byte(a_row[base + 1], b_row[base + 1], a);
+                    o_row[base + 2] = blend_byte(a_row[base + 2], b_row[base + 2], a);
+                    o_row[base + 3] = 255;
+                }
+            });
+        out
+    }
 }
 
 #[cfg(test)]

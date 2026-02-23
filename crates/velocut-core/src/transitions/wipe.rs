@@ -116,6 +116,40 @@ impl VideoTransition for Wipe {
 
         out
     }
+
+    /// Direct RGBA wipe — same L→R geometry as `apply`, no YUV round-trip.
+    /// Rayon parallelises over rows; per-pixel geometry is stateless.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width:   u32,
+        _height: u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "Wipe::apply_rgba — frame size mismatch");
+        let edge      = ease_in_out(alpha);
+        let row_bytes = (width * 4) as usize;
+        let mut out   = vec![0u8; frame_a.len()];
+        out.par_chunks_mut(row_bytes)
+            .zip(frame_a.par_chunks(row_bytes))
+            .zip(frame_b.par_chunks(row_bytes))
+            .for_each(|((o_row, a_row), b_row)| {
+                for px in 0..width as usize {
+                    let nx   = norm_x(px as u32, width);
+                    let wa   = wipe_alpha(nx, edge, FEATHER);
+                    let base = px * 4;
+                    // Same convention as apply: blend_byte(b, a, wa) → wa=0→b, wa=1→a
+                    o_row[base]     = blend_byte(b_row[base],     a_row[base],     wa);
+                    o_row[base + 1] = blend_byte(b_row[base + 1], a_row[base + 1], wa);
+                    o_row[base + 2] = blend_byte(b_row[base + 2], a_row[base + 2], wa);
+                    o_row[base + 3] = 255;
+                }
+            });
+        out
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@
 // ╚══════════════════════════════════════════════════════════════╝
 //
 //   1. Create `transitions/my_transition.rs`, impl `VideoTransition`
-//      (all 5 required methods: kind, label, icon, build, apply).
+//      (all 6 required methods: kind, label, icon, build, apply, apply_rgba).
+//      `apply`      → packed YUV420P (encode path).
+//      `apply_rgba` → packed RGBA (playback/scrub path); use rayon `par_chunks_mut`
+//                     over rows, must be stateless across rows.
 //
 //   2. Add ONE line to `declare_transitions!` below:
 //        my_transition::MyTransition => MyKind,
@@ -218,19 +221,7 @@ pub trait VideoTransition: Send + Sync {
         width:   u32,
         height:  u32,
         alpha:   f32,
-    ) -> Vec<u8> {
-        use rayon::prelude::*;
-        use crate::transitions::helpers::{rgba_to_yuv420p, yuv420p_to_rgba};
-        // Run both RGBA→YUV conversions in parallel, then blend, then convert back.
-        // Transitions that work directly in RGBA (e.g. Crossfade) should override
-        // this method entirely to skip the round-trip.
-        let (yuv_a, yuv_b) = rayon::join(
-            || rgba_to_yuv420p(frame_a, width, height),
-            || rgba_to_yuv420p(frame_b, width, height),
-        );
-        let yuv_out = self.apply(&yuv_a, &yuv_b, width, height, alpha);
-        yuv420p_to_rgba(&yuv_out, width, height)
-    }
+    ) -> Vec<u8>;
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
