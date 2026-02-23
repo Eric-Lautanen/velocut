@@ -192,7 +192,8 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - **`LiveDecoder::open` takes 5 args**: `(path, ts, aspect, cached_scaler, forced_size)`. All call sites must pass `None` for `forced_size` except the lazy decoder_b open in the pb thread blend loop, which passes `decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))`.
 - **pb thread always passes `aspect=0.0`** to `LiveDecoder::open` (both Start and StartBlend primary opens, and decoder_b pre-open). Scrub thread passes `aspect=active_video_ratio()` (> 0).
 - **L3 `request_repaint_after` belongs in the `else` branch** (idle wait), not `scrub_moved`. It must be self-rescheduling, not a one-shot.
-- **D3D11VA `hw_device_ctx` must be set before `avcodec_open2`** — enforced in `LiveDecoder::open`: `let mut dec_ctx = dec_ctx` then `(*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref` BEFORE `dec_ctx.decoder().video()?`. Never move hwaccel setup to after the decoder open call.
+- **`blend_rgba_transition` is rayon-parallelised** — `apply_rgba` in each `VideoTransition` impl splits the output row range with `par_chunks_mut`. All transition impls must be stateless (no shared mutable state across rows). The `rayon` dep lives in `velocut-core`. `blend_rgba_transition` in `worker.rs` is unchanged — parallelism is inside each transition's `apply_rgba`.
+- **AVPixelFormat comparisons use ffi enum constants, never hardcoded integers.** The numeric value of `AV_PIX_FMT_D3D11` is 171 in this fork (not mainline 172). Always `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`.
 
 ---
 
@@ -295,6 +296,7 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 ---
 
 ## Known Future Work
+- **wgpu GPU compute blend** *(high value, medium effort)*: replace `blend_rgba_transition` CPU path with a WGSL compute shader dispatched from the pb thread. eframe 0.33 already owns a wgpu `Device`+`Queue` — expose them via `Arc` at `MediaWorker::new()`. Upload both NV12 frames as textures, blend in shader (NV12→RGBA in one pass), output a `wgpu::Texture` returned via `register_native_texture` instead of `Vec<u8>`. Touches: `worker.rs`, `media_types.rs` (`PlaybackFrame` gains texture-ID variant), `context.rs`, `video_module.rs`, `preview_module.rs`. **Do not attempt until rayon interim is in place.** Raw Vulkan (`ash`) is excessive for this use case — stay on wgpu.
 - **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
 - **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
 - **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
@@ -313,4 +315,5 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
 - Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.
-- FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active** — `hw_device_ctx` now set on `dec_ctx` pre-open (before `avcodec_open2`). Lazy scaler rebuild in `next_frame()`/`advance_to()` handles D3D11→NV12 format change on first frame. CPU fallback still available if device init fails.
+- FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active and confirmed** — `get_format` callback fires, `AV_PIX_FMT_D3D11 (171)` selected for all three decoders (primary, decoder_b, recycled primary). Format value is build-specific (171 in this fork, not mainline 172) — all comparisons use `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`, never hardcoded integers. CPU fallback still available if device init fails.
+- **Transition blend perf**: blend currently done in RGBA on CPU (`blend_rgba_transition`). At 1504×832 this is ~10 MB/frame; at 4K it becomes ~64 MB/frame and saturates CPU memory bandwidth. **Interim fix: rayon parallel blend** (in progress). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
