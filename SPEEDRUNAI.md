@@ -300,10 +300,11 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Transition math: `transitions::helpers::{frame_alpha, blend_byte, blend_buffers, alloc_frame, ease_in_out, ease_in_out_cubic, ease_in_out_sine, split_planes, chroma_dims, norm_xy, center_dist, wipe_alpha, sample_plane, sample_plane_clamped}`
 - Logging: `crate::helpers::log::vlog` / `velocut_log!()` macro
 
----    
+---
 
 ## Known Future Work
-- **wgpu GPU compute blend** *(high value, medium effort)*: replace `blend_rgba_transition` CPU path with a WGSL compute shader dispatched from the pb thread. eframe 0.33 already owns a wgpu `Device`+`Queue` — expose them via `Arc` at `MediaWorker::new()`. Upload both NV12 frames as textures, blend in shader (NV12→RGBA in one pass), output a `wgpu::Texture` returned via `register_native_texture` instead of `Vec<u8>`. Touches: `worker.rs`, `media_types.rs` (`PlaybackFrame` gains texture-ID variant), `context.rs`, `video_module.rs`, `preview_module.rs`. **Do not attempt until rayon interim is in place.** Raw Vulkan (`ash`) is excessive for this use case — stay on wgpu.
+- **wgpu GPU compute blend** *(high value, medium effort)*: replace `blend_rgba_transition` CPU path with a WGSL compute shader dispatched from the pb thread. eframe 0.33 already owns a wgpu `Device`+`Queue` — expose them via `Arc` at `MediaWorker::new()`. Upload both NV12 frames as textures, blend in shader (NV12→RGBA in one pass), output a `wgpu::Texture` returned via `register_native_texture` instead of `Vec<u8>`. Touches: `worker.rs`, `media_types.rs` (`PlaybackFrame` gains texture-ID variant), `context.rs`, `video_module.rs`, `preview_module.rs`. **Do not attempt until rayon interim is confirmed stable.**
+- **Hardware encode fallback** *(high value, low effort)*: try `h264_nvenc` → `h264_amf` → `h264_qsv` → `libx264` at encode start. Hardware encoders use different quality opts — need `apply_encoder_quality_opts(opts, codec_name)` helper that branches on codec name (NVENC uses `cq`, AMF uses `qp_i`/`qp_p`/`qp_b`). `AV_CODEC_FLAG_GLOBAL_HEADER` and `g=fps` carry over unchanged. ~8–12× faster at 4K, offloads CPU during export so playback stays smooth. Optional UI toggle: Software (best quality) / Hardware (faster).
 - **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
 - **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
 - **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
@@ -315,12 +316,14 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 ## Current State (Feb 2026)
 - ~10K lines, 4-panel layout (library / preview / export / timeline), custom title bar
 - Transitions: Crossfade, Dip-to-Black, Iris, Wipe, Push — registry-driven, zero hardcoding
-- Transition preview: scrub blend correct (both halves). Live playback blend: both clip_a and clip_b halves work correctly for same-AR clips. Mixed-res clips: forced_size fix applied — decoder_b now matches primary dimensions.
-- Preview quality: 3-layer scrub (L1 cached 320px, L2 exact 320px, L3 idle HQ native-res). Playback at native resolution. AR mismatch handled by GPU-side `crop_uv_rect`.
+- Transition preview: scrub blend correct (both halves). L3 idle (150ms) now fires `request_transition_frame_hq` when playhead is inside a transition zone — both clips decoded at native resolution and blended, replacing the 320px scrub thumbnail with a full-quality frame. L2 drag-pixel path unchanged (320px fast). Live playback blend: both clip_a and clip_b halves work correctly for same-AR clips. Mixed-res clips: forced_size fix applied — decoder_b now matches primary dimensions.
+- **Outgoing-blend stutter eliminated**: `StartBlend` (active decoder branch, `invert_ab=false`) now detects that the primary decoder is already on clip_a's path and reuses it directly instead of reopening. File-open + keyframe-seek + burn_to_pts no longer stalls the pb thread at transition onset. Fallback fresh-open still used when decoder is absent or on a different path.
+- Preview quality: 4-tier scrub (L1 cached 320px, L2 exact 320px, L3 idle HQ native-res single-clip, L3 idle HQ native-res transition blend). Playback at native resolution. AR mismatch handled by GPU-side `crop_uv_rect`.
 - Audio extraction: dedicated audio library entry, correct WAV playback
 - Undo/redo: 50-snapshot, VecDeque
 - Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
 - Memory: ~90 MB idle, ~120 MB peak, returns to baseline on stop. No leaks in normal use.
 - FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active and confirmed** — `get_format` callback fires, `AV_PIX_FMT_D3D11 (171)` selected for all three decoders (primary, decoder_b, recycled primary). Format value is build-specific (171 in this fork, not mainline 172) — all comparisons use `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`, never hardcoded integers. CPU fallback still available if device init fails.
-- **Transition blend perf**: blend currently done in RGBA on CPU (`blend_rgba_transition`). At 1504×832 this is ~10 MB/frame; at 4K it becomes ~64 MB/frame and saturates CPU memory bandwidth. **Interim fix: rayon parallel blend — DONE** (`apply_rgba` in all 5 transition impls uses `par_chunks_mut`). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
+- **Transition blend perf**: blend done in RGBA on CPU (`blend_rgba_transition`). At 1504×832 this is ~10 MB/frame; at 4K it becomes ~64 MB/frame and saturates CPU memory bandwidth. **Interim fix: rayon parallel blend — DONE** (`apply_rgba` in all 5 transition impls uses `par_chunks_mut`). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
+- `decode_one_frame_rgba` now accepts `aspect: f32` (same convention as `LiveDecoder::open`). `aspect > 0` → 320px scrub. `aspect <= 0` → native resolution. `request_transition_frame` passes `1.0`; `request_transition_frame_hq` passes `0.0`.
