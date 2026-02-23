@@ -56,6 +56,8 @@ impl VideoTransition for Crossfade {
         _height: u32,
         alpha:   f32,
     ) -> Vec<u8> {
+        use rayon::prelude::*;
+
         debug_assert_eq!(
             frame_a.len(),
             frame_b.len(),
@@ -65,11 +67,46 @@ impl VideoTransition for Crossfade {
         );
 
         let eased = ease_in_out(alpha);
+        let mut out = vec![0u8; frame_a.len()];
+        out.par_iter_mut()
+            .zip(frame_a.par_iter())
+            .zip(frame_b.par_iter())
+            .for_each(|((o, &a), &b)| *o = blend_byte(a, b, eased));
+        out
+    }
 
-        frame_a.iter()
-            .zip(frame_b.iter())
-            .map(|(&a, &b)| blend_byte(a, b, eased))
-            .collect()
+    /// Direct parallel RGBA blend — skips the YUV round-trip in the default
+    /// `apply_rgba` impl.  Both frames arrive as RGBA from the D3D11VA
+    /// transfer path; converting to YUV and back purely to blend bytes is
+    /// wasted work.  Every byte is independent so rayon chunks across pixels
+    /// with zero coordination overhead.
+    fn apply_rgba(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        _width:  u32,
+        _height: u32,
+        alpha:   f32,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(frame_a.len(), frame_b.len(),
+            "Crossfade::apply_rgba — frame size mismatch: {} vs {}",
+            frame_a.len(), frame_b.len());
+
+        let eased = ease_in_out(alpha);
+        let mut out = vec![0u8; frame_a.len()];
+        // 4-byte chunks keep whole pixels together per thread.
+        out.par_chunks_mut(4)
+            .zip(frame_a.par_chunks(4))
+            .zip(frame_b.par_chunks(4))
+            .for_each(|((o, a), b)| {
+                o[0] = blend_byte(a[0], b[0], eased);
+                o[1] = blend_byte(a[1], b[1], eased);
+                o[2] = blend_byte(a[2], b[2], eased);
+                o[3] = blend_byte(a[3], b[3], eased);
+            });
+        out
     }
 }
 

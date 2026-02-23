@@ -219,9 +219,15 @@ pub trait VideoTransition: Send + Sync {
         height:  u32,
         alpha:   f32,
     ) -> Vec<u8> {
+        use rayon::prelude::*;
         use crate::transitions::helpers::{rgba_to_yuv420p, yuv420p_to_rgba};
-        let yuv_a = rgba_to_yuv420p(frame_a, width, height);
-        let yuv_b = rgba_to_yuv420p(frame_b, width, height);
+        // Run both RGBA→YUV conversions in parallel, then blend, then convert back.
+        // Transitions that work directly in RGBA (e.g. Crossfade) should override
+        // this method entirely to skip the round-trip.
+        let (yuv_a, yuv_b) = rayon::join(
+            || rgba_to_yuv420p(frame_a, width, height),
+            || rgba_to_yuv420p(frame_b, width, height),
+        );
         let yuv_out = self.apply(&yuv_a, &yuv_b, width, height, alpha);
         yuv420p_to_rgba(&yuv_out, width, height)
     }
