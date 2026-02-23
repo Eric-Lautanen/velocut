@@ -99,19 +99,153 @@ fn try_create_d3d11va_device() -> Option<HwDeviceCtx> {
     }
 }
 
+/// AVCodecContext.get_format callback — selects the best available D3D11VA
+/// pixel format from the list FFmpeg offers at codec-open time.
+///
+/// Two D3D11VA pixel format variants exist:
+///
+/// • `AV_PIX_FMT_D3D11` (172) — newer d3d11va2 API.  FFmpeg allocates
+///   `hw_frames_ctx` automatically; no manual setup needed.  Preferred.
+///
+/// • `AV_PIX_FMT_D3D11VA_VLD` (113) — older d3d11va API.  The application
+///   must allocate and initialise `hw_frames_ctx` on `AVCodecContext` before
+///   returning this format, otherwise FFmpeg prints "Invalid pixfmt for
+///   hwaccel!" and falls back to software.  Handled by
+///   `allocate_d3d11va_vld_frames_ctx`.
+///
+/// If neither hardware format is offered, the callback scans for
+/// `AV_PIX_FMT_YUV420P` (0) or `AV_PIX_FMT_NV12` (23) so we return a
+/// known-good CPU format rather than blindly returning `*fmt` (which could
+/// be another failing hwaccel format).
+///
+/// All comparisons use `as i32` so the code compiles whether `AVPixelFormat`
+/// is a Rust enum or a C-compatible type alias.
+unsafe extern "C" fn get_format_d3d11va(
+    ctx: *mut ffi::AVCodecContext,
+    fmt: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    // Use enum constants from the actual FFmpeg build rather than hardcoded
+    // integers — the numeric values can differ between FFmpeg versions/forks.
+    let d3d11     = ffi::AVPixelFormat::AV_PIX_FMT_D3D11      as i32;
+    let d3d11_vld = ffi::AVPixelFormat::AV_PIX_FMT_D3D11VA_VLD as i32;
+    let yuv420p   = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P     as i32;
+    let nv12      = ffi::AVPixelFormat::AV_PIX_FMT_NV12         as i32;
+
+    // Diagnostic: dump all formats FFmpeg is offering at codec-open time.
+    {
+        let mut p = fmt;
+        let mut offered = Vec::new();
+        while (*p) as i32 != -1 {
+            offered.push((*p) as i32);
+            p = p.add(1);
+        }
+        eprintln!("[hwaccel] get_format called — offered: {:?} (d3d11={} vld={} yuv420p={} nv12={})",
+            offered, d3d11, d3d11_vld, yuv420p, nv12);
+    }
+
+    // First pass: prefer AV_PIX_FMT_D3D11 (d3d11va2) — auto hw_frames_ctx.
+    let mut p = fmt;
+    while (*p) as i32 != -1 {
+        if (*p) as i32 == d3d11 {
+            eprintln!("[hwaccel] get_format: selected AV_PIX_FMT_D3D11 ({})", d3d11);
+            return *p;
+        }
+        p = p.add(1);
+    }
+
+    // Second pass: AV_PIX_FMT_D3D11VA_VLD (older API) — must alloc hw_frames_ctx.
+    p = fmt;
+    while (*p) as i32 != -1 {
+        if (*p) as i32 == d3d11_vld {
+            eprintln!("[hwaccel] get_format: AV_PIX_FMT_D3D11VA_VLD ({}) — allocating hw_frames_ctx", d3d11_vld);
+            if allocate_d3d11va_vld_frames_ctx(ctx) {
+                return *p;
+            }
+            eprintln!("[hwaccel] get_format: hw_frames_ctx alloc failed, falling through to CPU");
+            break;
+        }
+        p = p.add(1);
+    }
+
+    // CPU fallback: prefer YUV420P then NV12, else first offered.
+    p = fmt;
+    while (*p) as i32 != -1 {
+        if (*p) as i32 == yuv420p { return *p; }
+        p = p.add(1);
+    }
+    p = fmt;
+    while (*p) as i32 != -1 {
+        if (*p) as i32 == nv12 { return *p; }
+        p = p.add(1);
+    }
+    eprintln!("[hwaccel] get_format: no preferred CPU format found, returning first offered");
+    *fmt
+}
+
+/// Allocate and initialise an `AVHWFramesContext` for `AV_PIX_FMT_D3D11VA_VLD`.
+///
+/// Required when the decoder only offers format 113 (older d3d11va API).
+/// The newer d3d11va2 (format 172) handles this automatically.
+/// Returns `true` on success, `false` on any failure (CPU fallback).
+unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool {
+    let hw_device_ctx = (*ctx).hw_device_ctx;
+    if hw_device_ctx.is_null() {
+        eprintln!("[hwaccel] allocate_d3d11va_vld_frames_ctx: hw_device_ctx is NULL");
+        return false;
+    }
+
+    let frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
+    if frames_ref.is_null() {
+        eprintln!("[hwaccel] av_hwframe_ctx_alloc failed");
+        return false;
+    }
+
+    {
+        let frames_ctx = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        (*frames_ctx).format            = ffi::AVPixelFormat::AV_PIX_FMT_D3D11VA_VLD; // outer hw format
+        (*frames_ctx).sw_format         = ffi::AVPixelFormat::AV_PIX_FMT_NV12;        // inner sw format
+        (*frames_ctx).width             = (*ctx).coded_width;
+        (*frames_ctx).height            = (*ctx).coded_height;
+        (*frames_ctx).initial_pool_size = 10;  // surface pool — 10 is typical for decode
+    }
+
+    let ret = ffi::av_hwframe_ctx_init(frames_ref);
+    if ret < 0 {
+        eprintln!("[hwaccel] av_hwframe_ctx_init failed ({})", ret);
+        let mut p = frames_ref;
+        ffi::av_buffer_unref(&mut p);
+        return false;
+    }
+
+    // Codec context takes ownership of its ref; release our local ref below.
+    (*ctx).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+    let mut p = frames_ref;
+    ffi::av_buffer_unref(&mut p);
+
+    if (*ctx).hw_frames_ctx.is_null() {
+        eprintln!("[hwaccel] av_buffer_ref for hw_frames_ctx failed");
+        return false;
+    }
+
+    eprintln!("[hwaccel] D3D11VA VLD hw_frames_ctx allocated ({}x{})",
+        (*ctx).coded_width, (*ctx).coded_height);
+    true
+}
+
 /// Transfer a hardware frame (D3D11 surface) to a CPU-accessible frame.
 ///
+/// GPU frames are detected via `hw_frames_ctx != NULL` — more robust than
+/// pixel format integer constants, which can vary between FFmpeg builds.
 /// Returns the transferred frame on success, or the original frame unchanged
-/// if it is already a CPU format — so callers can always use the return value
-/// regardless of whether hwaccel is active.
+/// if it is already a CPU frame.
 fn ensure_cpu_frame(
     frame: ffmpeg::util::frame::video::Video,
 ) -> ffmpeg::util::frame::video::Video {
     unsafe {
-        let fmt = (*frame.as_ptr()).format;
-        // AV_PIX_FMT_D3D11 = 172, AV_PIX_FMT_D3D11VA_VLD = 113
-        if fmt != 172 && fmt != 113 {
-            return frame; // already CPU
+        // hw_frames_ctx is non-NULL on every hardware-accelerated frame.
+        // CPU frames always have a NULL hw_frames_ctx.
+        if (*frame.as_ptr()).hw_frames_ctx.is_null() {
+            return frame;
         }
         let mut cpu_frame = ffmpeg::util::frame::video::Video::empty();
         let ret = ffi::av_hwframe_transfer_data(
@@ -121,13 +255,12 @@ fn ensure_cpu_frame(
         );
         if ret < 0 {
             eprintln!("[hwaccel] av_hwframe_transfer_data failed ({}), dropping frame", ret);
-            return frame; // return original; scaler will likely fail but won't panic
+            return frame;
         }
-        // Copy metadata (pts, time_base, etc.) to the CPU frame.
-        (*cpu_frame.as_mut_ptr()).pts       = (*frame.as_ptr()).pts;
-        (*cpu_frame.as_mut_ptr()).pkt_dts   = (*frame.as_ptr()).pkt_dts;
-        (*cpu_frame.as_mut_ptr()).best_effort_timestamp =
-            (*frame.as_ptr()).best_effort_timestamp;
+        // Copy presentation metadata — FFmpeg does not propagate this during transfer.
+        (*cpu_frame.as_mut_ptr()).pts                   = (*frame.as_ptr()).pts;
+        (*cpu_frame.as_mut_ptr()).pkt_dts               = (*frame.as_ptr()).pkt_dts;
+        (*cpu_frame.as_mut_ptr()).best_effort_timestamp = (*frame.as_ptr()).best_effort_timestamp;
         cpu_frame
     }
 }
@@ -169,9 +302,37 @@ impl LiveDecoder {
 
         let _ = ictx.seek(seek_ts, ..=seek_ts);
 
+        // Make dec_ctx mutable so we can write hw_device_ctx onto the raw
+        // AVCodecContext* BEFORE avcodec_open2 is called internally by
+        // dec_ctx.decoder().video()?.  FFmpeg requires the device context to
+        // be present at open time — setting it afterwards is silently ignored.
+        let mut dec_ctx = dec_ctx;
+
+        // ── D3D11VA hardware acceleration (pre-open) ──────────────────────────
+        // Attach hw_device_ctx + get_format callback to the raw AVCodecContext*
+        // BEFORE .decoder().video()? triggers avcodec_open2 internally.
+        // Scrub-mode decoders (aspect > 0) skip hwaccel — short-lived, low-res.
+        // Playback / HQ decoders (aspect <= 0) use hwaccel when available.
+        let hw_device_ctx = if aspect <= 0.0 {
+            let maybe_hw = try_create_d3d11va_device();
+            if let Some(ref hw) = maybe_hw {
+                unsafe {
+                    let hw_ref = ffi::av_buffer_ref(hw.0);
+                    if !hw_ref.is_null() {
+                        (*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref;
+                        (*dec_ctx.as_mut_ptr()).get_format    = Some(get_format_d3d11va);
+                        eprintln!("[hwaccel] D3D11VA attached to decoder context (pre-open)");
+                    }
+                }
+            }
+            maybe_hw
+        } else {
+            None
+        };
+
         // Build decoder — width/height come from here, replacing the previous
         // unsafe raw-pointer read from stream.parameters().as_ptr().
-        let mut decoder = dec_ctx.decoder().video()?;
+        let decoder = dec_ctx.decoder().video()?;
         let raw_w = decoder.width().max(2);
         let raw_h = decoder.height().max(2);
 
@@ -196,49 +357,17 @@ impl LiveDecoder {
         let dec_w   = decoder.width();
         let dec_h   = decoder.height();
 
-        // ── D3D11VA hardware acceleration ─────────────────────────────────────
-        // Try to attach a D3D11VA device context to the codec context before
-        // the first packet is sent.  On success the decoder will output frames
-        // in AV_PIX_FMT_D3D11; ensure_cpu_frame() transfers them back to CPU
-        // (NV12 typically) before sws_scale is called.
-        //
-        // Scrub-mode decoders (aspect > 0) skip hwaccel — they're short-lived,
-        // low-res, and the transfer overhead isn't worth it for 320px frames.
-        // Playback / HQ decoders (aspect <= 0) use hwaccel when available.
-        let hw_device_ctx = if aspect <= 0.0 {
-            let maybe_hw = try_create_d3d11va_device();
-            if let Some(ref hw) = maybe_hw {
-                unsafe {
-                    // av_buffer_ref bumps the ref-count so both the codec
-                    // context and our HwDeviceCtx wrapper own a reference.
-                    let hw_ref = ffi::av_buffer_ref(hw.0);
-                    if !hw_ref.is_null() {
-                        (*decoder.as_mut_ptr()).hw_device_ctx = hw_ref;
-                        eprintln!("[hwaccel] D3D11VA attached to decoder");
-                    }
-                }
-            }
-            maybe_hw
-        } else {
-            None
-        };
-
         // The decoder format reported before the first packet can be wrong
         // (AVCC coded dims, AV_PIX_FMT_NONE for some Annex-B streams).
         // We record what the codec metadata says here; the scaler is built
         // from the *actual* first-frame format in next_frame() when hwaccel
-        // is active, since the output format changes to D3D11/NV12.
+        // is active, since the output format changes after D3D11 transfer.
         // For CPU-only paths the existing eager scaler construction is fine.
         // [Opt #1] Reuse cached SwsContext when source format/dimensions haven't
         // changed — avoids re-running lookup-table initialisation on every
         // backward scrub or cross-clip reset.  Out dimensions are fixed for the
         // lifetime of a session (same `aspect` is always passed), so a matching
         // source key is sufficient to guarantee safe reuse.
-        //
-        // When hwaccel is active the real output format is determined by the
-        // first decoded frame, so we build the scaler lazily there instead.
-        // For now we pre-build using dec_fmt as a best-effort — next_frame()
-        // will rebuild if the actual format differs (NV12 from D3D11 transfer).
         let scaler = match cached_scaler {
             Some((sws, cf, cw, ch)) if cf == dec_fmt && cw == dec_w && ch == dec_h => sws,
             _ => SwsContext::get(dec_fmt, dec_w, dec_h, Pixel::RGBA, out_w, out_h, Flags::BILINEAR)?,
