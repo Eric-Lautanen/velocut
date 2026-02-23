@@ -254,7 +254,7 @@ pub fn show_uninstall_modal(ctx: &egui::Context, visible: &mut bool) {
 fn show_modal_content(ui: &mut egui::Ui, visible: &mut bool) {
     // ── Title ─────────────────────────────────────────────────────────────────
     ui.label(
-        RichText::new("  Reset Complete")
+        RichText::new("  Uninstall Complete")
             .size(15.0)
             .strong()
             .color(GREEN_DIM),
