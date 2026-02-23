@@ -214,7 +214,7 @@ impl EditorModule for ExportModule {
                                 );
                                 format!("⚠ {}s?", secs_left)
                             } else {
-                                "↺ Reset".into()
+                                "↺ Uninstall".into()
                             };
 
                             let (text_color, fill, border) = if in_confirm {

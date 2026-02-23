@@ -251,20 +251,24 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
 
 // ── Audio playback helper ─────────────────────────────────────────────────────
 
-/// Return the clip that should be providing audio at `time`.
+/// Return the clip that should be providing the *primary* audio at `time`.
 ///
-/// Priority: A-row clips (extracted audio, rows 1/3) over V-row clips (rows 0/2).
-/// This ensures that after `ExtractAudioTrack`, the A-row WAV plays instead of
-/// the muted V-row source. V-row clips with `audio_muted = true` are skipped.
+/// Priority: extracted A-row clips (rows 1/3 with `linked_clip_id`) over V-row
+/// clips (rows 0/2).  This ensures that after `ExtractAudioTrack`, the A-row WAV
+/// plays instead of the muted V-row source.
 ///
-/// Centralised here so `audio_module.rs` and any future consumer share a single
-/// definition of "what clip plays audio at time t" — no silent drift between callsites.
+/// Standalone A-row clips (no `linked_clip_id`) are intentionally excluded here —
+/// they play as independent overlays via `active_overlay_clips` so they mix
+/// additively with V-row audio rather than silencing it.
+///
+/// V-row clips with `audio_muted = true` are skipped.
 #[inline]
 pub fn active_audio_clip(state: &ProjectState, time: f64) -> Option<&TimelineClip> {
-    // A-row first (extracted audio takes priority)
+    // Extracted A-row first (linked_clip_id present = V↔A pair, not standalone)
     state.timeline.iter()
         .find(|c| {
             matches!(c.track_row, 1 | 3)
+                && c.linked_clip_id.is_some()
                 && c.start_time <= time
                 && time < c.start_time + c.duration
         })
@@ -277,4 +281,25 @@ pub fn active_audio_clip(state: &ProjectState, time: f64) -> Option<&TimelineCli
                     && time < c.start_time + c.duration
             })
         })
+}
+
+/// Return all *standalone* A-row clips active at `time`.
+///
+/// These are independent audio files dragged to an A-row track (odd `track_row`,
+/// no `linked_clip_id`).  They play simultaneously with — not instead of —
+/// the primary audio from `active_audio_clip`, mirroring the `AudioOverlay`
+/// behaviour in the encode pipeline.
+#[inline]
+pub fn active_overlay_clips<'s>(
+    state: &'s ProjectState,
+    time:  f64,
+) -> Vec<&'s TimelineClip> {
+    state.timeline.iter()
+        .filter(|c| {
+            matches!(c.track_row, 1 | 3)
+                && c.linked_clip_id.is_none()
+                && c.start_time <= time
+                && time < c.start_time + c.duration
+        })
+        .collect()
 }

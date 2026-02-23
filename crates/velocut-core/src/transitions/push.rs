@@ -40,7 +40,7 @@ impl VideoTransition for Push {
     }
 
     fn icon(&self) -> &'static str {
-        "➡️"
+        ">"
     }
 
     fn default_duration_secs(&self) -> f32 {

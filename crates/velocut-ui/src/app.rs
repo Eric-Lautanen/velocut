@@ -2,6 +2,7 @@
 use velocut_core::state::{ProjectState, TimelineClip, LibraryClip, ClipType};
 use velocut_core::commands::EditorCommand;
 use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
+use velocut_media::encode::AudioOverlay;
 use velocut_media::audio::cleanup_audio_temp;
 use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionKind, TransitionType};
 use crate::context::AppContext;
@@ -239,6 +240,7 @@ impl VeloCutApp {
             EditorCommand::SetPlayhead(t) => {
                 self.state.current_time = t;
                 self.context.audio_sinks.clear();
+                self.context.audio_overlay_sinks.clear();
                 self.context.playback.audio_was_playing = false;
                 self.context.cache.pending_pb_frame = None;
             }
@@ -455,6 +457,7 @@ impl VeloCutApp {
                 // Step 2: drop audio sinks. rodio threads reference WAV paths;
                 // dropping sinks lets them finish cleanly before paths go stale.
                 self.context.audio_sinks.clear();
+                self.context.audio_overlay_sinks.clear();
 
                 // Step 3: evict all GPU textures and reset the byte budget.
                 self.context.cache.clear_all();
@@ -588,7 +591,7 @@ impl VeloCutApp {
         let mut sorted: Vec<&TimelineClip> = self.state.timeline.iter().collect();
         sorted.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
 
-        let Some((clip_specs, encode_transitions)) =
+        let Some((clip_specs, encode_transitions, audio_overlays)) =
             build_encode_plan(&self.state, &sorted) else
         {
             velocut_log!("[export] no resolvable clips — aborting render");
@@ -604,6 +607,7 @@ impl VeloCutApp {
             fps,
             output: dest,
             transitions: encode_transitions,
+            audio_overlays,
         };
 
         // Arm encode state before handing to the worker so ingest_media_results
@@ -711,6 +715,7 @@ impl eframe::App for VeloCutApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.context.media_worker.shutdown();
         self.context.audio_sinks.clear();
+        self.context.audio_overlay_sinks.clear();
         for clip in &self.state.library {
             if let Some(apath) = &clip.audio_path {
                 cleanup_audio_temp(apath);
@@ -801,12 +806,20 @@ impl eframe::App for VeloCutApp {
 fn build_encode_plan(
     state:  &velocut_core::state::ProjectState,
     sorted: &[&TimelineClip],
-) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>)> {
-    // Filter out extracted-audio A-row clips — their contribution is encoded
-    // through the paired V-row clip using the A-row's volume value.
+) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>, Vec<AudioOverlay>)> {
+    // Only V-row clips (even track_row) drive the sequential video/audio encode.
+    //
+    // Two categories of A-row clips must be excluded from this list:
+    //   1. Extracted-audio clips (odd row + linked_clip_id) — their audio is
+    //      already encoded via the paired V-row clip using the A-row's volume.
+    //   2. Standalone audio clips (odd row, no linked_clip_id) — these are
+    //      independent audio files dragged to an A-row track.  Including them
+    //      here causes encode_clip to open an audio-only file, find no video
+    //      stream, and abort the entire export with "no video stream in '...'".
+    //      Their audio is handled separately as AudioOverlay entries below.
     let filtered: Vec<&TimelineClip> = sorted.iter()
         .copied()
-        .filter(|tc| !clip_query::is_extracted_audio_clip(tc))
+        .filter(|tc| tc.track_row % 2 == 0)   // V-row clips only
         .collect();
 
     let clip_specs: Vec<ClipSpec> = filtered.iter()
@@ -840,8 +853,8 @@ fn build_encode_plan(
     }
 
     // Map TimelineTransitions (UUID-keyed) → ClipTransitions (index-keyed).
-    // Uses position in *filtered* vec, not raw timeline, so extracted-audio
-    // clips don't shift transition indices.
+    // Uses position in *filtered* vec, not raw timeline, so A-row clips don't
+    // shift transition indices.
     let encode_transitions: Vec<ClipTransition> = state.transitions.iter()
         .filter_map(|t| {
             let idx = filtered.iter().copied().position(|tc| tc.id == t.after_clip_id)?;
@@ -853,7 +866,41 @@ fn build_encode_plan(
         })
         .collect();
 
-    Some((clip_specs, encode_transitions))
+    // Collect standalone audio clips — odd track_row with no linked_clip_id.
+    //
+    // These are NOT extracted-audio partners; they are independent audio files
+    // (e.g. a music track) dragged to an A-row.  Each one becomes an
+    // AudioOverlay: its PCM is pre-decoded once in run_encode and then mixed
+    // into the AAC encoder FIFO at the correct output-timeline position as
+    // video frames are encoded.  The mixing is additive: if a V-row clip also
+    // has un-muted audio, both sources contribute to the output.
+    //
+    // Note: `sorted` contains ALL timeline clips, so we iterate it directly
+    // rather than `filtered` (which only contains V-row clips).
+    let audio_overlays: Vec<AudioOverlay> = sorted.iter()
+        .copied()
+        .filter(|tc| tc.track_row % 2 == 1 && tc.linked_clip_id.is_none())
+        .filter_map(|tc| {
+            state.library.iter()
+                .find(|lc| lc.id == tc.media_id)
+                .map(|lc| AudioOverlay {
+                    path:           lc.path.clone(),
+                    source_offset:  tc.source_offset,
+                    timeline_start: tc.start_time,
+                    duration:       tc.duration,
+                    volume:         tc.volume,
+                })
+        })
+        .collect();
+
+    if !audio_overlays.is_empty() {
+        eprintln!(
+            "[render] {} standalone audio overlay(s) included in export",
+            audio_overlays.len()
+        );
+    }
+
+    Some((clip_specs, encode_transitions, audio_overlays))
 }
 
 // ── Sub-frame helpers (called from update) ────────────────────────────────────

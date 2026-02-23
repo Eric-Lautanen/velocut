@@ -35,7 +35,7 @@ impl VideoTransition for DipToBlack {
     }
 
     fn icon(&self) -> &'static str {
-        "⬛️"  // U+2B1B U+FE0F — variation selector required for emoji rendering
+        "■"  // U+2B1B U+FE0F — variation selector required for emoji rendering
     }
 
     fn default_duration_secs(&self) -> f32 {

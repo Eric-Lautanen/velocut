@@ -29,7 +29,7 @@ impl VideoTransition for Crossfade {
     }
 
     fn icon(&self) -> &'static str {
-        "🌫️"  // U+1F32B U+FE0F — variation selector required for emoji rendering
+        "↔"  // U+1F32B U+FE0F — variation selector required for emoji rendering
     }
 
     fn default_duration_secs(&self) -> f32 {

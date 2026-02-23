@@ -88,6 +88,30 @@ pub struct ClipSpec {
     pub skip_audio:    bool,
 }
 
+/// A standalone audio clip that runs in parallel with the video timeline.
+///
+/// Unlike the clips in `EncodeSpec::clips`, which are processed sequentially
+/// and must have a video stream, an `AudioOverlay` is an audio-only file
+/// (or any file with audio) placed on an A-row track that does NOT correspond
+/// to an extracted V↔A pair.  Its PCM is mixed into the AAC encoder FIFO at
+/// the correct output-timeline position as each frame is encoded.
+///
+/// Created by `build_encode_plan` in `app.rs` for every standalone audio clip
+/// (odd `track_row`, no `linked_clip_id`) on the timeline.
+#[derive(Clone)]
+pub struct AudioOverlay {
+    /// Absolute path to the audio source file.
+    pub path:           PathBuf,
+    /// Seconds into the source file at which this clip begins.
+    pub source_offset:  f64,
+    /// Start position on the output timeline, in seconds.
+    pub timeline_start: f64,
+    /// Duration in seconds to include from this clip.
+    pub duration:       f64,
+    /// Linear gain applied to decoded audio (1.0 = unity).
+    pub volume:         f32,
+}
+
 /// Complete description of an encode job.
 pub struct EncodeSpec {
     /// Unique identifier used in all progress / done / error results.
@@ -104,6 +128,14 @@ pub struct EncodeSpec {
     /// Index N means "between clips[N] and clips[N+1]".
     /// Missing entries default to Cut (hard splice, zero overhead).
     pub transitions: Vec<ClipTransition>,
+    /// Standalone audio clips that run in parallel with the video timeline.
+    ///
+    /// These are NOT part of the sequential `clips` list and do NOT drive video
+    /// frame output.  Their PCM is pre-decoded once before the encode loop and
+    /// then mixed (summed) into every AAC encoder frame at the correct
+    /// output-timeline sample position.  Any number of overlays may be present;
+    /// each is mixed independently so they accumulate additively.
+    pub audio_overlays: Vec<AudioOverlay>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -336,6 +368,22 @@ impl AudioFifo {
 
 // ── Audio encoder state ───────────────────────────────────────────────────────
 
+/// Pre-decoded stereo f32 PCM for one `AudioOverlay`.
+///
+/// Indexed to the output timeline via `start_sample`: overlay sample at index `i`
+/// corresponds to output sample `start_sample + i`.  Built once in `run_encode`
+/// before the clip loop and stored on `AudioEncState` so it is available inside
+/// every `drain_fifo` call without threading it through every call-site.
+struct DecodedOverlay {
+    left:         Vec<f32>,
+    right:        Vec<f32>,
+    /// Absolute output-timeline sample index of the first sample in this overlay
+    /// (`overlay.timeline_start * AUDIO_RATE`).
+    start_sample: i64,
+    /// Total number of samples decoded (per channel).
+    sample_count: usize,
+}
+
 /// Everything needed to drive the AAC encoder across multiple clips.
 struct AudioEncState {
     encoder:        ffmpeg::encoder::Audio,
@@ -348,6 +396,10 @@ struct AudioEncState {
     audio_tb:       Rational,
     /// The muxer-assigned timebase for stream 1 (may differ from audio_tb).
     ost_audio_tb:   Rational,
+    /// Pre-decoded standalone audio overlay tracks.  Mixed (summed) into every
+    /// AAC encoder frame inside `drain_fifo` at the correct absolute output-
+    /// timeline sample position.  Empty when no overlays are present.
+    overlays:       Vec<DecodedOverlay>,
 }
 
 impl AudioEncState {
@@ -356,6 +408,12 @@ impl AudioEncState {
     /// In normal operation (`flush = false`) only full frames are sent.
     /// At the end of the encode (`flush = true`) a partial tail frame is
     /// zero-padded and flushed so no PCM is lost.
+    ///
+    /// Any pre-decoded `AudioOverlay` tracks stored in `self.overlays` are
+    /// mixed (summed and clamped) into each frame before it is sent to the
+    /// encoder.  The mix uses `self.out_sample_idx` as the absolute output-
+    /// timeline anchor so overlays are placed at exactly the right position
+    /// regardless of clip boundaries.
     fn drain_fifo(
         &mut self,
         octx:  &mut ffmpeg::format::context::Output,
@@ -374,6 +432,36 @@ impl AudioEncState {
             || (flush && self.fifo.len() > 0)
         {
             let frame = self.fifo.pop_frame(self.frame_size, self.out_sample_idx);
+
+            // Mix standalone audio overlays into this AAC frame.
+            //
+            // `out_sample_idx` is the absolute output-timeline sample position of
+            // the first sample in this frame (matches the PTS set by pop_frame).
+            // Each overlay's `start_sample` anchors it to the same coordinate
+            // space, so `out_sample_idx + i - ov.start_sample` gives the index
+            // into the pre-decoded PCM array for the i-th sample of this frame.
+            if !self.overlays.is_empty() {
+                let n = self.frame_size;
+                unsafe {
+                    let l_bytes = frame.data(0);
+                    let r_bytes = frame.data(1);
+                    let ldst = std::slice::from_raw_parts_mut(
+                        l_bytes.as_ptr() as *mut f32, n);
+                    let rdst = std::slice::from_raw_parts_mut(
+                        r_bytes.as_ptr() as *mut f32, n);
+                    for ov in &self.overlays {
+                        for i in 0..n {
+                            let ov_s = self.out_sample_idx + i as i64 - ov.start_sample;
+                            if ov_s >= 0 && (ov_s as usize) < ov.sample_count {
+                                let idx = ov_s as usize;
+                                ldst[i] = (ldst[i] + ov.left[idx]).clamp(-1.0, 1.0);
+                                rdst[i] = (rdst[i] + ov.right[idx]).clamp(-1.0, 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+
             self.out_sample_idx += self.frame_size as i64;
 
             self.encoder.send_frame(&frame)
@@ -408,6 +496,161 @@ impl AudioEncState {
             .map_err(|e| format!("send EOF to audio encoder: {e}"))?;
         self.drain_packets(octx)
     }
+}
+
+// ── Overlay decode ────────────────────────────────────────────────────────────
+
+/// Decode audio from an `AudioOverlay` into a stereo f32 FLTP `DecodedOverlay`.
+///
+/// Opens the source file, seeks to `overlay.source_offset`, decodes
+/// `overlay.duration` seconds of audio, resamples to 44100 Hz stereo FLTP,
+/// and returns left+right sample arrays together with the absolute output-
+/// timeline start sample (`overlay.timeline_start * AUDIO_RATE`).
+///
+/// Soft-fails on any decode error: callers filter `Err` and log, allowing the
+/// rest of the encode to proceed without the overlay.
+fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
+    use ffmpeg::format::sample::{Sample, Type as SampleType};
+    use ffmpeg::software::resampling;
+    use ffmpeg::util::channel_layout::ChannelLayout;
+    use ffmpeg::util::frame::audio::Audio as AudioFrame;
+    use ffmpeg::media::Type as MediaType;
+
+    let target_fmt    = Sample::F32(SampleType::Planar);
+    const OUT_RATE: u32 = 44_100;
+
+    let mut ictx = open_input(&overlay.path)
+        .map_err(|e| format!("overlay open '{}': {e}", overlay.path.display()))?;
+
+    let audio_idx = ictx
+        .streams()
+        .best(MediaType::Audio)
+        .ok_or_else(|| format!("no audio stream in overlay '{}'", overlay.path.display()))?
+        .index();
+
+    let ast   = ictx.stream(audio_idx).unwrap();
+    let in_tb = ast.time_base();
+    let adec_ctx = ffmpeg::codec::context::Context::from_parameters(ast.parameters())
+        .map_err(|e| format!("overlay codec ctx: {e}"))?;
+    let mut adec = adec_ctx.decoder().audio()
+        .map_err(|e| format!("overlay audio decoder: {e}"))?;
+
+    // Seek to source_offset.  Soft-fail: if seek fails we just decode from
+    // the beginning and the pre-roll filter below discards the extra frames.
+    let seek_ts = {
+        let tb = in_tb;
+        (overlay.source_offset * tb.denominator() as f64 / tb.numerator() as f64) as i64
+    };
+    let _ = ictx.seek(seek_ts, ..=seek_ts);
+
+    let mut resampler: Option<resampling::Context> = None;
+    let mut left:  Vec<f32> = Vec::new();
+    let mut right: Vec<f32> = Vec::new();
+
+    let clip_end = overlay.source_offset + overlay.duration;
+
+    let push_frame = |frame: &AudioFrame,
+                      left:  &mut Vec<f32>,
+                      right: &mut Vec<f32>,
+                      vol:   f32| {
+        let n = frame.samples();
+        if n == 0 { return; }
+        unsafe {
+            let l = std::slice::from_raw_parts(frame.data(0).as_ptr() as *const f32, n);
+            let channels = frame.ch_layout().channels();
+            let r_plane  = if channels >= 2 { frame.data(1) } else { frame.data(0) };
+            let r = std::slice::from_raw_parts(r_plane.as_ptr() as *const f32, n);
+            left.extend(l.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+            right.extend(r.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+        }
+    };
+
+    for result in ictx.packets() {
+        let (stream, packet) = match result {
+            Ok(p)  => p,
+            Err(_) => continue,
+        };
+        if stream.index() != audio_idx { continue; }
+        if adec.send_packet(&packet).is_err() { continue; }
+
+        let mut raw = AudioFrame::empty();
+        while adec.receive_frame(&mut raw).is_ok() {
+            let pts_secs = raw.pts()
+                .map(|p| p as f64 * f64::from(in_tb))
+                .unwrap_or(0.0);
+
+            if pts_secs < overlay.source_offset - 0.05 { continue; }
+            if pts_secs >= clip_end { break; }
+
+            let src_channels  = raw.ch_layout().channels();
+            let needs_resample = raw.format() != target_fmt
+                || raw.rate()             != OUT_RATE
+                || src_channels           != 2;
+
+            if needs_resample {
+                let rs = resampler.get_or_insert_with(|| {
+                    let src_layout = if src_channels >= 2 {
+                        raw.ch_layout()
+                    } else {
+                        ChannelLayout::MONO
+                    };
+                    resampling::Context::get2(
+                        raw.format(), src_layout,           raw.rate(),
+                        target_fmt,   ChannelLayout::STEREO, OUT_RATE,
+                    ).expect("overlay resampler")
+                });
+                let mut resampled = AudioFrame::empty();
+                if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
+                    push_frame(&resampled, &mut left, &mut right, overlay.volume);
+                }
+            } else {
+                push_frame(&raw, &mut left, &mut right, overlay.volume);
+            }
+        }
+    }
+
+    // Flush decoder tail.
+    let _ = adec.send_eof();
+    let mut raw = AudioFrame::empty();
+    while adec.receive_frame(&mut raw).is_ok() {
+        let pts_secs = raw.pts()
+            .map(|p| p as f64 * f64::from(in_tb))
+            .unwrap_or(0.0);
+        if pts_secs >= clip_end { break; }
+
+        let src_channels  = raw.ch_layout().channels();
+        let needs_resample = raw.format() != target_fmt
+            || raw.rate()             != OUT_RATE
+            || src_channels           != 2;
+
+        if needs_resample {
+            if let Some(rs) = &mut resampler {
+                let mut resampled = AudioFrame::empty();
+                if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
+                    push_frame(&resampled, &mut left, &mut right, overlay.volume);
+                }
+            }
+        } else {
+            push_frame(&raw, &mut left, &mut right, overlay.volume);
+        }
+    }
+
+    if left.is_empty() {
+        return Err(format!("overlay '{}': no audio decoded", overlay.path.display()));
+    }
+
+    let sample_count  = left.len();
+    let start_sample  = (overlay.timeline_start * OUT_RATE as f64).round() as i64;
+
+    eprintln!(
+        "[encode] overlay decoded: {} samples ({:.2}s) start_sample={} ← {}",
+        sample_count,
+        sample_count as f64 / OUT_RATE as f64,
+        start_sample,
+        overlay.path.display(),
+    );
+
+    Ok(DecodedOverlay { left, right, start_sample, sample_count })
 }
 
 // ── Internal implementation ───────────────────────────────────────────────────
@@ -550,6 +793,15 @@ fn run_encode(
         fifo:           AudioFifo::new(),
         audio_tb,
         ost_audio_tb,
+        // Pre-decode all standalone audio overlay tracks before the clip loop.
+        // Any overlay that fails to decode is logged and skipped gracefully so
+        // the rest of the export is unaffected.
+        overlays: spec.audio_overlays.iter()
+            .filter_map(|ov| match decode_overlay(ov) {
+                Ok(d)  => Some(d),
+                Err(e) => { eprintln!("[encode] overlay decode failed: {e}"); None }
+            })
+            .collect(),
     };
 
     // ── Per-clip encode loop ──────────────────────────────────────────────────

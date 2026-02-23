@@ -96,9 +96,17 @@ impl VideoModule {
         }
 
         // Step 1: fill pending slot if empty.
+        //
+        // Drain wrong-id (coast) frames in a single loop rather than one-per-tick.
+        // Coast frames carry the OLD clip's media_id. Without this drain, each
+        // stale frame takes a full tick to evict via the wrong_clip guard above —
+        // up to 4 frames × 16ms = ~64ms of showing nothing at the transition.
         if ctx.cache.pending_pb_frame.is_none() {
-            if let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
+            while let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
+                let stale = current_media_id.map_or(false, |id| id != f.id);
+                if stale { continue; }
                 ctx.cache.pending_pb_frame = Some(f);
+                break;
             }
         }
 
@@ -120,15 +128,33 @@ impl VideoModule {
 
         // Step 3: promote pending frame when its PTS is due.
         //
-        // Upper bound: don't show a frame more than 1 tick early.
+        // Upper bound: 2 frames (2/30s ≈ 67ms) of early-show tolerance for steady
+        // state, plus a startup exception for the first 150ms of any new clip.
+        //
+        // Why the startup exception: after a clip transition the primary decoder
+        // burns to `elapsed` (e.g. 10ms into clip_b), but the first decodable
+        // keyframe lands ~73ms later (e.g. ts=0.083s). With pb_local_t=0.010 that
+        // blows past even the 2/30s upper bound (0.083 > 0.010+0.067), so the
+        // frame sits in pending while held_frame (frozen coast, alpha=0.437) keeps
+        // displaying — visible as a stall right at the blend handoff.
+        // The exception bypasses the upper bound for the first 150ms of any new
+        // clip (lt<0.15), where any near-future frame (ts<0.30) is preferable to
+        // the stale held_frame. The lower bound (-3s) still guards against genuinely
+        // stale frames, and step 2 fast-forward handles runaway lookahead in steady
+        // playback.
+        //
         // Lower bound: 3.0 s — must cover the worst-case burn_to_pts duration.
         // At 60 fps H.264 with a 5 s GOP, burn is ~300 frames × ~2 ms = ~600 ms.
         // 3 s is ample headroom. Genuine staleness (different clip, scrub bleed)
         // is caught by the wrong_clip / too_old guards above.
         let frame_due = ctx.cache.pending_pb_frame.as_ref().map(|f: &PlaybackFrame| {
             pb_local_t.map(|lt| {
-                f.timestamp <= lt + (1.0 / 60.0)
-                    && f.timestamp >= lt - 3.0
+                let above_lower   = f.timestamp >= lt - 3.0;
+                let normal_window = f.timestamp <= lt + (2.0 / 30.0);
+                // Startup exception: at clip startup (lt < 150ms) show any
+                // near-future frame immediately rather than stalling on held_frame.
+                let startup_early = lt < 0.15 && f.timestamp < 0.30;
+                above_lower && (normal_window || startup_early)
             }).unwrap_or(true)
         }).unwrap_or(false);
 

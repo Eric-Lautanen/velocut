@@ -60,7 +60,7 @@ impl LiveDecoder {
     pub fn open(
         path:          &PathBuf,
         timestamp:     f64,
-        aspect:        f32,
+        _aspect:        f32,
         cached_scaler: Option<(SwsContext, Pixel, u32, u32)>,
     ) -> Result<Self> {
         let mut ictx = input(path)?;

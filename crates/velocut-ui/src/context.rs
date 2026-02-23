@@ -202,6 +202,7 @@ pub struct AppContext {
     // stops all audio.  audio_module borrows it each tick via .mixer().
     pub audio_stream: Option<OutputStream>,
     pub audio_sinks:  HashMap<Uuid, Sink>,
+    pub audio_overlay_sinks: HashMap<Uuid, rodio::Sink>,
 }
 
 impl AppContext {
@@ -216,6 +217,7 @@ impl AppContext {
             playback:     PlaybackContext::new(),
             audio_stream: None,
             audio_sinks:  HashMap::new(),
+            audio_overlay_sinks: HashMap::new(),
         }
     }
 

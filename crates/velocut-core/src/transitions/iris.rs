@@ -43,7 +43,7 @@ impl VideoTransition for Iris {
     }
 
     fn icon(&self) -> &'static str {
-        "⭕️"  // U+2B55 U+FE0F — variation selector required
+        "○"  // U+2B55 U+FE0F — variation selector required
     }
 
     fn default_duration_secs(&self) -> f32 {
