@@ -149,6 +149,13 @@ impl LiveDecoder {
     /// avoids the flat_map().collect() iterator overhead and the implicit Vec growth
     /// that could occur when the size_hint is imprecise.
     pub fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
+        // Max video packets to process per call while in skip mode.
+        // Keeps each call bounded at ~30 ms so the pb thread stays responsive.
+        // Caller detects "still burning" vs EOF by checking skip_until_pts > 0
+        // after a None return.
+        const MAX_SKIP_PACKETS: usize = 60;
+        let mut skip_packets = 0usize;
+
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
             if self.decoder.send_packet(&packet).is_err() { continue; }
@@ -167,6 +174,16 @@ impl LiveDecoder {
                 if self.scaler.run(&decoded, &mut out).is_err() { return None; }
                 let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
                 return Some((data, self.out_w, self.out_h, ts_secs));
+            }
+            // After each video packet in skip mode, check the chunk limit.
+            // Return None with skip_until_pts still set so the caller knows
+            // the burn is ongoing (not EOF) and can send a raw primary frame
+            // this tick and call us again next iteration.
+            if self.skip_until_pts > 0 {
+                skip_packets += 1;
+                if skip_packets >= MAX_SKIP_PACKETS {
+                    return None;
+                }
             }
         }
         None

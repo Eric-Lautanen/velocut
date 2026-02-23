@@ -172,6 +172,12 @@ impl VideoModule {
             if let Some(clip) = &current_clip {
                 let clip_changed = Some(clip.media_id) != ctx.playback.playback_media_id;
                 if just_started || clip_changed {
+                    eprintln!(
+                        "[tick] clip_changed: just_started={just_started} current_time={:.3} \
+                         clip.start_time={:.3} clip.media_id={} prev_media_id={:?}",
+                        state.current_time, clip.start_time, clip.media_id,
+                        ctx.playback.playback_media_id
+                    );
                     ctx.playback.playback_media_id = Some(clip.media_id);
                     // Drop stale scrub frame so preview doesn't freeze on wrong pos.
                     ctx.cache.frame_cache.remove(&clip.media_id);
@@ -185,8 +191,10 @@ impl VideoModule {
                         if let Some(spec) = build_incoming_blend_spec(state, clip)
                             .or_else(|| build_blend_spec(state, clip))
                         {
+                            eprintln!("[tick] → start_blend_playback alpha_start={:.3}", spec.alpha_start);
                             ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, aspect, spec);
                         } else {
+                            eprintln!("[tick] → start_playback (no blend spec — hard cut)");
                             ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, aspect);
                         }
                     }
@@ -234,6 +242,9 @@ impl VideoModule {
         if scrub_moved {
             ctx.playback.scrub_last_moved = Some(std::time::Instant::now());
 
+            // Compute zone first — needed both for clip_changed eviction and L1/L2 below.
+            let zone = clip_query::active_transition_at(state);
+
             if let Some((prev_id, _)) = ctx.playback.last_frame_req {
                 if prev_id != clip.media_id {
                     ctx.cache.frame_cache.remove(&prev_id);
@@ -242,29 +253,59 @@ impl VideoModule {
                     // Buckets accumulate one entry per ¼s scrubbed — without this
                     // they are never freed, causing unbounded TextureHandle growth.
                     ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+                    // If the new clip is inside a transition zone, also evict any
+                    // stale raw frame that may be sitting in frame_cache for it.
+                    //
+                    // Root cause of both the "flash frame" and "transition appears
+                    // half as long" bugs: the user may have scrubbed clip_b outside
+                    // the zone previously, leaving a raw single-clip frame in
+                    // frame_cache[clip_b.media_id]. When the playhead crosses the
+                    // clip_a/clip_b boundary, frame_cache[clip_a] is cleared above
+                    // but frame_cache[clip_b] is not. The stale raw frame shows
+                    // immediately (alpha≈1.0 visually) while the async blend decode
+                    // is in flight — covering 50–150 ms of the clip_b blend half and
+                    // making the visible transition appear half as long.
+                    if zone.is_some() {
+                        ctx.cache.frame_cache.remove(&clip.media_id);
+                    }
                 }
             }
             ctx.playback.last_frame_req = Some((clip.media_id, local_t));
 
             // Layer 1 (0ms): show nearest cached frame immediately.
-            let found_nearby = (0..=8u32).find_map(|delta| {
-                let b = fine_bucket.saturating_sub(delta);
-                ctx.cache.frame_bucket_cache.get(&(clip.media_id, b))
-                    .map(|(tex, _)| tex.clone())
-            });
-            if let Some(cached) = found_nearby {
-                ctx.cache.frame_cache.insert(clip.media_id, cached);
+            // Skipped when inside a transition zone: the bucket cache holds unblended
+            // single-clip frames. Inserting one here would flash a raw clip_b frame
+            // for the 1–3 ticks it takes the async blend decode (L2) to arrive.
+            if zone.is_none() {
+                let found_nearby = (0..=8u32).find_map(|delta| {
+                    let b = fine_bucket.saturating_sub(delta);
+                    ctx.cache.frame_bucket_cache.get(&(clip.media_id, b))
+                        .map(|(tex, _)| tex.clone())
+                });
+                if let Some(cached) = found_nearby {
+                    ctx.cache.frame_cache.insert(clip.media_id, cached);
+                }
             }
 
             // Layer 2 (every scrub move): fire exact-timestamp decode request.
             // If the playhead is inside a transition zone, decode both clips and
             // send a blended frame; otherwise request a normal single-clip frame.
-            if let Some(zone) = clip_query::active_transition_at(state) {
+            if let Some(zone) = zone {
                 let path_a = clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
                 let path_b = clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
                 if let (Some(pa), Some(pb)) = (path_a, path_b) {
                     ctx.media_worker.request_transition_frame(TransitionScrubRequest {
-                        clip_a_id:   zone.clip_a.media_id,
+                        // Tag with the CURRENT clip's media_id, not always zone.clip_a.media_id.
+                        //
+                        // ingest_media_results stores the VideoFrame result under this id.
+                        // app.rs looks it up via frame_cache[active_media_id] where
+                        // active_media_id = clip_at_time(current_time).media_id = clip.media_id.
+                        //
+                        // In the first half of the zone clip == clip_a so the value is the
+                        // same as before. In the second half clip == clip_b, so tagging with
+                        // clip_a.media_id caused a permanent cache miss — ingest stored the
+                        // blend under clip_a's key while preview looked it up under clip_b's.
+                        clip_a_id:   clip.media_id,
                         clip_a_path: pa,
                         clip_a_ts:   zone.clip_a_source_ts,
                         clip_b_id:   zone.clip_b.media_id,
@@ -280,12 +321,17 @@ impl VideoModule {
             }
 
             // Layer 2b (per 2s): coarse warm-up prefetch ahead of scrub head.
-            let coarse_key = (clip.media_id, coarse_bucket);
-            if ctx.playback.scrub_coarse_req != Some(coarse_key) {
-                ctx.playback.scrub_coarse_req = Some(coarse_key);
-                if let Some(lib) = clip_query::library_entry_for(state, &clip) {
-                    let aspect = state.active_video_ratio();
-                    ctx.media_worker.request_frame(lib.id, lib.path.clone(), coarse_bucket as f64 * 2.0, aspect);
+            // Skipped in transition zones: request_frame would store a raw single-clip
+            // frame in frame_bucket_cache which L1 would then flash on the next
+            // scrub-in to the zone before the blend decode completes.
+            if clip_query::active_transition_at(state).is_none() {
+                let coarse_key = (clip.media_id, coarse_bucket);
+                if ctx.playback.scrub_coarse_req != Some(coarse_key) {
+                    ctx.playback.scrub_coarse_req = Some(coarse_key);
+                    if let Some(lib) = clip_query::library_entry_for(state, &clip) {
+                        let aspect = state.active_video_ratio();
+                        ctx.media_worker.request_frame(lib.id, lib.path.clone(), coarse_bucket as f64 * 2.0, aspect);
+                    }
                 }
             }
         } else {
@@ -376,29 +422,103 @@ fn build_incoming_blend_spec(
     state:  &velocut_core::state::ProjectState,
     clip_b: &velocut_core::state::TimelineClip,
 ) -> Option<PlaybackTransitionSpec> {
-    // Find the preceding V-row clip (clip_a).
     let clip_b_start = clip_b.start_time;
+
+    // Find the preceding V-row clip (clip_a).
     let clip_a = state.timeline.iter()
         .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
-        .find(|c| (c.start_time + c.duration - clip_b_start).abs() < 0.05)?;
+        .find(|c| (c.start_time + c.duration - clip_b_start).abs() < 0.05);
+
+    let clip_a = match clip_a {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "[blend_in] clip_a not found for clip_b.start_time={:.3} \
+                 (no V-row clip ends within 0.05s of that point — gap or first clip)",
+                clip_b_start
+            );
+            return None;
+        }
+    };
 
     // Find the non-Cut transition recorded after clip_a.
     let tr = state.transitions.iter().find(|tr| {
         tr.after_clip_id == clip_a.id
             && tr.kind.kind != TransitionKind::Cut
-    })?;
+    });
 
-    let half_d = tr.kind.duration_secs as f64 / 2.0;
+    let tr = match tr {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "[blend_in] no non-Cut transition found after clip_a id={} — no blend",
+                clip_a.id
+            );
+            return None;
+        }
+    };
 
-    // Direct in-zone guard: only activate during the incoming half of the zone
-    // [clip_b_start, clip_b_start + D/2).  Seeking mid-clip or starting fresh
-    // will have current_time >> clip_b_start + half_d and returns None here,
-    // keeping normal start_playback behaviour and avoiding a spurious second decoder.
-    if state.current_time >= clip_b.start_time + half_d { return None; }
+    let half_d  = tr.kind.duration_secs as f64 / 2.0;
+    let elapsed = (state.current_time - clip_b_start).max(0.0);
 
-    let clip_a_lib  = clip_query::library_entry_for(state, clip_a)?;
+    eprintln!(
+        "[blend_in] guard: current_time={:.3} clip_b_start={:.3} elapsed={:.3} \
+         half_d={:.3} duration={:.3} kind={:?}",
+        state.current_time, clip_b_start, elapsed, half_d,
+        tr.kind.duration_secs, tr.kind.kind
+    );
+
+    // In-zone guard: only activate when we are still inside the incoming blend
+    // half, i.e. [clip_b_start, clip_b_start + D/2).
+    //
+    // A generous 2-frame budget (≈ 67 ms at 30 fps) is added beyond half_d to
+    // tolerate stable_dt overshoots and minor frame-rate dips. Without this
+    // buffer, a single late tick on a short transition (< 200 ms total duration)
+    // is enough to push elapsed past the bare half_d and silently abort the blend.
+    //
+    // Seeking mid-clip far from the zone (elapsed >> half_d) still returns None
+    // and avoids the cost of opening a spurious secondary decoder.
+    const TWO_FRAMES: f64 = 2.0 / 30.0;
+    if elapsed >= half_d + TWO_FRAMES {
+        eprintln!(
+            "[blend_in] GUARD TRIGGERED — elapsed {:.3} >= half_d+2f {:.3}; \
+             returning None (hard cut will follow). \
+             This is the clip_b blend bug if you see it during normal playback.",
+            elapsed, half_d + TWO_FRAMES
+        );
+        return None;
+    }
+
+    let clip_a_lib = match clip_query::library_entry_for(state, clip_a) {
+        Some(l) => l,
+        None => {
+            eprintln!("[blend_in] clip_a library entry missing — no blend");
+            return None;
+        }
+    };
+
+    // alpha_start is always 0.5 — do NOT add elapsed/duration here.
+    //
+    // In the pb thread the formula is:
+    //   alpha = alpha_start + local_t / duration
+    // where local_t = ts_secs − blend_start_ts.
+    //
+    // blend_start_ts = clip_b.source_offset, and the primary decoder was opened
+    // and burned to (clip_b.source_offset + elapsed). So the first ts_secs out of
+    // next_frame() is already ≈ source_offset + elapsed, making local_t ≈ elapsed
+    // on frame 1. The elapsed offset is therefore already baked into local_t —
+    // adding it again into alpha_start double-counts it and produces a visible
+    // jump at the start of the clip_b blend half (circle size pop for iris, etc.).
+    let alpha_start = 0.5_f32;
+
     // Secondary decoder: clip_a's tail, starting at the last D/2 of clip_a's source.
     let clip_a_tail = (clip_a.source_offset + clip_a.duration - half_d).max(0.0);
+
+    eprintln!(
+        "[blend_in] returning Some: alpha_start={:.3} clip_a_tail={:.3} \
+         clip_b.source_offset={:.3}",
+        alpha_start, clip_a_tail, clip_b.source_offset
+    );
 
     Some(PlaybackTransitionSpec {
         clip_b_id:           clip_a.media_id,       // secondary = clip_a tail
@@ -407,7 +527,7 @@ fn build_incoming_blend_spec(
         blend_start_ts:      clip_b.source_offset,  // blend from clip_b's first frame
         duration:            tr.kind.duration_secs, // full D; alpha_start offsets into it
         kind:                tr.kind.kind,
-        alpha_start:         0.5,   // second half: ramps 0.5 → 1.0
+        alpha_start,          // dynamic: 0.5 + elapsed/duration, clamped to [0.5, 1.0]
         invert_ab:           true,  // primary=clip_b is "b"; secondary=clip_a is "a"
     })
 }

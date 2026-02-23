@@ -230,7 +230,12 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
         //   clip_a: last D/2 of its source playing out over the full zone
         //   clip_b: first D/2 of its source starting at source_offset
         let clip_a_source_ts = (clip_a.source_offset + clip_a.duration - half_d + local_blend).max(0.0);
-        let clip_b_source_ts = (clip_b.source_offset + local_blend).max(0.0);
+        // clip_b only starts advancing at the cut point (local_blend == half_d).
+        // Before the cut, clip_b is decoded at its first frame (source_offset).
+        // After the cut it advances to source_offset + half_d at zone_end.
+        // Old formula (+ local_blend) was half_d seconds ahead at the cut point,
+        // making clip_b show mid-clip content and the blend appear half as long.
+        let clip_b_source_ts = (clip_b.source_offset + (local_blend - half_d).max(0.0)).max(0.0);
 
         return Some(TransitionZone {
             clip_a,
