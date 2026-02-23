@@ -4,7 +4,7 @@
 
 ## AI Dev Workflow
 - **Always ask for the file before touching it.** Never guess contents or edit from error messages alone.
-- **`str_replace` for all edits.** Never rewrite whole files. One call per logical change.
+- **`str_replace or python` for all edits.** Never rewrite whole files. One call per logical change.
 - **`grep` first** to find all instances before editing. **`grep` after** to confirm no stale calls.
 
 ---
