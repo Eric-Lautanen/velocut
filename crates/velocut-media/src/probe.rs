@@ -10,6 +10,7 @@ use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
+use ffmpeg::ffi;
 
 use velocut_core::media_types::MediaResult;
 
@@ -46,6 +47,12 @@ pub fn probe_duration(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) -> f64
 }
 
 /// Probes video stream dimensions and extracts a thumbnail frame in one pass.
+///
+/// Previously opened two `ictx` instances — one to seek and one for the decoder
+/// — to work around a borrow-checker conflict. This now uses
+/// `Context::from_parameters` (same pattern as `LiveDecoder::open`) to copy
+/// codec parameters out of the stream borrow before seeking, eliminating the
+/// second file open entirely. One ictx, one set of I/O buffers.
 pub fn probe_video_size_and_thumbnail(
     path:     &PathBuf,
     id:       Uuid,
@@ -59,7 +66,9 @@ pub fn probe_video_size_and_thumbnail(
         None    => return, // audio-only file
     };
 
-    let (raw_w, raw_h, seek_ts) = {
+    // Extract everything we need from the stream borrow in one block,
+    // then release the borrow so ictx is free for seeking and packet iteration.
+    let (raw_w, raw_h, seek_ts, dec_ctx) = {
         let stream = ictx.stream(video_stream_idx).unwrap();
         let (w, h) = unsafe {
             let p = stream.parameters().as_ptr();
@@ -72,7 +81,13 @@ pub fn probe_video_size_and_thumbnail(
         } else {
             0i64
         };
-        (w, h, ts)
+        // Copy codec parameters into an owned context — same pattern as
+        // LiveDecoder::open. Releases the stream borrow so ictx is usable below.
+        let dec_ctx = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
+            Ok(c)  => c,
+            Err(e) => { eprintln!("[media] codec ctx: {e}"); return; }
+        };
+        (w, h, ts, dec_ctx)
     };
 
     if raw_w > 0 && raw_h > 0 {
@@ -80,18 +95,19 @@ pub fn probe_video_size_and_thumbnail(
         let _ = tx.send(MediaResult::VideoSize { id, width: raw_w, height: raw_h });
     }
 
+    // [Fix] Discard non-video streams so the demuxer doesn't buffer audio packets
+    // that are never consumed. Each probe was previously holding audio in memory
+    // for the entire thumbnail decode pass.
+    for mut stream in ictx.streams_mut() {
+        if stream.index() != video_stream_idx {
+            unsafe { (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL; }
+        }
+    }
+
     let _ = ictx.seek(seek_ts, ..=seek_ts);
 
-    // Open a second context to build the decoder (avoids borrow-after-seek conflict).
-    let Ok(ictx2) = input(path) else { return };
-    let context = match ictx2.stream(video_stream_idx) {
-        Some(s) => match ffmpeg::codec::context::Context::from_parameters(s.parameters()) {
-            Ok(c)  => c,
-            Err(e) => { eprintln!("[media] codec ctx: {e}"); return; }
-        },
-        None => return,
-    };
-    let mut decoder = context.decoder().video().unwrap();
+    // Decoder built from the parameters copied above — no second file open needed.
+    let mut decoder = dec_ctx.decoder().video().unwrap();
 
     // Thumbnail output: 160 wide, proportional height
     let thumb_w: u32 = 160;

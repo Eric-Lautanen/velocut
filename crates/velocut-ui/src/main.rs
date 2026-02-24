@@ -5,6 +5,10 @@ mod context;
 mod helpers;
 mod modules;
 mod theme;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> eframe::Result {
     ffmpeg_the_third::init().expect("FFmpeg init failed");

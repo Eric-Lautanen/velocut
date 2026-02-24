@@ -207,7 +207,12 @@ unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool
         (*frames_ctx).sw_format         = ffi::AVPixelFormat::AV_PIX_FMT_NV12;        // inner sw format
         (*frames_ctx).width             = (*ctx).coded_width;
         (*frames_ctx).height            = (*ctx).coded_height;
-        (*frames_ctx).initial_pool_size = 10;  // surface pool — 10 is typical for decode
+        // [Fix 3] Pool of 4 is sufficient for the decode pipeline depth (1 being
+        // decoded + 1 in transfer + 2 in flight to renderer).  The original 10
+        // allocated 10 × NV12 GPU surfaces per playback decoder; with 5 clips open
+        // simultaneously that's 50 surfaces, each backed by a D3D11 staging buffer
+        // for av_hwframe_transfer_data readback.  4 per decoder cuts that to 20.
+        (*frames_ctx).initial_pool_size = 4;
     }
 
     let ret = ffi::av_hwframe_ctx_init(frames_ref);
@@ -300,6 +305,20 @@ impl LiveDecoder {
             let dec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
             (tb.numerator(), tb.denominator(), seek_ts, dec_ctx)
         };
+
+        // [Fix 1] Discard all non-video streams at the demuxer level.
+        // Without this, FFmpeg allocates and buffers audio/subtitle packets even
+        // though we immediately drop them in the packet loop — with 5 LiveDecoders
+        // open simultaneously that's 5 demuxers each buffering a full audio track.
+        // StreamMut doesn't expose a set_discard() setter in this fork, so we
+        // write the AVStream.discard field directly via the raw pointer.
+        for mut stream in ictx.streams_mut() {
+            if stream.index() != video_idx {
+                unsafe {
+                    (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
 
         let _ = ictx.seek(seek_ts, ..=seek_ts);
 
@@ -589,6 +608,14 @@ pub fn decode_frame(
         (idx, ts, tb.numerator() as f64, tb.denominator() as f64, dec_ctx)
     };
 
+    // Discard non-video streams — one-shot decode, no need to demux audio.
+    // StreamMut has no set_discard() setter in this fork; write AVStream.discard directly.
+    for mut stream in ictx.streams_mut() {
+        if stream.index() != video_stream_idx {
+            unsafe { (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL; }
+        }
+    }
+
     ictx.seek(seek_ts, ..=seek_ts)?;
     let mut decoder = dec_ctx.decoder().video()?;
 
@@ -715,6 +742,14 @@ pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64, aspect: f32) -> Result<(Ve
         (idx, ts_raw, tb.numerator() as f64, tb.denominator() as f64, dec_ctx)
     };
 
+    // Discard non-video streams — one-shot decode, no audio needed.
+    // StreamMut has no set_discard() setter in this fork; write AVStream.discard directly.
+    for mut stream in ictx.streams_mut() {
+        if stream.index() != video_idx {
+            unsafe { (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL; }
+        }
+    }
+
     // Honour the seek_to_secs invariant: skip seek at ts=0 (Windows EPERM).
     if seek_ts > 0 {
         let _ = ictx.seek(seek_ts, ..=seek_ts);
@@ -737,6 +772,9 @@ pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64, aspect: f32) -> Result<(Ve
     // Matches probe.rs: AVCC codecs report coded dims (e.g. 1088 ≠ 1080) before
     // the first packet; Annex-B has AV_PIX_FMT_NONE until then.
     let mut scaler: Option<SwsContext> = None;
+    // [Fix 2] last_good uses move semantics — only one Vec<u8> lives at a time.
+    // Previously buf.clone() was stored in last_good AND returned, meaning two
+    // full-frame allocations existed simultaneously for every pre-target frame.
     let mut last_good: Option<Vec<u8>> = None;
 
     for (stream, packet) in ictx.packets().flatten() {
@@ -761,14 +799,20 @@ pub fn decode_one_frame_rgba(path: &PathBuf, ts: f64, aspect: f32) -> Result<(Ve
             for row in 0..out_h as usize {
                 buf.extend_from_slice(&raw[row * stride..row * stride + row_bytes]);
             }
-            last_good = Some(buf.clone());
 
-            // Skip frames that landed before the target due to keyframe-aligned seek.
-            if let Some(pts) = decoded.pts() {
-                let pts_secs = pts as f64 * tb_num / tb_den;
-                if pts_secs < ts - (1.0 / 60.0) { continue; }
+            // Check PTS before deciding whether to return or continue scanning.
+            // Store buf into last_good via move (no clone), then return a clone
+            // only for the hit case — one allocation total on the happy path.
+            let pts_ok = decoded.pts().map_or(true, |pts| {
+                pts as f64 * tb_num / tb_den >= ts - (1.0 / 60.0)
+            });
+
+            last_good = Some(buf);
+
+            if pts_ok {
+                // Move out of last_good — no extra clone needed.
+                return Ok((last_good.take().unwrap(), out_w, out_h));
             }
-            return Ok((buf, out_w, out_h));
         }
     }
 
