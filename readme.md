@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ VeloCut
+# <img src="assets/linux/icon-48.png" alt="Velocut"> VeloCut
 
 **A fast, native desktop video editor written in Rust.**
 
