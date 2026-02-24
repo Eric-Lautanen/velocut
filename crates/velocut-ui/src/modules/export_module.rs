@@ -34,6 +34,7 @@ use super::EditorModule;
 use velocut_core::state::{ProjectState, AspectRatio};
 use velocut_core::commands::EditorCommand;
 use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
+use velocut_media::encode::HwEncodeCapabilities;
 use crate::modules::ThumbnailCache;
 use crate::helpers::reset;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, RENDER_BTN};
@@ -62,8 +63,8 @@ enum QualityPreset {
     SD480,
     HD720,
     FHD1080,
-   // QHD1440, commented out causes crashes
-   // UHD4K, commented out causes crashes
+    QHD1440,
+    UHD4K,
 }
 
 impl QualityPreset {
@@ -72,8 +73,8 @@ impl QualityPreset {
             QualityPreset::SD480   => "480p",
             QualityPreset::HD720   => "720p  (HD)",
             QualityPreset::FHD1080 => "1080p (Full HD)",
-           // QualityPreset::QHD1440 => "1440p (2K)", commented out causes crashes
-           // QualityPreset::UHD4K   => "4K    (2160p)", commented out causes crashes
+            QualityPreset::QHD1440 => "1440p (2K)",
+            QualityPreset::UHD4K   => "4K    (2160p)",
         }
     }
 
@@ -83,9 +84,14 @@ impl QualityPreset {
             QualityPreset::SD480   => 480,
             QualityPreset::HD720   => 720,
             QualityPreset::FHD1080 => 1080,
-           // QualityPreset::QHD1440 => 1440, commented out causes crashes
-           // QualityPreset::UHD4K   => 2160, commented out causes crashes
+            QualityPreset::QHD1440 => 1440,
+            QualityPreset::UHD4K   => 2160,
         }
+    }
+
+    /// Returns true if this preset requires a GPU (HW encoder) to run safely.
+    fn requires_hw(self) -> bool {
+        matches!(self, QualityPreset::QHD1440 | QualityPreset::UHD4K)
     }
 
     /// Compute (width, height) for a given aspect ratio.
@@ -132,16 +138,14 @@ pub struct ExportModule {
     quality:  QualityPreset,
     fps:      u32,
     /// Export aspect ratio override. `None` = follow the project's aspect ratio.
-    /// Stored as `Option` so we can show a "Match Project" default and switch
-    /// back to automatic if the project ratio changes.
     export_aspect: Option<AspectRatio>,
     /// Timestamp of when the first "Reset" click happened.
-    /// `None` = normal state.  `Some(t)` = waiting for confirmation within 5 s.
-    /// Auto-expires — checked and cleared on every render frame.
     clear_confirm_at: Option<std::time::Instant>,
-    /// Set to true when the user confirms a reset. Consumed by
-    /// `reset::show_uninstall_modal` which renders the post-reset overlay.
+    /// Set to true when the user confirms a reset.
     pub show_reset_complete: bool,
+    /// Cached result of the HW encoder probe. `None` until first render of this
+    /// panel — probed lazily so startup is not blocked. Once set, never changes.
+    hw_caps: Option<HwEncodeCapabilities>,
 }
 
 impl Default for ExportModule {
@@ -150,9 +154,10 @@ impl Default for ExportModule {
             filename:         "sequence_01".into(),
             quality:          QualityPreset::FHD1080,
             fps:              30,
-            export_aspect:        None, // follows project
+            export_aspect:        None,
             clear_confirm_at:     None,
             show_reset_complete:  false,
+            hw_caps:              None,
         }
     }
 }
@@ -526,6 +531,19 @@ impl ExportModule {
         cmd:         &mut Vec<EditorCommand>,
         is_encoding: bool,
     ) {
+        // Probe HW capabilities once on first render — lightweight dry-run,
+        // typically < 100 ms. Cached for the lifetime of the module.
+        let hw_caps = self.hw_caps.get_or_insert_with(|| {
+            velocut_media::encode::probe_hw_encode_capabilities()
+        });
+        let sw_only = hw_caps.sw_only;
+        let backend_name = hw_caps.backend_name;
+
+        // If the user somehow had a HW-only preset selected and HW is now gone,
+        // reset to 1080p to avoid a stale selection being passed to the encoder.
+        if sw_only && self.quality.requires_hw() {
+            self.quality = QualityPreset::FHD1080;
+        }
         // Resolve the effective aspect ratio and its f32 value for dimension math.
         let effective_ar    = self.export_aspect.unwrap_or(state.aspect_ratio);
         let effective_ratio = aspect_ratio_value(effective_ar);
@@ -593,9 +611,6 @@ impl ExportModule {
 
         ui.add_space(10.0);
 
-        // ── Quality / Resolution ──────────────────────────────────────────────
-        // Shown as quality levels (short-side px). Actual pixel dimensions are
-        // displayed below the ComboBox so the user can see the final resolution.
         ui.label(RichText::new("Quality").size(11.0).color(DARK_TEXT_DIM));
         ui.add_space(2.0);
         ui.add_enabled_ui(!is_encoding, |ui| {
@@ -607,15 +622,45 @@ impl ExportModule {
                         QualityPreset::SD480,
                         QualityPreset::HD720,
                         QualityPreset::FHD1080,
-                       // QualityPreset::QHD1440, commented out causes crashes
-                       // QualityPreset::UHD4K, commented out causes crashes
+                        QualityPreset::QHD1440,
+                        QualityPreset::UHD4K,
                     ] {
-                        let (w, h) = q.dimensions(effective_ratio);
-                        let label  = format!("{}  — {w}×{h}", q.label());
-                        ui.selectable_value(&mut self.quality, q, label);
+                        let disabled = sw_only && q.requires_hw();
+                        let (w, h)   = q.dimensions(effective_ratio);
+                        let label    = if disabled {
+                            format!("{}  — {w}×{h}  🔒", q.label())
+                        } else {
+                            format!("{}  — {w}×{h}", q.label())
+                        };
+                        let resp = ui.add_enabled(
+                            !disabled,
+                            egui::SelectableLabel::new(self.quality == q, &label),
+                        );
+                        if resp.clicked() {
+                            self.quality = q;
+                        }
+                        if disabled {
+                            resp.on_hover_text(format!(
+                                "Requires GPU acceleration\n\
+                                 Current encoder: {backend_name}\n\
+                                 2K and 4K are disabled on software-only encode\n\
+                                 to prevent long stalls on this machine."
+                            ));
+                        }
                     }
                 });
         });
+
+        // Show the resolved pixel dimensions below the ComboBox as a hint.
+        // Also show a warning if SW-only so users understand the cap.
+        if sw_only {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!("⚠ GPU encode unavailable ({backend_name}) — max 1080p"))
+                    .size(10.0)
+                    .color(Color32::from_rgb(220, 160, 60)),
+            );
+        }
 
         // Show the resolved pixel dimensions below the ComboBox as a hint.
         let (res_w, res_h) = self.quality.dimensions(effective_ratio);
@@ -717,7 +762,7 @@ impl ExportModule {
                     "Audio:     {}",
                     if has_audio { "AAC 128kbps stereo" } else { "none detected" }
                 )).size(11.0).monospace());
-                ui.label(RichText::new("Video:     H.264 CRF 18").size(11.0).monospace());
+                ui.label(RichText::new(format!("Video:     H.264 via {backend_name}")).size(11.0).monospace());
             });
 
         ui.add_space(12.0);

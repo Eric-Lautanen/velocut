@@ -14,12 +14,18 @@
 //   Stream 1 — AAC audio  (FLTP stereo, 44100 Hz, 128 kbps)
 //
 // Hardware encoding:
-//   Attempted in priority order: NVENC (CUDA) → VAAPI → VideoToolbox → libx264.
+//   Attempted in priority order: AMF (D3D11) → NVENC (CUDA) → VAAPI → VideoToolbox → libx264.
 //   Each HW path uploads YUV420P software frames to the device via an
 //   AVHWFramesContext before calling send_frame; the muxer receives standard
 //   H.264 Annex-B / AVCC output regardless of which encoder ran.
 //   If all HW paths fail (missing driver, wrong platform) the pipeline falls
 //   through to software x264 automatically.
+//
+// Hardware capability probe:
+//   `probe_hw_encode_capabilities()` runs a lightweight dry-run at startup
+//   (no actual encode) and returns `HwEncodeCapabilities`. The UI uses this
+//   to enable/disable 2K and 4K resolution options — SW-only machines are
+//   capped at 1080p to prevent lockups on high-resolution encodes.
 //
 // PTS strategy:
 //   Video: monotonically increasing frame counter (output_frame_idx) in 1/fps.
@@ -113,6 +119,144 @@ pub struct EncodeSpec {
     pub audio_overlays: Vec<AudioOverlay>,
 }
 
+// ── Hardware capability probe ─────────────────────────────────────────────────
+
+/// Result of the startup hardware encoder probe.
+///
+/// The UI reads this to decide which resolution options to offer.
+/// SW-only machines are capped at 1080p — above that libx264 is too slow
+/// and will stall the machine for several minutes per minute of footage.
+#[derive(Debug, Clone)]
+pub struct HwEncodeCapabilities {
+    /// True when no HW encoder is available and libx264 will be used.
+    /// 2K and 4K are disabled in the UI when this is true.
+    pub sw_only:      bool,
+    /// Human-readable name of the winning backend, e.g. "AMF", "NVENC",
+    /// "VAAPI", "VideoToolbox", or "Software (libx264)".
+    pub backend_name: &'static str,
+}
+
+/// Probe hardware encoder availability without starting an actual encode.
+///
+/// Tries each backend in priority order by attempting to create a D3D11/CUDA/
+/// VAAPI device context and a tiny (128×128) hw_frames_ctx. No frames are
+/// encoded. The probe typically completes in < 100 ms.
+///
+/// Call once at app startup and cache the result. Pass it to the export UI
+/// so it can enable or disable 2K/4K options before the user wastes time
+/// building a high-res timeline on an unsupported machine.
+pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
+    eprintln!("[encode] probing HW encode capabilities...");
+
+    // AMF — D3D11, Windows (AMD/Intel/discrete NVIDIA via AMF runtime)
+    if encoder::find_by_name("h264_amf").is_some() && probe_d3d11_device(128, 128) {
+        eprintln!("[encode] probe: AMF available");
+        return HwEncodeCapabilities { sw_only: false, backend_name: "AMF" };
+    }
+
+    // NVENC — CUDA, Windows/Linux
+    if encoder::find_by_name("h264_nvenc").is_some() && probe_cuda_device(128, 128) {
+        eprintln!("[encode] probe: NVENC available");
+        return HwEncodeCapabilities { sw_only: false, backend_name: "NVENC" };
+    }
+
+    // VAAPI — Linux (AMD/Intel)
+    if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(128, 128) {
+        eprintln!("[encode] probe: VAAPI available");
+        return HwEncodeCapabilities { sw_only: false, backend_name: "VAAPI" };
+    }
+
+    // VideoToolbox — macOS
+    if encoder::find_by_name("h264_videotoolbox").is_some() {
+        eprintln!("[encode] probe: VideoToolbox available");
+        return HwEncodeCapabilities { sw_only: false, backend_name: "VideoToolbox" };
+    }
+
+    eprintln!("[encode] probe: no HW encoder available — SW only, 2K/4K disabled");
+    HwEncodeCapabilities { sw_only: true, backend_name: "Software (libx264)" }
+}
+
+/// Try to create a D3D11VA device + NV12 frames context. Returns true on success.
+fn probe_d3d11_device(width: u32, height: u32) -> bool {
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(), std::ptr::null_mut(), 0,
+        )
+    };
+    if ret < 0 { return false; }
+
+    let ok = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+            width, height,
+        ) {
+            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Err(_) => false,
+        }
+    };
+    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    ok
+}
+
+/// Try to create a CUDA device + YUV420P frames context. Returns true on success.
+fn probe_cuda_device(width: u32, height: u32) -> bool {
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            std::ptr::null(), std::ptr::null_mut(), 0,
+        )
+    };
+    if ret < 0 { return false; }
+
+    let ok = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            width, height,
+        ) {
+            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Err(_) => false,
+        }
+    };
+    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    ok
+}
+
+/// Try to create a VAAPI device + YUV420P frames context. Returns true on success.
+fn probe_vaapi_device(width: u32, height: u32) -> bool {
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            std::ptr::null(), std::ptr::null_mut(), 0,
+        )
+    };
+    if ret < 0 { return false; }
+
+    let ok = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            width, height,
+        ) {
+            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Err(_) => false,
+        }
+    };
+    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    ok
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const PROGRESS_INTERVAL: u64 = 15;
@@ -159,7 +303,8 @@ fn try_open_hw_encoder(
         return result;
     }
 
-    // ── NVENC ─────────────────────────────────────────────────────────────────
+    // ── NVENC (CUDA — NVIDIA, Windows/Linux) ─────────────────────────────────
+    // Only compiled in when nv-codec-headers are present at ffmpeg build time.
     eprintln!("[encode] trying NVENC (CUDA)...");
     if let Some(result) = try_nvenc_encoder(width, height, fps, out_tb, octx) {
         eprintln!("[encode] HW encoder: NVENC (CUDA)");
@@ -315,7 +460,7 @@ fn try_amf_encoder(
         match build_hw_frames_ctx(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
-            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12, // D3D11 requires NV12, not YUV420P
             width, height,
         ) {
             Ok(f)  => f,
