@@ -50,7 +50,9 @@ mod fit_label_tests {
         assert!(result.len() < "hello world long name".len());
     }
 }
-/// valid UTF-8 character boundary.
+
+/// Truncate `s` to at most `max` bytes, always ending on a valid UTF-8
+/// character boundary.
 ///
 /// Used by the library card grid to keep clip names from overflowing their
 /// fixed-width tiles.

@@ -24,8 +24,8 @@ use velocut_core::helpers::time::format_duration;
 use crate::helpers::format::truncate;
 use crate::modules::ThumbnailCache;
 use crate::theme::{
-    ACCENT, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BG_4,
-    DARK_BORDER, DARK_TEXT, DARK_TEXT_DIM,
+    ACCENT, ACCENT_DUR, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BG_4,
+    DARK_BORDER, DARK_TEXT, DARK_TEXT_DIM, SEL_CHECK, SEL_MULTI,
 };
 use egui::{Align, Color32, Id, LayerId, Layout, Order, RichText, Sense, Stroke, Ui};
 use rfd::FileDialog;
@@ -39,10 +39,6 @@ const THUMB_W:  f32 = 86.0;   // image width  inside card
 const THUMB_H:  f32 = 48.0;   // image height inside card
 const CARD_GAP: f32 = 6.0;    // gap between cards
 const CARD_PAD: f32 = 8.0;    // left / right inset of the grid
-
-// ── Multi-select colour ───────────────────────────────────────────────────────
-const SEL_MULTI: Color32 = Color32::from_rgb(255, 160, 50);   // same as ACCENT
-const SEL_CHECK: Color32 = Color32::from_rgb(255, 200, 80);   // check-mark tint
 
 // ── Module ────────────────────────────────────────────────────────────────────
 
@@ -121,18 +117,13 @@ impl EditorModule for LibraryModule {
             self.clear_selection(cmd);
         }
 
-        // ── Column count (must be before ScrollArea) ─────────────────────────
-        let usable_w = (ui.available_width() - CARD_PAD * 2.0).max(CARD_W);
-        let cols     = ((usable_w + CARD_GAP) / (CARD_W + CARD_GAP)).floor() as usize;
-        let cols     = cols.max(1);
-
         // ── Layout ───────────────────────────────────────────────────────────
         ui.vertical(|ui| {
             header_bar(ui, cmd);
             status_strip(ui, state, &self.multi_selection);
             ui.add_space(1.0);
 
-            egui::ScrollArea::both()
+            egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .show(ui, |ui| {
@@ -152,6 +143,13 @@ impl EditorModule for LibraryModule {
                     }
 
                     ui.add_space(CARD_PAD);
+
+                    // Column count recalculated here so it uses the true inner width
+                    // after the vertical scrollbar has been reserved — prevents cards
+                    // from overflowing and triggering a horizontal scrollbar.
+                    let usable_w = (ui.available_width() - CARD_PAD * 2.0).max(CARD_W);
+                    let cols     = ((usable_w + CARD_GAP) / (CARD_W + CARD_GAP)).floor() as usize;
+                    let cols     = cols.max(1);
 
                     // Collect ids in display order for range selection
                     let ids: Vec<Uuid> = state.library.iter().map(|c| c.id).collect();
@@ -378,7 +376,7 @@ fn paint_card(
     let border_col = if highlight { SEL_MULTI } else { DARK_BORDER };
     let border_w   = if highlight { 1.5 } else { 1.0 };
     let name_col   = if is_selected { DARK_TEXT } else { DARK_TEXT_DIM };
-    let dur_col    = if is_selected { ACCENT } else { Color32::from_rgb(130, 90, 35) };
+    let dur_col    = if is_selected { ACCENT } else { ACCENT_DUR };
 
     let resp = egui::Frame::new()
         .fill(fill_col)

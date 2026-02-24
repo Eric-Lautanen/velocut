@@ -21,9 +21,11 @@ use eframe::egui;
 use egui_desktop::{TitleBar, TitleBarOptions, render_resize_handles};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::collections::HashSet;
 use uuid::Uuid;
 use rfd::FileDialog;
 use crate::velocut_log;
+use crate::helpers::memory_manager::MemoryManager;
 
 #[derive(Serialize, Deserialize)]
 struct AppStorage {
@@ -70,12 +72,6 @@ pub struct VeloCutApp {
     /// the very first frame. Runs exactly once per process lifetime.
     startup_size_checked: bool,
 
-    /// Set to true by ClearProject so the next update() call wipes egui's
-    /// in-memory IdTypeMap (panel heights, scroll offsets, open popup flags)
-    /// before any panel renders. Cannot be done in process_command because
-    /// ctx is not available there.
-    clear_egui_memory: bool,
-
     /// Set to true by ClearProject and checked in save() and on_exit().
     ///
     /// eframe calls save() automatically after the export_module deletes the
@@ -84,16 +80,25 @@ pub struct VeloCutApp {
     /// on_exit() re-runs delete_app_data_dir() as a backstop in case eframe
     /// squeezed in an autosave between the button click and the exit.
     reset_done: bool,
+
+
+    memory_manager: MemoryManager,
 }
 
 impl VeloCutApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
+        // egui_extras::install_image_loaders is called in main() before this
+        // runs — removed the duplicate call that was here previously.
         configure_style(&cc.egui_ctx);
-        // Pin to dark mode — prevents egui overwriting our theme on OS light/dark changes.
         cc.egui_ctx.options_mut(|o| {
             o.theme_preference = egui::ThemePreference::Dark;
         });
+
+        // Fix taskbar icon: WS_POPUP (from with_decorations(false)) doesn't get
+        // WS_EX_APPWINDOW automatically — the shell omits or icon-strips the button.
+        // fix_taskbar_icon() enumerates windows on this thread and patches the style.
+        // No rwh import needed; see main.rs for implementation.
+        crate::fix_taskbar_icon();
 
         let state = cc.storage
             .and_then(|s| eframe::get_value::<AppStorage>(s, eframe::APP_KEY))
@@ -102,15 +107,13 @@ impl VeloCutApp {
 
         let media_worker = MediaWorker::new();
         for clip in &state.library {
-            // Always re-probe on startup — thumbnails and audio are runtime-only
-            // (temp WAVs deleted on exit, textures not serialized). Duration and
-            // waveform peaks are already in state so probe just refreshes visuals.
             media_worker.probe_clip(clip.id, clip.path.clone());
         }
 
         let context = AppContext::new(media_worker);
         let library  = LibraryModule::new();
         let timeline = TimelineModule::new();
+        let memory_manager = MemoryManager::new();
 
         Self {
             state,
@@ -124,8 +127,8 @@ impl VeloCutApp {
             undo_stack:   VecDeque::new(),
             redo_stack:   VecDeque::new(),
             startup_size_checked: false,
-            clear_egui_memory:    false,
             reset_done:           false,
+            memory_manager,
         }
     }
 
@@ -209,7 +212,7 @@ impl VeloCutApp {
 
     // ── Command processing ────────────────────────────────────────────────────
 
-    fn process_command(&mut self, cmd: EditorCommand) {
+    fn process_command(&mut self, cmd: EditorCommand, ctx: &egui::Context) {
         match cmd {
             // ── Undo / Redo ──────────────────────────────────────────────────
             EditorCommand::PushUndoSnapshot => {
@@ -448,24 +451,13 @@ impl VeloCutApp {
 
             // ── Project reset ─────────────────────────────────────────────────
             EditorCommand::ClearProject => {
-                // Steps are ordered carefully — see reset.rs for filesystem ops.
+                // Context teardown — stops playback, drops audio handles, evicts
+                // all GPU textures, resets scrub/playback tracking, and wipes egui
+                // widget state. Worker threads stay alive so the user can continue
+                // using the app on the "keep using" path after reset.
+                crate::helpers::reset::reset_context(&mut self.context, Some(ctx));
 
-                // Step 1: stop playback before touching state. The decode loop
-                // holds clip references and races if state changes under it.
-                self.context.media_worker.stop_playback();
-
-                // Step 2: drop audio sinks. rodio threads reference WAV paths;
-                // dropping sinks lets them finish cleanly before paths go stale.
-                self.context.audio_sinks.clear();
-                self.context.audio_overlay_sinks.clear();
-
-                // Step 3: evict all GPU textures and reset the byte budget.
-                self.context.cache.clear_all();
-
-                // Step 4: reset scrub / playback tracking.
-                self.context.playback.reset();
-
-                // Step 5: wipe serialisable project data.
+                // Wipe serialisable project data.
                 self.state.library.clear();
                 self.state.timeline.clear();
                 self.state.transitions.clear();
@@ -474,34 +466,36 @@ impl VeloCutApp {
                 self.state.current_time           = 0.0;
                 self.state.is_playing             = false;
 
-                // Step 6: zero encode state (may have been mid-encode).
+                // Zero encode state (may have been mid-encode).
                 self.state.encode_job      = None;
                 self.state.encode_progress = None;
                 self.state.encode_done     = None;
                 self.state.encode_error    = None;
 
-                // Step 7: clear undo/redo — stale snapshots waste memory and
-                // there is nothing meaningful to undo after a full wipe.
-                self.undo_stack.clear();
-                self.redo_stack.clear();
+                // Clear undo/redo — stale snapshots waste memory and there is
+                // nothing meaningful to undo after a full wipe.
+                self.undo_stack = VecDeque::new();
+                self.redo_stack = VecDeque::new();
                 self.sync_undo_len();
 
-                // Step 8: clear the deferred audio-cleanup queue.
-                // export_module called reset::delete_temp_files() synchronously
-                // before pushing this command, so every velocut_* file is already
-                // gone. Clearing the queue prevents poll_media from attempting a
-                // second deletion next frame and logging a spurious "file not found".
+                // Clear the deferred audio-cleanup queue. export_module called
+                // reset::delete_temp_files() before pushing this command, so every
+                // velocut_* file is already gone. Clearing prevents poll_media from
+                // attempting a second deletion next frame and logging a spurious
+                // "file not found".
                 self.state.pending_audio_cleanup.clear();
 
-                // Step 9: schedule egui in-memory clear. Panel heights, scroll
-                // positions, and popup flags live in egui's IdTypeMap and cannot
-                // be cleared here because ctx is unavailable in process_command.
-                // The flag is consumed at the top of the very next update() call,
-                // before any panel renders. startup_size_checked is also reset so
-                // the timeline-height guard re-runs and injects a fresh default.
-                self.clear_egui_memory    = true;
+                // Re-arm the startup size guard so the timeline height is
+                // re-injected on the next frame after egui memory is fresh.
                 self.startup_size_checked = false;
                 self.reset_done           = true;
+                self.preview.current_frame = None;
+                // held_frame is private, so either make it pub or add a reset method on PreviewModule
+
+                self.library.multi_selection = HashSet::new();
+                self.library.visible_ids     = HashSet::new();
+
+                self.preview.reset();
             }
             EditorCommand::SetCrossfadeDuration(secs) => {
                 // Batch operation: set crossfade on every touching adjacent pair,
@@ -724,22 +718,13 @@ impl eframe::App for VeloCutApp {
         // eframe flushes its own storage (window geometry, egui panel state)
         // after on_exit() returns, which recreates %APPDATA%\VeloCut\data\
         // even if our save() is a no-op. schedule_app_data_dir_deletion()
-        // spawns a detached cmd process that waits ~1 s then deletes the
-        // directory — by then eframe's final flush will have completed.
+        // hard-exits the process before that flush can run.
         if self.reset_done {
-            crate::helpers::reset::schedule_app_data_dir_deletion();
+            crate::helpers::reset::schedule_app_data_dir_deletion(&mut self.context);
         }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Post-reset egui memory wipe ───────────────────────────────────────
-        // Consumes the flag set by ClearProject. Replacing mem.data with a
-        // default IdTypeMap evicts all stored egui values (panel heights, scroll
-        // positions, open-popup flags) in one shot, before any widget runs.
-        if self.clear_egui_memory {
-            ctx.memory_mut(|mem| mem.data = egui::util::IdTypeMap::default());
-            self.clear_egui_memory = false;
-        }
         // ── Startup size guard ────────────────────────────────────────────────
         // eframe restores persisted window geometry. If a previous run left the
         // window at tiny/zero dimensions (e.g. the resizable-panel bug), we snap
@@ -757,28 +742,32 @@ impl eframe::App for VeloCutApp {
         // irrelevant — we own the initial height explicitly.
         if !self.startup_size_checked {
             let screen = ctx.viewport_rect();
-            const SETTLE_MIN_H: f32 = 400.0;
+            const TARGET_W: f32 = 1465.0;
+            const TARGET_H: f32 = 965.0;
+            const SETTLE_MIN_H: f32 = 900.0; // raise this — must match your actual target
+
+            // Always fire the resize command on frame 1 unconditionally.
+            // Don't wait to "check" — just assert the correct size every frame
+            // until the viewport reports it's actually there.
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                egui::vec2(TARGET_W, TARGET_H),
+            ));
+
+            // Only write panel heights once the OS has actually applied the resize.
+            // This prevents the race where we write a 340px timeline into a
+            // 200px-tall viewport and egui clamps + persists the clamped value.
             if screen.height() >= SETTLE_MIN_H {
                 self.startup_size_checked = true;
 
-                // Target: timeline takes ~35 % of the window height, clamped to
-                // a comfortable [300, 420] px band.
                 let timeline_h = (screen.height() * 0.35).clamp(300.0, 420.0);
                 ctx.memory_mut(|mem| {
                     mem.data.insert_temp(egui::Id::new("timeline_panel"), timeline_h);
+                    mem.data.insert_persisted(egui::Id::new("timeline_panel"), timeline_h);
                 });
-
-                // Also guard against a previously shrunken window geometry.
-                const MIN_W: f32 = 900.0;
-                const MIN_H: f32 = 600.0;
-                if screen.width() < MIN_W || screen.height() < MIN_H {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                        egui::vec2(1465.0, 965.0),
-                    ));
-                }
             }
-            // Keep repainting until the viewport settles (typically frame 1-2).
+
             ctx.request_repaint();
+            return; // skip the rest of update() until the window is properly sized
         }
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
@@ -788,7 +777,7 @@ impl eframe::App for VeloCutApp {
         // ── Process commands emitted by modules this frame ────────────────────
         let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
         for cmd in cmds {
-            self.process_command(cmd);
+            self.process_command(cmd, ctx);
         }
 
         self.tick_modules(ctx);
@@ -909,16 +898,16 @@ impl VeloCutApp {
     /// Render the title bar, all panels, and the encode modal overlay.
     /// Called from `update()` after pre-frame housekeeping.
     fn render_panels(&mut self, ctx: &egui::Context) {
-        const BOLT_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><polygon points="9,1 4,9 8,9 7,15 12,7 8,7" fill="rgb(255,160,50)"/></svg>"#;
+        const APP_ICON: &[u8] = include_bytes!("../../../assets/linux/icon-32.png");
         TitleBar::new(
             TitleBarOptions::new()
-                .with_title("VeloCut")
+                .with_title("")
                 .with_background_color(crate::theme::DARK_BG_1)
                 .with_hover_color(crate::theme::DARK_BG_4)
                 .with_close_hover_color(egui::Color32::from_rgb(232, 17, 35))
                 .with_title_color(crate::theme::ACCENT)
                 .with_title_font_size(15.0)
-                .with_app_icon(BOLT_ICON, "bolt.svg"),
+                .with_app_icon(APP_ICON, "icon-32.png"),
         )
         .show(ctx);
 
@@ -971,7 +960,7 @@ impl VeloCutApp {
     fn tick_modules(&mut self, ctx: &egui::Context) {
         VideoModule::tick(&self.state, &mut self.context, ctx);
         self.audio.tick(&self.state, &mut self.context);
-
+        self.memory_manager.tick(ctx, &self.state, &mut self.context);
         if self.state.is_playing {
             let dt = ctx.input(|i| i.stable_dt as f64);
             self.state.current_time += dt;

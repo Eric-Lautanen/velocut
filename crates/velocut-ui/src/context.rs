@@ -56,7 +56,7 @@ pub struct CacheContext {
     /// Approximate bytes currently held in frame_bucket_cache.
     /// Updated on insert and eviction.  Treated as an estimate (we don't track
     /// exact compressed GPU size) — uses raw RGBA bytes as a conservative ceiling.
-    frame_cache_bytes: usize,
+    pub(crate) frame_cache_bytes: usize,
 }
 
 impl CacheContext {
@@ -125,11 +125,11 @@ impl CacheContext {
     /// Dropping TextureHandles releases the GPU allocations; clearing the
     /// byte counter prevents a stale over-budget signal on the next insert.
     pub fn clear_all(&mut self) {
-        self.thumbnail_cache.clear();
-        self.frame_cache.clear();
-        self.frame_bucket_cache.clear();
-        self.pending_pb_frame  = None;
-        self.frame_cache_bytes = 0;
+        self.thumbnail_cache    = HashMap::new();
+        self.frame_cache        = HashMap::new();
+        self.frame_bucket_cache = HashMap::new();
+        self.pending_pb_frame   = None;
+        self.frame_cache_bytes  = 0;
     }
 }
 

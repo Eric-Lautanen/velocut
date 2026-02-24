@@ -36,7 +36,7 @@ use velocut_core::commands::EditorCommand;
 use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
 use crate::modules::ThumbnailCache;
 use crate::helpers::reset;
-use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
+use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, RENDER_BTN};
 use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
 
 // ── Colour palette extensions (local to this module) ─────────────────────────
@@ -729,9 +729,9 @@ impl ExportModule {
                 RichText::new("⚡ Render MP4")
                     .size(13.0)
                     .strong()
-                    .color(if no_clips { Color32::DARK_GRAY } else { Color32::BLACK }),
+                    .color(if no_clips { Color32::DARK_GRAY } else { Color32::WHITE }),
             )
-            .fill(if no_clips { DARK_BG_3 } else { ACCENT })
+            .fill(if no_clips { DARK_BG_3 } else { RENDER_BTN })
             .stroke(Stroke::NONE)
             .min_size(egui::vec2(ui.available_width(), 34.0));
 

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <clipPath id="rounded">
+      <rect width="256" height="256" rx="28" ry="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#rounded)">
+
+    <!-- Background -->
+    <rect width="256" height="256" fill="#0e0e10"/>
+
+    <!-- Top perforation bar -->
+    <rect x="0" y="0" width="256" height="44" fill="#1c1c1e"/>
+
+    <!-- Bottom perforation bar -->
+    <rect x="0" y="212" width="256" height="44" fill="#1c1c1e"/>
+
+    <!-- Top perforation holes -->
+    <rect x="14"  y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="52"  y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="90"  y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="128" y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="166" y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="204" y="10" width="22" height="24" rx="4" fill="#0e0e10"/>
+
+    <!-- Bottom perforation holes -->
+    <rect x="14"  y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="52"  y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="90"  y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="128" y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="166" y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+    <rect x="204" y="222" width="22" height="24" rx="4" fill="#0e0e10"/>
+
+    <!-- VC text centered in frame area (y=44 to y=212, midpoint=128) -->
+    <text
+      x="128"
+      y="123"
+      text-anchor="middle"
+      dominant-baseline="central"
+      font-family="Arial Black, Arial, sans-serif"
+      font-weight="900"
+      font-size="138"
+      fill="#00b8d4"
+      letter-spacing="-6"
+    >VC</text>
+
+  </g>
+</svg>

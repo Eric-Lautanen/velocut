@@ -2,9 +2,15 @@
 use egui::{Context, Color32, Stroke, Visuals, Style};
 
 // ── Palette ──────────────────────────────────────────────────────────────────
-pub const ACCENT:        Color32 = Color32::from_rgb(255, 160,  50);
-pub const ACCENT_DIM:    Color32 = Color32::from_rgb(180, 100,  20);
-pub const ACCENT_HOVER:  Color32 = Color32::from_rgb(255, 185,  90);
+pub const ACCENT:        Color32 = Color32::from_rgb(  0, 229, 255);
+pub const ACCENT_DIM:    Color32 = Color32::from_rgb(  0, 150, 180);
+pub const ACCENT_HOVER:  Color32 = Color32::from_rgb( 80, 240, 255);
+pub const RENDER_BTN:    Color32 = Color32::from_rgb(  0,  90, 110);  // dark teal fill for the Render MP4 button
+
+pub const ACTION_BTN_FILL:   Color32 = Color32::from_rgb( 38,  38,  46);  // Split / primary action button fill
+pub const ACTION_BTN_STROKE: Color32 = Color32::from_rgb( 65,  65,  80);  // Split / primary action button border
+pub const PLAYHEAD_BTN_FILL:   Color32 = Color32::from_rgb( 32,  32,  40);  // Playhead frame button fill
+pub const PLAYHEAD_BTN_STROKE: Color32 = Color32::from_rgb( 58,  58,  72);  // Playhead frame button border
 
 pub const DARK_BG_0:     Color32 = Color32::from_rgb( 14,  14,  16);
 pub const DARK_BG_1:     Color32 = Color32::from_rgb( 20,  20,  24);
@@ -18,7 +24,11 @@ pub const DARK_BORDER:   Color32 = Color32::from_rgb( 55,  55,  68);
 
 pub const CLIP_VIDEO:    Color32 = Color32::from_rgb( 52,  98, 168);
 pub const CLIP_AUDIO:    Color32 = Color32::from_rgb( 42, 138,  98);
-pub const CLIP_SELECTED: Color32 = Color32::from_rgb(200,  80,  50);
+pub const CLIP_SELECTED: Color32 = Color32::from_rgb(  0, 180, 210);
+
+pub const SEL_MULTI:     Color32 = Color32::from_rgb(  0, 229, 255);  // card border / badge fill when multi-selected
+pub const SEL_CHECK:     Color32 = Color32::from_rgb( 80, 240, 255);  // ✓ checkmark tint on badge
+pub const ACCENT_DUR:    Color32 = Color32::from_rgb(  0, 120, 145);  // dimmed duration text on unselected cards
 
 pub fn configure_style(ctx: &Context) {
     let mut style = Style::default();

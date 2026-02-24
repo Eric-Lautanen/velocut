@@ -58,11 +58,16 @@ pub struct PreviewModule {
     /// Last successfully decoded frame. Held across ticks so that brief gaps
     /// during clip transitions and scrub decode latency never flash the thumbnail.
     /// Cleared only when the playhead moves to a region with no timeline clip.
-    held_frame: Option<egui::TextureHandle>,
+    pub held_frame: Option<egui::TextureHandle>,
 }
 
 impl PreviewModule {
     pub fn new() -> Self { Self { current_frame: None, held_frame: None } }
+
+    pub fn reset(&mut self) {
+        self.current_frame = None;
+        self.held_frame    = None;
+    }
 }
 
 impl EditorModule for PreviewModule {
@@ -197,10 +202,6 @@ impl EditorModule for PreviewModule {
             ui.add_space(6.0);
 
             // ── Transport Bar ─────────────────────────────────────────────────
-            // Allocate the full-width bar, then position every element with
-            // pure coordinate math from bar_rect.center().  No egui layout
-            // pass is used for the controls — this eliminates all centering
-            // drift and guarantees buttons are always the same pixel size.
             let bar_w = ui.available_width();
             let (bar_rect, _) = ui.allocate_exact_size(
                 Vec2::new(bar_w, BAR_H), Sense::hover());
@@ -211,18 +212,11 @@ impl EditorModule for PreviewModule {
                 Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Outside);
 
             let cy = bar_rect.center().y;
-            // Compute how much space we actually have.
-            // When the panel is narrow, suppress the volume slider to save space,
-            // and always clamp the start x so controls never draw outside the bar.
             let show_volume  = bar_w >= CONTENT_W + 16.0;
             let content_w    = if show_volume { CONTENT_W } else { CONTENT_W - GAP - VOL_W };
-            // x advances left-to-right through the content block
             let mut x = (bar_rect.center().x - content_w / 2.0)
                 .max(bar_rect.min.x + 6.0);
 
-            // ── Helper: one fixed-size transport button ───────────────────
-            // Paints bg + border, calls draw_icon closure, returns clicked.
-            // Every button is exactly BTN_SIZE × BTN_SIZE — no text involved.
             macro_rules! tbtn {
                 ($id:expr, $active:expr, $draw_icon:expr) => {{
                     let r = Rect::from_min_size(
@@ -253,13 +247,11 @@ impl EditorModule for PreviewModule {
 
             // ── Skip to Start ─────────────────────────────────────────────
             if tbtn!("skip_back", false, |c: Pos2, col: Color32| {
-                // Vertical bar on left
                 painter.rect_filled(
                     Rect::from_center_size(
                         Pos2::new(c.x - ICON_SZ + 0.5, c.y),
                         Vec2::new(2.5, ICON_SZ * 2.0)),
                     0.5, col);
-                // Left-pointing triangle
                 painter.add(egui::Shape::convex_polygon(vec![
                     Pos2::new(c.x - ICON_SZ + 4.0, c.y),
                     Pos2::new(c.x + ICON_SZ - 1.0,  c.y - ICON_SZ + 1.0),
@@ -274,7 +266,6 @@ impl EditorModule for PreviewModule {
             let playing = state.is_playing;
             if tbtn!("play_pause", playing, |c: Pos2, col: Color32| {
                 if playing {
-                    // Two bars = pause
                     for ox in [-ICON_SZ * 0.45, ICON_SZ * 0.45] {
                         painter.rect_filled(
                             Rect::from_center_size(
@@ -283,7 +274,6 @@ impl EditorModule for PreviewModule {
                             1.0, col);
                     }
                 } else {
-                    // Right-pointing triangle = play
                     painter.add(egui::Shape::convex_polygon(vec![
                         Pos2::new(c.x - ICON_SZ * 0.5, c.y - ICON_SZ),
                         Pos2::new(c.x - ICON_SZ * 0.5, c.y + ICON_SZ),
@@ -319,7 +309,6 @@ impl EditorModule for PreviewModule {
             let muted   = state.muted;
             let vol_val = state.volume;
             if tbtn!("mute", muted, |c: Pos2, col: Color32| {
-                // Speaker cone
                 painter.add(egui::Shape::convex_polygon(vec![
                     Pos2::new(c.x - ICON_SZ + 1.0, c.y - ICON_SZ * 0.4),
                     Pos2::new(c.x - ICON_SZ + 1.0, c.y + ICON_SZ * 0.4),
@@ -352,9 +341,6 @@ impl EditorModule for PreviewModule {
             x += GAP;
 
             // ── Volume Slider ─────────────────────────────────────────────
-            // ui.put() places the widget at an exact rect we control,
-            // keeping it perfectly aligned with the painted buttons.
-            // Hidden when the panel is too narrow to fit all controls.
             if show_volume {
                 let vol_rect = Rect::from_min_size(
                     Pos2::new(x, cy - BTN_SIZE / 2.0),

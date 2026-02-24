@@ -7,7 +7,7 @@ use velocut_core::transitions::TransitionType;
 use crate::helpers::clip_query;
 use crate::helpers::format::fit_label;
 use crate::modules::ThumbnailCache;
-use crate::theme::{ACCENT, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM};
+use crate::theme::{ACCENT, ACTION_BTN_FILL, ACTION_BTN_STROKE, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, PLAYHEAD_BTN_FILL, PLAYHEAD_BTN_STROKE};
 use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};
 use uuid::Uuid;
 
@@ -73,17 +73,16 @@ fn tool_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 /// Accented action button (Split) — subtle tinted fill so it reads as primary.
 fn action_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     egui::Button::new(label)
-        .fill(Color32::from_rgb(35, 65, 105))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(80, 130, 210)))
+        .fill(ACTION_BTN_FILL)
+        .stroke(Stroke::new(1.0, ACTION_BTN_STROKE))
         .min_size(egui::vec2(0.0, 26.0))
 }
 
-/// Playhead-frame export button — amber tint to distinguish it from the
-/// neutral First/Last Frame buttons while staying in the same visual family.
+/// Playhead-frame export button — consistent dark style matching the toolbar theme.
 fn playhead_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     egui::Button::new(label)
-        .fill(Color32::from_rgb(75, 50, 8))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(210, 148, 38)))
+        .fill(PLAYHEAD_BTN_FILL)
+        .stroke(Stroke::new(1.0, PLAYHEAD_BTN_STROKE))
         .min_size(egui::vec2(0.0, 26.0))
 }
 
@@ -456,6 +455,7 @@ impl EditorModule for TimelineModule {
             // bug. Track heights scale between [28, 54] px to fill the space as
             // the user resizes the panel via the drag handle at the top.
             let header_height = 28.0_f32;
+            let label_col     = 48.0_f32;  // fixed track-label column width
             let track_gap     = 4.0_f32;
             let num_tracks    = 4_usize;
             let track_height  = {
@@ -485,31 +485,48 @@ impl EditorModule for TimelineModule {
                     // `.clone()` gives an owned Painter (egui Painter is Arc-backed)
                     // so ui is free for mutable calls like ui.put() later in the loop.
                     let painter = ui.painter().clone();
+                    // All time→x conversions use this as x=0, offsetting past the label column.
+                    let time_origin_x = rect.min.x + label_col;
 
-                    painter.rect_filled(rect, 0.0, DARK_BG_0);
-
-                    // Track lanes
+                    // Track lanes (start after label column)
+                    let viewport_w = ui.clip_rect().width();
+                    let fill_w = rect.width().max(viewport_w);
+                    painter.rect_filled(Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height())), 0.0, DARK_BG_0);
+                    let label_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("track_labels")));
+                    let label_col_x  = ui.clip_rect().min.x;
                     for t in 0..num_tracks {
                         let y    = rect.min.y + header_height + t as f32 * (track_height + track_gap);
-                        let lane = Rect::from_min_size(Pos2::new(rect.min.x, y),
-                            egui::vec2(rect.width(), track_height));
+                        // Lane background starts at time_origin_x
+                        let lane = Rect::from_min_size(Pos2::new(time_origin_x, y),
+                            egui::vec2(fill_w, track_height));
                         painter.rect_filled(lane, 0.0,
                             if t % 2 == 0 { Color32::from_rgba_unmultiplied(255, 255, 255, 3) }
                             else { Color32::TRANSPARENT });
+                        // Label column — pinned to visible left, always on top
+                        let label_rect = Rect::from_min_size(Pos2::new(label_col_x, y), egui::vec2(label_col, track_height));
+                        label_painter.rect_filled(label_rect, 0.0, DARK_BG_2);
+                        label_painter.rect_stroke(label_rect, 0.0, Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Inside);
                         let label = match t { 0 => "V1", 1 => "A1", 2 => "V2", _ => "A2" };
-                        painter.text(Pos2::new(rect.min.x + 4.0, y + track_height * 0.5),
-                            Align2::LEFT_CENTER, label, FontId::monospace(9.0),
-                            Color32::from_rgba_unmultiplied(120, 120, 138, 180));
+                        label_painter.text(Pos2::new(label_col_x + label_col * 0.5, y + track_height * 0.5),
+                            Align2::CENTER_CENTER, label, FontId::monospace(9.0),
+                            Color32::from_rgba_unmultiplied(120, 120, 138, 200));
                     }
 
                     // Ruler
                     painter.rect_filled(
-                        Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height)),
+                        Rect::from_min_size(Pos2::new(time_origin_x, rect.min.y), egui::vec2(fill_w, header_height)),
                         0.0, Color32::from_rgb(16, 16, 20));
+                    // Label column header
+                    label_painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(label_col_x, rect.min.y), egui::vec2(label_col, header_height)),
+                        0.0, Color32::from_rgb(12, 12, 16));
+                    label_painter.rect_stroke(
+                        Rect::from_min_size(Pos2::new(label_col_x, rect.min.y), egui::vec2(label_col, header_height)),
+                        0.0, Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Inside);
                     let step = ruler_step(state.timeline_zoom);
                     let mut s = 0.0f64;
                     while s <= max_time + step {
-                        let x        = rect.min.x + (s as f32 * state.timeline_zoom);
+                        let x        = time_origin_x + (s as f32 * state.timeline_zoom);
                         let is_major = (s % (step * 5.0)).abs() < step * 0.1;
                         let tick_h   = if is_major { header_height } else { header_height * 0.4 };
                         painter.line_segment(
@@ -525,11 +542,11 @@ impl EditorModule for TimelineModule {
                     }
 
                     // Ruler click/drag → seek
-                    let ruler_rect = Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
+                    let ruler_rect = Rect::from_min_size(Pos2::new(time_origin_x, rect.min.y), egui::vec2(fill_w, header_height));
                     let ruler_resp = ui.interact(ruler_rect, Id::new("timeline_ruler"), Sense::click_and_drag());
                     if ruler_resp.clicked() || ruler_resp.dragged() {
                         if let Some(ptr) = ruler_resp.interact_pointer_pos() {
-                            let t         = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t         = ((ptr.x - time_origin_x) / state.timeline_zoom).max(0.0) as f64;
                             let t_clamped = t.min(state.total_duration().max(0.0));
                             if ruler_resp.drag_started() || ruler_resp.clicked() {
                                 // Click or drag-start: always emit so the user gets instant response.
@@ -553,7 +570,7 @@ impl EditorModule for TimelineModule {
                     // DnD drop zone
                     let payload: Option<Uuid> = ui.memory(|m| m.data.get_temp(Id::new("DND_PAYLOAD")));
                     let content_rect = Rect::from_min_max(
-                        Pos2::new(rect.min.x, rect.min.y + header_height), rect.max);
+                        Pos2::new(time_origin_x, rect.min.y + header_height), rect.max);
 
                     if payload.is_some() && !ui.input(|i| i.pointer.any_down()) {
                         ui.memory_mut(|mem| mem.data.remove::<Uuid>(Id::new("DND_PAYLOAD")));
@@ -568,7 +585,7 @@ impl EditorModule for TimelineModule {
 
                         if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
                             if content_rect.contains(hover) {
-                                let raw_t = ((hover.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                                let raw_t = ((hover.x - time_origin_x) / state.timeline_zoom).max(0.0) as f64;
 
                                 // Raw row from hover y position.
                                 let raw_row = {
@@ -603,10 +620,10 @@ impl EditorModule for TimelineModule {
                                 let lane_y = rect.min.y + header_height
                                     + enforced_row as f32 * (track_height + track_gap);
                                 let lane_rect = Rect::from_min_size(
-                                    Pos2::new(rect.min.x, lane_y),
+                                    Pos2::new(time_origin_x, lane_y),
                                     egui::vec2(rect.width(), track_height));
 
-                                let line_x   = rect.min.x + snapped as f32 * state.timeline_zoom;
+                                let line_x   = time_origin_x + snapped as f32 * state.timeline_zoom;
                                 let snapping = track_end.is_finite() && (raw_t - track_end).abs() < 1.0;
 
                                 // Highlight the target lane so the user sees enforcement.
@@ -655,7 +672,7 @@ impl EditorModule for TimelineModule {
                             clip_type
                         };
 
-                        let start_x = rect.min.x + (clip.start_time as f32 * state.timeline_zoom);
+                        let start_x = time_origin_x + (clip.start_time as f32 * state.timeline_zoom);
                         let width   = (clip.duration as f32 * state.timeline_zoom).max(4.0);
                         let y_off   = header_height + clip.track_row as f32 * (track_height + track_gap);
 
@@ -941,7 +958,7 @@ impl EditorModule for TimelineModule {
                             if gap.abs() > 0.25 { continue; } // only touching clips
                             if track_row % 2 == 1 { continue; } // audio rows — no video transitions
 
-                            let join_x = rect.min.x
+                            let join_x = time_origin_x
                                 + ((clip_a.start_time + clip_a.duration) as f32 * state.timeline_zoom);
                             let y_off = header_height + track_row as f32 * (track_height + track_gap);
                             let badge_center = Pos2::new(
@@ -1045,7 +1062,7 @@ impl EditorModule for TimelineModule {
                     } else {
                         state.current_time
                     };
-                    let ph_x = rect.min.x + (clamped_time as f32 * state.timeline_zoom);
+                    let ph_x = time_origin_x + (clamped_time as f32 * state.timeline_zoom);
                     painter.line_segment(
                         [Pos2::new(ph_x + 1.0, rect.min.y), Pos2::new(ph_x + 1.0, rect.max.y)],
                         Stroke::new(1.0, Color32::from_black_alpha(60)));
@@ -1058,6 +1075,23 @@ impl EditorModule for TimelineModule {
                              Pos2::new(ph_x, rect.min.y + 12.0)],
                         ACCENT, Stroke::NONE));
 
+                    // ── Floating timecode label — foreground, inside ruler strip ──
+                    {
+                        let time_str = format_time(clamped_time);
+                        let font     = FontId::monospace(10.0);
+                        let fg_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("ph_timecode")));
+                        let galley  = fg_painter.layout_no_wrap(time_str, font, ACCENT);
+                        let pad     = egui::vec2(5.0, 2.0);
+                        let label_w = galley.size().x + pad.x * 2.0;
+                        let label_h = galley.size().y + pad.y * 2.0;
+                        let label_x = ph_x - label_w * 0.5;
+                        let label_y = rect.min.y - label_h - 6.0;
+                        let pill    = Rect::from_min_size(Pos2::new(label_x, label_y), egui::vec2(label_w, label_h));
+                        fg_painter.rect_filled(pill, egui::CornerRadius::same(3), Color32::from_rgba_unmultiplied(10, 10, 14, 220));
+                        fg_painter.rect_stroke(pill, egui::CornerRadius::same(3), Stroke::new(1.0, ACCENT.linear_multiply(0.4)), egui::StrokeKind::Inside);
+                        fg_painter.galley(Pos2::new(label_x + pad.x, label_y + pad.y), galley, ACCENT);
+                    }
+
                     // Playhead handle drag
                     let handle_rect = Rect::from_center_size(
                         Pos2::new(ph_x, rect.min.y + 6.0),
@@ -1068,7 +1102,7 @@ impl EditorModule for TimelineModule {
                     );
                     if handle_resp.dragged() {
                         if let Some(ptr) = handle_resp.interact_pointer_pos() {
-                            let t         = ((ptr.x - rect.min.x) / state.timeline_zoom).max(0.0) as f64;
+                            let t         = ((ptr.x - time_origin_x) / state.timeline_zoom).max(0.0) as f64;
                             let t_clamped = t.min(state.total_duration().max(0.0));
                             if handle_resp.drag_started() {
                                 // Drag start: always emit so the handle feels immediately responsive.
@@ -1367,7 +1401,7 @@ fn hotkey_section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
         egui::RichText::new(title.to_uppercase())
             .size(9.5)
             .monospace()
-            .color(egui::Color32::from_rgba_unmultiplied(255, 160, 50, 130)),
+            .color(egui::Color32::from_rgba_unmultiplied(0, 180, 210, 130)),
     );
     ui.add_space(2.0);
 
@@ -1419,9 +1453,16 @@ fn draw_waveform(painter: &egui::Painter, clip_rect: Rect, peaks: &[f32], clip_t
 }
 
 fn ruler_step(zoom: f32) -> f64 {
-    if zoom >= 200.0 { 0.5 }
-    else if zoom >= 80.0  { 1.0 }
-    else if zoom >= 30.0  { 5.0 }
-    else { 10.0 }
+    if      zoom >= 1200.0 { 0.0333 }
+    else if zoom >= 600.0  { 0.05   }
+    else if zoom >= 300.0  { 0.1    }
+    else if zoom >= 150.0  { 0.25   }
+    else if zoom >= 80.0   { 0.5    }
+    else if zoom >= 40.0   { 1.0    }
+    else if zoom >= 18.0   { 2.0    }
+    else if zoom >= 8.0    { 5.0    }
+    else if zoom >= 3.0    { 10.0   }
+    else if zoom >= 1.5    { 30.0   }
+    else                   { 60.0   }
 }
 // fit_label moved to crate::helpers::format — imported above.

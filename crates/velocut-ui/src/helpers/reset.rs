@@ -10,14 +10,19 @@
 // Public surface:
 //   delete_app_data_dir()          — wipe %APPDATA%\VeloCut (or platform equivalent)
 //   delete_temp_files()            — sweep OS temp dir(s) for velocut_* and velocut.log
-//   schedule_app_data_dir_deletion — delete app data then hard-exit before eframe
-//                                    can recreate the directory on its final flush
+//   reset_context()                 — soft in-memory teardown: stop playback,
+//                                    drop audio handles, clear caches, wipe egui
+//                                    state. Safe to call on the keep-using path.
+//   schedule_app_data_dir_deletion — calls reset_context, deletes app data,
+//                                    then hard-exits
 //   show_uninstall_modal()         — egui overlay shown after reset; "Close" or "Keep Using"
 //
 // Neither filesystem function panics. All errors are logged via eprintln! and
 // treated as non-fatal; a failed delete is always better than a crashed app.
 
 use eframe::egui::{self, Color32, Margin, RichText, Stroke};
+use crate::context::AppContext;
+use std::collections::HashMap;
 
 // ── Visual constants (local) ──────────────────────────────────────────────────
 
@@ -137,6 +142,78 @@ pub fn delete_temp_files() {
     }
 }
 
+// ── In-memory teardown ───────────────────────────────────────────────────────
+
+/// Soft in-memory reset — clears all cached state so the app can continue
+/// running with a clean slate. Safe to call on the "keep using" path.
+///
+/// Does NOT call `media_worker.shutdown()` — the worker threads stay alive and
+/// ready to probe and decode after the reset. Use this from `ClearProject` in
+/// `app.rs` and from the second reset button press in `export_module.rs`.
+///
+/// For the hard-exit path, `schedule_app_data_dir_deletion()` calls this first
+/// and then additionally shuts down the worker before the process exits.
+///
+/// Teardown order:
+///
+/// 1. `media_worker.stop_playback()` — signals the pb thread to stop before any
+///    state changes. The decode loop holds clip references and races if state
+///    changes under it.
+/// 2. `audio_sinks.clear()` + `audio_overlay_sinks.clear()` — drops rodio Sinks
+///    (which hold WAV file handles) before the OutputStream. Dropping the stream
+///    before its sinks panics in rodio.
+/// 3. `audio_stream = None` — shuts down the WASAPI/ALSA output stream.
+/// 4. `cache.clear_all()` — drops all GPU `TextureHandle` refs, releasing
+///    thumbnail, frame, and bucket cache allocations through eframe's backend.
+/// 5. `playback.reset()` — clears all scrub / playback decode tracking state.
+/// 6. `ctx.memory_mut(|mem| mem.data.clear())` — wipes all egui widget state:
+///    scroll positions, collapsible open/close, text cursor positions, popup
+///    flags, etc. Leaves the UI blank for the next frame. Pass `None` on the
+///    hard-exit path where no live context is available.
+pub fn reset_context(context: &mut AppContext, ctx: Option<&egui::Context>) {
+    // Stop pb thread before touching any state it references.
+    context.media_worker.stop_playback();
+
+    // Drop rodio Sinks before the OutputStream — order is load-bearing.
+    // Sinks hold WAV file handles; stream must outlive them.
+    context.audio_sinks         = HashMap::new();
+    context.audio_overlay_sinks = HashMap::new();
+    context.audio_stream = None;
+
+    // Evict all GPU textures and reset the byte budget.
+    context.cache.clear_all();
+
+    // Clear scrub / playback decode tracking.
+    context.playback.reset();
+
+    // Wipe all egui widget state so the UI starts blank on the next frame.
+    // None on the hard-exit path — no live context available, and the process
+    // is about to die anyway so the clear would be a no-op regardless.
+    if let Some(ctx) = ctx {
+        // Flush egui_extras image-loader URI cache. Without this, thumbnail textures
+        // loaded via URI strings linger in the loader's internal HashMap and keep
+        // occupying GPU memory even after cache.clear_all() drops our TextureHandles.
+        ctx.forget_all_images();
+
+        ctx.memory_mut(|mem| {
+            // mem.data.clear() only clears the widget TypeMap (panel sizes, scroll
+            // positions, collapsible states). It does NOT touch the private fields:
+            //   • areas       — positions of every panel/window/Area
+            //   • interactions — per-viewport drag and hover tracking
+            //   • focus        — which widget holds keyboard focus
+            //   • popups       — any open combo-box/context-menu/tooltip
+            //   • caches       — frame-to-frame computation caches
+            //   • to_global    — per-layer coordinate transforms
+            //
+            // Replacing the whole Memory with Default resets all of them at once.
+            // We preserve `options` so the dark-mode preference isn't wiped.
+            let options = mem.options.clone();
+            *mem = egui::Memory::default();
+            mem.options = options;
+        });
+    }
+}
+
 // ── Deferred app-data deletion ───────────────────────────────────────────────
 
 /// Delete the VeloCut app-data directory and immediately hard-exit the process.
@@ -154,6 +231,17 @@ pub fn delete_temp_files() {
 /// eframe's event loop can perform that final write. The directory is gone and
 /// nothing recreates it. No external processes, no timers, no race conditions.
 ///
+/// # Resource teardown
+///
+/// Calls `reset_context()` before deleting the filesystem and exiting.
+/// `std::process::exit(0)` skips all Drop impls — `reset_context` is the
+/// single place where all handles are explicitly released. See its doc for
+/// the full teardown order.
+/// 6. `ctx.memory_mut(|mem| mem.data.clear())` — wipes all egui widget state
+///    (scroll positions, collapsible open/close, text cursor positions, etc.)
+///    so the UI starts blank rather than restoring stale panel layout from the
+///    memory that eframe would otherwise persist to the now-deleted app data dir.
+///
 /// # Usage
 ///
 /// Call this from your `App::on_exit()` implementation when the reset flag is set:
@@ -161,7 +249,7 @@ pub fn delete_temp_files() {
 /// ```rust
 /// fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
 ///     if self.reset_scheduled {
-///         crate::helpers::reset::schedule_app_data_dir_deletion();
+///         crate::helpers::reset::schedule_app_data_dir_deletion(&mut self.context);
 ///         // unreachable — process exits inside the call above
 ///     }
 /// }
@@ -178,7 +266,23 @@ pub fn delete_temp_files() {
 ///     // ... normal save logic
 /// }
 /// ```
-pub fn schedule_app_data_dir_deletion() {
+pub fn schedule_app_data_dir_deletion(context: &mut AppContext) {
+    // Soft teardown first — stops playback, drops audio, clears caches.
+    // No egui context available on the exit path, so None is passed — the
+    // process is about to die and the egui memory clear would be a no-op.
+    // std::process::exit(0) below skips Drop impls, so anything not released
+    // here leaks until the OS reclaims the process.
+    reset_context(context, None);
+
+    // Shut down the FFmpeg worker threads now. This is intentionally NOT in
+    // reset_context — shutdown() permanently joins the worker threads, which
+    // would break the app on the "keep using" path. Only safe to call here
+    // because we are about to hard-exit anyway.
+    // Must happen after reset_context (which calls stop_playback) and before
+    // delete_temp_files so no thread still has a WAV temp file open when we
+    // try to unlink it.
+    context.media_worker.shutdown();
+
     delete_app_data_dir();
 
     // Hard-exit now. eframe's post-exit storage flush — which would otherwise
