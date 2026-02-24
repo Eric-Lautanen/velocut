@@ -634,7 +634,7 @@ impl ExportModule {
                         };
                         let resp = ui.add_enabled(
                             !disabled,
-                            egui::SelectableLabel::new(self.quality == q, &label),
+                            egui::Button::selectable(self.quality == q, &label),
                         );
                         if resp.clicked() {
                             self.quality = q;

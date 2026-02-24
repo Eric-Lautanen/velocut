@@ -466,7 +466,7 @@ fn try_amf_encoder(
             Ok(f)  => f,
             Err(e) => {
                 eprintln!("[encode] AMF frames ctx: {e}");
-                unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
                 return None;
             }
         }

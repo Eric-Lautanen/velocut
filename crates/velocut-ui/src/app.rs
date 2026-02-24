@@ -958,7 +958,9 @@ impl VeloCutApp {
     /// Called from `update()` after command processing so ticks see the
     /// freshest state (including commands processed this frame).
     fn tick_modules(&mut self, ctx: &egui::Context) {
-        VideoModule::tick(&self.state, &mut self.context, ctx);
+        // preview.last_canvas_size is written by preview.ui() inside render_panels(),
+        // which runs before tick_modules() — so this is always the current panel size.
+        VideoModule::tick(&self.state, &mut self.context, ctx, self.preview.last_canvas_size);
         self.audio.tick(&self.state, &mut self.context);
         self.memory_manager.tick(ctx, &self.state, &mut self.context);
         if self.state.is_playing {

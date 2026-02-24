@@ -184,7 +184,7 @@ impl VideoModule {
 
     // ── tick ──────────────────────────────────────────────────────────────────
     /// 3-layer scrub + playback start/stop. Call every frame from app::update().
-    pub fn tick(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context) {
+    pub fn tick(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context, preview_size: Option<(u32, u32)>) {
         let just_started = state.is_playing && !ctx.playback.prev_playing;
         let just_stopped = !state.is_playing && ctx.playback.prev_playing;
         ctx.playback.prev_playing = state.is_playing;
@@ -217,10 +217,10 @@ impl VideoModule {
                             .or_else(|| build_blend_spec(state, clip))
                         {
                             eprintln!("[tick] → start_blend_playback alpha_start={:.3}", spec.alpha_start);
-                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, 0.0, spec);
+                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, 0.0, spec, preview_size);
                         } else {
                             eprintln!("[tick] → start_playback (no blend spec — hard cut)");
-                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, 0.0);
+                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, 0.0, preview_size);
                         }
                     }
                 }
