@@ -62,8 +62,8 @@ enum QualityPreset {
     SD480,
     HD720,
     FHD1080,
-    QHD1440,
-    UHD4K,
+   // QHD1440, commented out causes crashes
+   // UHD4K, commented out causes crashes
 }
 
 impl QualityPreset {
@@ -72,8 +72,8 @@ impl QualityPreset {
             QualityPreset::SD480   => "480p",
             QualityPreset::HD720   => "720p  (HD)",
             QualityPreset::FHD1080 => "1080p (Full HD)",
-            QualityPreset::QHD1440 => "1440p (2K)",
-            QualityPreset::UHD4K   => "4K    (2160p)",
+           // QualityPreset::QHD1440 => "1440p (2K)", commented out causes crashes
+           // QualityPreset::UHD4K   => "4K    (2160p)", commented out causes crashes
         }
     }
 
@@ -83,8 +83,8 @@ impl QualityPreset {
             QualityPreset::SD480   => 480,
             QualityPreset::HD720   => 720,
             QualityPreset::FHD1080 => 1080,
-            QualityPreset::QHD1440 => 1440,
-            QualityPreset::UHD4K   => 2160,
+           // QualityPreset::QHD1440 => 1440, commented out causes crashes
+           // QualityPreset::UHD4K   => 2160, commented out causes crashes
         }
     }
 
@@ -607,8 +607,8 @@ impl ExportModule {
                         QualityPreset::SD480,
                         QualityPreset::HD720,
                         QualityPreset::FHD1080,
-                        QualityPreset::QHD1440,
-                        QualityPreset::UHD4K,
+                       // QualityPreset::QHD1440, commented out causes crashes
+                       // QualityPreset::UHD4K, commented out causes crashes
                     ] {
                         let (w, h) = q.dimensions(effective_ratio);
                         let label  = format!("{}  — {w}×{h}", q.label());

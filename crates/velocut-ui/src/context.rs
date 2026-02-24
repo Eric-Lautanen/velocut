@@ -57,6 +57,18 @@ pub struct CacheContext {
     /// Updated on insert and eviction.  Treated as an estimate (we don't track
     /// exact compressed GPU size) — uses raw RGBA bytes as a conservative ceiling.
     pub(crate) frame_cache_bytes: usize,
+
+    /// Persistent GPU texture handles for the scrub decode path, keyed by media_id.
+    ///
+    /// On every scrub frame ingest we call `TextureHandle::set()` on the existing
+    /// handle rather than `ctx.load_texture()`.  `set()` does an in-place GPU pixel
+    /// upload with no reallocation when dimensions are unchanged — one GPU transfer
+    /// per frame instead of alloc + upload + dealloc.  A new handle is allocated only
+    /// on first use or when the clip's source resolution changes (e.g. switching to a
+    /// clip recorded at a different camera resolution).
+    ///
+    /// Stores `(handle, width, height)` so a dimension change is detectable in O(1).
+    pub scrub_textures: HashMap<Uuid, (egui::TextureHandle, u32, u32)>,
 }
 
 impl CacheContext {
@@ -67,6 +79,7 @@ impl CacheContext {
             pending_pb_frame:   None,
             frame_bucket_cache: HashMap::new(),
             frame_cache_bytes:  0,
+            scrub_textures:     HashMap::new(),
         }
     }
 
@@ -125,9 +138,13 @@ impl CacheContext {
     /// Dropping TextureHandles releases the GPU allocations; clearing the
     /// byte counter prevents a stale over-budget signal on the next insert.
     pub fn clear_all(&mut self) {
-        self.thumbnail_cache    = HashMap::new();
-        self.frame_cache        = HashMap::new();
-        self.frame_bucket_cache = HashMap::new();
+        // Use .clear() rather than = HashMap::new() to retain the HashMap's heap
+        // allocation — avoids a pointless dealloc+realloc on the next project open.
+        // TextureHandle drops in-place, releasing GPU memory for each entry.
+        self.thumbnail_cache.clear();
+        self.frame_cache.clear();
+        self.frame_bucket_cache.clear();
+        self.scrub_textures.clear();
         self.pending_pb_frame   = None;
         self.frame_cache_bytes  = 0;
     }
@@ -365,13 +382,67 @@ impl AppContext {
         needs_repaint: &mut bool,
         ctx:           &egui::Context,
     ) {
-        let tex = ctx.load_texture(
-            format!("frame-{id}"),
-            egui::ColorImage::from_rgba_unmultiplied(
-                [width as usize, height as usize], &data,
-            ),
-            egui::TextureOptions::LINEAR,
-        );
+        // ── Zero-copy ColorImage ───────────────────────────────────────────────
+        // `data` is an owned Vec<u8> of tightly packed RGBA bytes produced by
+        // copy_frame_rgba() in decode.rs.  egui's ColorImage stores Vec<Color32>,
+        // which is repr(C) [u8; 4] — identical layout to four RGBA bytes.
+        //
+        // Instead of calling ColorImage::from_rgba_unmultiplied (which copies the
+        // entire buffer into a new Vec<Color32>), we reinterpret the existing Vec<u8>
+        // in-place.  This eliminates one full-frame CPU allocation per promoted frame:
+        //   Before: decode alloc → channel Vec<u8> → ColorImage Vec<Color32> copy → GPU upload
+        //   After:  decode alloc → channel Vec<u8> → reinterpret → GPU upload
+        //
+        // SAFETY:
+        //   • Color32 is #[repr(C)] with alignment 1 (four u8 fields) — same as u8.
+        //   • data.len() is always width * height * 4 (enforced by copy_frame_rgba).
+        //   • We consume `data` via mem::forget so its destructor never runs on the
+        //     original pointer, avoiding a double-free.
+        //   • The resulting Vec<Color32> is the sole owner of the allocation.
+        let pixels: Vec<egui::Color32> = unsafe {
+            let mut data = data;
+            let len = data.len() / 4;
+            let cap = data.capacity() / 4;
+            let ptr = data.as_mut_ptr() as *mut egui::Color32;
+            std::mem::forget(data);
+            Vec::from_raw_parts(ptr, len, cap)
+        };
+        let image = egui::ColorImage {
+            size:        [width as usize, height as usize],
+            // source_size is the logical source dimensions before any egui scaling.
+            // Our buffer is always exactly `size` pixels (no sub-region), so they match.
+            source_size: egui::Vec2::new(width as f32, height as f32),
+            pixels,
+        };
+
+        // ── Persistent texture reuse ──────────────────────────────────────────
+        // Reuse the existing GPU texture handle for this clip when dimensions
+        // are unchanged.  TextureHandle::set() performs an in-place GPU pixel
+        // upload (no realloc, no driver-level dealloc/alloc round-trip).
+        //
+        // A new handle is allocated only on:
+        //   a) First frame for this clip (cold path, O(1) HashMap miss).
+        //   b) Source resolution change — e.g. switching from a 4K clip to a
+        //      720p clip that happens to share the same media_id (pathological but
+        //      handled correctly: the old handle is replaced and the GPU memory
+        //      freed when the Arc refcount in frame_bucket_cache reaches zero).
+        let tex = match self.cache.scrub_textures.get_mut(&id) {
+            Some((handle, w, h)) if *w == width && *h == height => {
+                // Hot path: in-place GPU upload, zero CPU allocations.
+                handle.set(image, egui::TextureOptions::LINEAR);
+                handle.clone()
+            }
+            _ => {
+                // Cold path: first frame or resolution change — full GPU alloc.
+                let handle = ctx.load_texture(
+                    format!("scrub-{id}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.cache.scrub_textures.insert(id, (handle.clone(), width, height));
+                handle
+            }
+        };
 
         // Derive the ¼s bucket key for frame_bucket_cache.
         // playback.last_frame_req stores exact f64 ts — convert here.
