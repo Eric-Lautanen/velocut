@@ -131,6 +131,8 @@ enum HwBackend {
     Vaapi,
     /// Apple VideoToolbox (macOS only).
     VideoToolbox,
+    /// AMD AMF via D3D11 device frames (Windows — AMD/Intel/NVIDIA via AMF runtime).
+    Amf,
 }
 
 /// Open the best available H.264 encoder for the given output dimensions/rate.
@@ -150,19 +152,29 @@ fn try_open_hw_encoder(
     out_tb:  Rational,
     octx:    &ffmpeg::format::context::Output,
 ) -> (ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>) {
+    // ── AMF (D3D11 — Windows native, AMD/Intel/NVIDIA) ───────────────────────
+    eprintln!("[encode] trying AMF (D3D11)...");
+    if let Some(result) = try_amf_encoder(width, height, fps, out_tb, octx) {
+        eprintln!("[encode] HW encoder: AMF (D3D11)");
+        return result;
+    }
+
     // ── NVENC ─────────────────────────────────────────────────────────────────
+    eprintln!("[encode] trying NVENC (CUDA)...");
     if let Some(result) = try_nvenc_encoder(width, height, fps, out_tb, octx) {
         eprintln!("[encode] HW encoder: NVENC (CUDA)");
         return result;
     }
 
     // ── VAAPI ─────────────────────────────────────────────────────────────────
+    eprintln!("[encode] trying VAAPI...");
     if let Some(result) = try_vaapi_encoder(width, height, fps, out_tb, octx) {
         eprintln!("[encode] HW encoder: VAAPI");
         return result;
     }
 
     // ── VideoToolbox ──────────────────────────────────────────────────────────
+    eprintln!("[encode] trying VideoToolbox...");
     if let Some(result) = try_videotoolbox_encoder(width, height, fps, out_tb, octx) {
         eprintln!("[encode] HW encoder: VideoToolbox");
         return result;
@@ -268,6 +280,94 @@ unsafe fn build_hw_frames_ctx(
     Ok(frames_ref)
 }
 
+fn try_amf_encoder(
+    width:  u32,
+    height: u32,
+    fps:    u32,
+    out_tb: Rational,
+    octx:   &ffmpeg::format::context::Output,
+) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
+    let codec = match encoder::find_by_name("h264_amf") {
+        Some(c) => c,
+        None => {
+            eprintln!("[encode] h264_amf not found in ffmpeg build, skipping AMF");
+            return None;
+        }
+    };
+
+    // AMF on Windows uses a D3D11 device context.
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),       // NULL = use default adapter
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        eprintln!("[encode] D3D11 device init failed ({ret}), skipping AMF");
+        return None;
+    }
+
+    let frames_ctx = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            width, height,
+        ) {
+            Ok(f)  => f,
+            Err(e) => {
+                eprintln!("[encode] AMF frames ctx: {e}");
+                unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+                return None;
+            }
+        }
+    };
+
+    let enc_ctx_obj = codec::context::Context::new_with_codec(codec);
+    let mut enc = enc_ctx_obj.encoder().video().ok()?;
+
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_time_base(out_tb);
+    enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+    enc.set_bit_rate(0);
+
+    unsafe {
+        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+        (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
+        ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
+    }
+
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    // AMF quality options: quality preset + CQP equivalent to CRF 18.
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("quality",  "quality");   // slow preset — balanced quality/speed
+    opts.set("rc",       "cqp");       // constant QP, analogous to CRF
+    opts.set("qp_i",     "18");
+    opts.set("qp_p",     "20");
+    opts.set("qp_b",     "22");
+    opts.set("g",        &fps.to_string());
+
+    match enc.open_as_with(codec, opts) {
+        Ok(opened) => {
+            let hw_dev = HwDeviceContext { ptr: device_ctx };
+            Some((opened, HwBackend::Amf, Some(hw_dev)))
+        }
+        Err(e) => {
+            eprintln!("[encode] h264_amf open failed: {e}, skipping AMF");
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            None
+        }
+    }
+}
+
 fn try_nvenc_encoder(
     width:  u32,
     height: u32,
@@ -275,7 +375,13 @@ fn try_nvenc_encoder(
     out_tb: Rational,
     octx:   &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
-    let codec = encoder::find_by_name("h264_nvenc")?;
+    let codec = match encoder::find_by_name("h264_nvenc") {
+        Some(c) => c,
+        None => {
+            eprintln!("[encode] h264_nvenc not found in ffmpeg build, skipping NVENC");
+            return None;
+        }
+    };
 
     // Create CUDA device context.
     let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
@@ -357,7 +463,13 @@ fn try_vaapi_encoder(
     out_tb: Rational,
     octx:   &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
-    let codec = encoder::find_by_name("h264_vaapi")?;
+    let codec = match encoder::find_by_name("h264_vaapi") {
+        Some(c) => c,
+        None => {
+            eprintln!("[encode] h264_vaapi not found in ffmpeg build, skipping VAAPI");
+            return None;
+        }
+    };
 
     let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
     let ret = unsafe {
@@ -437,7 +549,13 @@ fn try_videotoolbox_encoder(
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
     // VideoToolbox accepts YUV420P input directly (no explicit HW upload needed);
     // it manages the IOSurface pool internally.
-    let codec = encoder::find_by_name("h264_videotoolbox")?;
+    let codec = match encoder::find_by_name("h264_videotoolbox") {
+        Some(c) => c,
+        None => {
+            eprintln!("[encode] h264_videotoolbox not found in ffmpeg build, skipping VideoToolbox");
+            return None;
+        }
+    };
 
     let enc_ctx_obj = codec::context::Context::new_with_codec(codec);
     let mut enc = enc_ctx_obj.encoder().video().ok()?;
@@ -693,6 +811,8 @@ struct AudioEncState {
     audio_tb:       Rational,
     ost_audio_tb:   Rational,
     overlays:       Vec<DecodedOverlay>,
+    /// Counts FIFO overrun events; used to throttle log spam at 1080p SW encode.
+    fifo_overrun_count: u64,
 }
 
 impl AudioEncState {
@@ -702,11 +822,18 @@ impl AudioEncState {
         flush: bool,
     ) -> Result<(), String> {
         if !flush && self.fifo.len() > 2 * self.frame_size {
-            eprintln!(
-                "[encode] audio FIFO overrun: {} samples buffered (threshold={}); \
-                 audio may be running ahead of video",
-                self.fifo.len(), 2 * self.frame_size
-            );
+            self.fifo_overrun_count += 1;
+            // At 1080p with SW encoding, audio routinely outruns video by a few frames
+            // (the encoder is slow; the demuxer keeps feeding audio).  Logging every
+            // occurrence floods the terminal with hundreds of identical lines.
+            // Print the first event so the developer sees it, then every 500th.
+            if self.fifo_overrun_count == 1 || self.fifo_overrun_count % 500 == 0 {
+                eprintln!(
+                    "[encode] audio FIFO overrun: {} samples buffered (threshold={}); \
+                     audio running ahead of video (occurrence #{})",
+                    self.fifo.len(), 2 * self.frame_size, self.fifo_overrun_count,
+                );
+            }
         }
         while self.fifo.len() >= self.frame_size
             || (flush && self.fifo.len() > 0)
@@ -1078,6 +1205,7 @@ fn run_encode(
                 Err(e) => { eprintln!("[encode] overlay decode failed: {e}"); None }
             })
             .collect(),
+        fifo_overrun_count: 0,
     };
 
     // ── Per-clip encode loop ──────────────────────────────────────────────────
@@ -1187,12 +1315,9 @@ fn run_encode(
         let frame_pts = pkt.pts().unwrap_or(pkt.dts().unwrap_or(0));
         pkt.rescale_ts(frame_tb, ost_video_tb);
         let raw_dts = pkt.dts().unwrap_or(0);
-        let raw_pts = pkt.pts().unwrap_or(raw_dts);
-        let dts_s   = raw_dts as f64 * f64::from(ost_video_tb);
-        let pts_s   = raw_pts as f64 * f64::from(ost_video_tb);
-        eprintln!("[encode] encoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
         if last_video_dts != i64::MIN {
             let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
+            let dts_s  = raw_dts       as f64 * f64::from(ost_video_tb);
             if dts_s < prev_s {
                 let clamped = last_video_dts + 1;
                 eprintln!(
@@ -1233,6 +1358,13 @@ fn run_encode(
                 total_audio as f64 / AUDIO_RATE as f64,
             );
         }
+        if audio_state.fifo_overrun_count > 1 {
+            eprintln!(
+                "[encode] audio FIFO overrun occurred {} time(s) total \
+                 (normal for SW encode at 1080p — audio decoded faster than video encoded)",
+                audio_state.fifo_overrun_count,
+            );
+        }
     }
 
     // ── Flush audio FIFO then encoder ─────────────────────────────────────────
@@ -1264,7 +1396,7 @@ fn send_video_frame(
         && hw_backend != HwBackend::Software
         && hw_backend != HwBackend::VideoToolbox
     {
-        // CUDA / VAAPI: upload SW frame to HW surface before encoding.
+        // CUDA / VAAPI / AMF: upload SW frame to HW surface before encoding.
         let hw_frame = unsafe { upload_frame_to_hw(yuv, hw_frames_ctx) }
             .map_err(|e| format!("HW frame upload: {e}"))?;
         video_encoder.send_frame(&hw_frame)
@@ -1328,6 +1460,12 @@ fn encode_clip(
                 },
                 Err(e) => { eprintln!("[encode] audio decoder params failed for '{}': {e}", clip.path.display()); }
             }
+        } else {
+            eprintln!(
+                "[encode] clip '{}' has no audio stream — silence will be padded \
+                 (overlay tracks still mix)",
+                clip.path.display(),
+            );
         }
     }
 
@@ -1350,7 +1488,6 @@ fn encode_clip(
 
     let clip_start_frame_idx = out_frame_idx;
     let mut video_clip_done = false;
-    let mut first_pts_logged = false;
 
     for result in ictx.packets() {
         let (stream, packet) = result
@@ -1380,15 +1517,6 @@ fn encode_clip(
                     .unwrap_or(0.0);
 
                 if frame_pts_secs < clip.source_offset - half_frame { continue; }
-
-                if !first_pts_logged {
-                    eprintln!(
-                        "[encode] first decoded PTS after seek: {frame_pts_secs:.4}s \
-                         (expected source_offset={:.4}s, file='{}')",
-                        clip.source_offset, clip.path.display()
-                    );
-                    first_pts_logged = true;
-                }
 
                 if frame_pts_secs >= clip_end {
                     video_clip_done = true;
@@ -1425,12 +1553,9 @@ fn encode_clip(
                             pkt.set_stream(0);
                             pkt.rescale_ts(frame_tb, ost_tb);
                             let raw_dts = pkt.dts().unwrap_or(0);
-                            let raw_pts = pkt.pts().unwrap_or(raw_dts);
-                            let dts_s   = raw_dts as f64 * f64::from(ost_tb);
-                            let pts_s   = raw_pts as f64 * f64::from(ost_tb);
-                            eprintln!("[encode] video pkt dts={dts_s:.4}s pts={pts_s:.4}s");
                             if *last_video_dts != i64::MIN {
                                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
                                 if dts_s < prev_s {
                                     let clamped = *last_video_dts + 1;
                                     eprintln!(
@@ -1446,6 +1571,22 @@ fn encode_clip(
                         }
 
                         out_frame_idx += 1;
+
+                        // Keep audio timeline in sync with video even when this clip
+                        // has no audio stream (or audio has been fully consumed).
+                        // Without this, video-only clips never push samples into the
+                        // FIFO, drain_fifo(false) is always a no-op (fifo.len() < 1024),
+                        // and overlay tracks stop being mixed after the last audio clip.
+                        // Push silence up to the expected sample count for this frame.
+                        {
+                            let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+                            let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                            let gap      = (expected - have).max(0) as usize;
+                            if gap > 0 {
+                                audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
+                                audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                            }
+                        }
 
                         if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
                             let _ = tx.send(MediaResult::EncodeProgress {
@@ -1501,11 +1642,22 @@ fn encode_clip(
                     } else {
                         audio_state.fifo.push_scaled(&raw, clip.volume as f32);
                     }
-
-                    audio_state.drain_fifo(octx, false)?;
+                    // Do NOT drain here — draining after every audio frame causes
+                    // audio to run many seconds ahead of video in the muxer interleave
+                    // buffer at 1080p (slow video encoder), which makes write_interleaved
+                    // drop audio packets silently. Drain once per outer packet iteration
+                    // (below) so audio/video stay within one demuxer packet of each other.
                 }
             }
         }
+
+        // Drain the audio FIFO once per packet-loop iteration rather than once
+        // per decoded audio frame. This throttles how far audio can run ahead of
+        // video in write_interleaved's internal queue (bounded by source demux
+        // rate, not by audio decoding speed). At 1080p the video encoder is slow
+        // enough that eager per-frame draining let audio sprint 5–10 s ahead,
+        // exceeding the MP4 muxer's interleave window and causing silent drops.
+        audio_state.drain_fifo(octx, false)?;
     }
 
     // ── Drain video decoder at clip end ───────────────────────────────────────
@@ -1537,12 +1689,9 @@ fn encode_clip(
                             pkt.set_stream(0);
                             pkt.rescale_ts(frame_tb, ost_tb);
                             let raw_dts = pkt.dts().unwrap_or(0);
-                            let raw_pts = pkt.pts().unwrap_or(raw_dts);
-                            let dts_s   = raw_dts as f64 * f64::from(ost_tb);
-                            let pts_s   = raw_pts as f64 * f64::from(ost_tb);
-                            eprintln!("[encode] decoder-flush pkt dts={dts_s:.4}s pts={pts_s:.4}s");
                             if *last_video_dts != i64::MIN {
                                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
+                                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
                                 if dts_s < prev_s {
                                     let clamped = *last_video_dts + 1;
                                     eprintln!(
@@ -1557,6 +1706,16 @@ fn encode_clip(
                                 .map_err(|e| format!("decoder-flush write video packet: {e}"))?;
                         }
                         out_frame_idx += 1;
+                        // Same silence-padding logic as the main packet loop.
+                        {
+                            let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+                            let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                            let gap      = (expected - have).max(0) as usize;
+                            if gap > 0 {
+                                audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
+                                audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                            }
+                        }
                         if out_frame_idx > target_out_pts { break; }
                     }
                 }
@@ -1602,6 +1761,26 @@ fn encode_clip(
             flush_audio_resampler(rs, &mut audio_state.fifo, clip.volume);
         }
 
+        audio_state.drain_fifo(octx, false)?;
+    }
+
+    // ── Final silence pad for the whole clip ──────────────────────────────────
+    // If this clip has no audio stream, or if the audio ended before the video
+    // (e.g. source audio shorter than video), the FIFO may be behind the video
+    // timeline. Pad silence to the exact video endpoint so that:
+    //   1. Overlay tracks continue to be mixed through the whole clip duration.
+    //   2. The FIFO carry-over into the next clip starts at the right position.
+    // This is the definitive fix for overlays stopping at the first audio clip
+    // boundary on timelines that mix audio-only and video-only source files.
+    {
+        let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+        let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+        let gap      = (expected - have).max(0) as usize;
+        if gap > 0 {
+            audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
+            audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+        }
+        // Drain any full frames the silence padding completed.
         audio_state.drain_fifo(octx, false)?;
     }
 
