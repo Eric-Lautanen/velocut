@@ -983,17 +983,18 @@ impl AudioEncState {
         while self.fifo.len() >= self.frame_size
             || (flush && self.fifo.len() > 0)
         {
-            let frame = self.fifo.pop_frame(self.frame_size, self.out_sample_idx);
+            let mut frame = self.fifo.pop_frame(self.frame_size, self.out_sample_idx);
 
             if !self.overlays.is_empty() {
                 let n = self.frame_size;
                 unsafe {
-                    let l_bytes = frame.data(0);
-                    let r_bytes = frame.data(1);
-                    let ldst = std::slice::from_raw_parts_mut(
-                        l_bytes.as_ptr() as *mut f32, n);
-                    let rdst = std::slice::from_raw_parts_mut(
-                        r_bytes.as_ptr() as *mut f32, n);
+                    // Derive mutable pointers from the frame's raw AVFrame directly.
+                    // Using frame.data(0) (which returns &[u8]) and casting its pointer
+                    // to *mut f32 is UB — Rust's aliasing rules forbid mutable access
+                    // through a pointer derived from a shared reference.
+                    let fptr = frame.as_mut_ptr();
+                    let ldst = std::slice::from_raw_parts_mut((*fptr).data[0] as *mut f32, n);
+                    let rdst = std::slice::from_raw_parts_mut((*fptr).data[1] as *mut f32, n);
                     for ov in &self.overlays {
                         for i in 0..n {
                             let ov_s = self.out_sample_idx + i as i64 - ov.start_sample;
@@ -1213,6 +1214,31 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
         }
     }
 
+    // Flush resampler tail — mirrors the same fix in encode_clip.
+    // SwrContext buffers up to one output block internally and will not emit it
+    // until it receives more input. After decoder EOF those samples are silently
+    // discarded without this null-frame flush, causing the decoded sample_count
+    // to be short and the overlay mixer's bounds check to cut audio off early.
+    if let Some(ref mut rs) = resampler {
+        loop {
+            let mut tmp = AudioFrame::new(
+                Sample::F32(SampleType::Planar), 4096, ChannelLayoutMask::STEREO,
+            );
+            tmp.set_rate(OUT_RATE);
+            unsafe {
+                let n_out = ffmpeg::ffi::swr_convert(
+                    rs.as_mut_ptr(),
+                    (*tmp.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                    4096,
+                    std::ptr::null_mut(), 0,
+                );
+                if n_out <= 0 { break; }
+                (*tmp.as_mut_ptr()).nb_samples = n_out;
+            }
+            push_frame(&tmp, &mut left, &mut right, overlay.volume);
+        }
+    }
+
     if left.is_empty() {
         return Err(format!("overlay '{}': no audio decoded", overlay.path.display()));
     }
@@ -1347,7 +1373,16 @@ fn run_encode(
         overlays: spec.audio_overlays.iter()
             .filter_map(|ov| match decode_overlay(ov) {
                 Ok(d)  => Some(d),
-                Err(e) => { eprintln!("[encode] overlay decode failed: {e}"); None }
+                Err(e) => {
+                    eprintln!("[encode] overlay decode failed: {e}");
+                    // Surface to the UI — a silent drop here means the render
+                    // completes with no audio and no visible diagnostic.
+                    let _ = tx.send(MediaResult::EncodeError {
+                        job_id: spec.job_id,
+                        msg: format!("audio overlay decode failed: {e}"),
+                    });
+                    None
+                }
             })
             .collect(),
         fifo_overrun_count: 0,

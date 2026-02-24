@@ -449,14 +449,24 @@ impl LiveDecoder {
                 // Rebuild the SwsContext if the actual decoded format differs
                 // from what was recorded at open() — happens on the first frame
                 // after D3D11VA transfer (D3D11 → NV12) and for AVCC streams.
+                // Use the live frame's width/height, not self.decoder_w/h — those
+                // were set from codec metadata before any packets and can be coded
+                // dims (e.g. 1088) rather than display dims (e.g. 1080).
                 let actual_fmt = decoded.format();
-                if actual_fmt != self.decoder_fmt {
+                let actual_w   = decoded.width();
+                let actual_h   = decoded.height();
+                if actual_fmt != self.decoder_fmt
+                    || actual_w != self.decoder_w
+                    || actual_h != self.decoder_h
+                {
                     if let Ok(new_sws) = SwsContext::get(
-                        actual_fmt, self.decoder_w, self.decoder_h,
+                        actual_fmt, actual_w, actual_h,
                         Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
                     ) {
-                        self.scaler     = new_sws;
+                        self.scaler      = new_sws;
                         self.decoder_fmt = actual_fmt;
+                        self.decoder_w   = actual_w;
+                        self.decoder_h   = actual_h;
                     }
                 }
                 let mut out = ffmpeg::util::frame::video::Video::empty();
@@ -503,16 +513,23 @@ impl LiveDecoder {
                 // ~4x faster than decode+scale+alloc for the same set of frames.
                 if pts < target_pts { continue; }
                 // Target reached — transfer GPU surface to CPU if needed,
-                // rebuild scaler if format changed, then scale exactly this frame.
-                let decoded = ensure_cpu_frame(decoded);
+                // rebuild scaler if format or dimensions changed, then scale exactly this frame.
+                let decoded    = ensure_cpu_frame(decoded);
                 let actual_fmt = decoded.format();
-                if actual_fmt != self.decoder_fmt {
+                let actual_w   = decoded.width();
+                let actual_h   = decoded.height();
+                if actual_fmt != self.decoder_fmt
+                    || actual_w != self.decoder_w
+                    || actual_h != self.decoder_h
+                {
                     if let Ok(new_sws) = SwsContext::get(
-                        actual_fmt, self.decoder_w, self.decoder_h,
+                        actual_fmt, actual_w, actual_h,
                         Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
                     ) {
                         self.scaler      = new_sws;
                         self.decoder_fmt = actual_fmt;
+                        self.decoder_w   = actual_w;
+                        self.decoder_h   = actual_h;
                     }
                 }
                 let mut out = ffmpeg::util::frame::video::Video::empty();
@@ -616,24 +633,31 @@ pub fn decode_frame(
         }
     }
 
-    ictx.seek(seek_ts, ..=seek_ts)?;
+    // [Fix] Guard seek at ts=0: seeking to position 0 returns EPERM on Windows
+    // (the OS rejects a SetFilePointer call FFmpeg makes on the demux path).
+    // decode_one_frame_rgba applies the same guard; decode_frame must too.
+    if seek_ts > 0 {
+        let _ = ictx.seek(seek_ts, ..=seek_ts);
+    }
     let mut decoder = dec_ctx.decoder().video()?;
-
-    let (out_w, out_h) = if save_png || aspect <= 0.0 {
-        (decoder.width(), decoder.height())
-    } else {
-        let w: u32 = 640;
-        let h: u32 = ((w as f32 / aspect.max(0.01)) as u32).max(2) & !1;
-        (w, h)
-    };
 
     let out_fmt = if save_png { Pixel::RGB24 } else { Pixel::RGBA };
 
-    let mut scaler = SwsContext::get(
-        decoder.format(), decoder.width(), decoder.height(),
-        out_fmt, out_w, out_h,
-        Flags::BILINEAR,
-    )?;
+    // [Fix] Build the SwsContext lazily on the first decoded frame rather than
+    // eagerly from decoder metadata.  Two reasons:
+    //   1. Annex-B H.264: decoder.format() == AV_PIX_FMT_NONE before the first
+    //      packet, so SwsContext::get fails immediately and the function returns
+    //      Err — no frame is ever decoded.
+    //   2. AVCC H.264: decoder.width()/height() are coded dimensions (e.g. 1088)
+    //      rather than display dimensions (e.g. 1080), producing a subtly wrong
+    //      source rect in the scaler and distorted output.
+    // Both issues are fixed identically to decode_one_frame_rgba and probe.rs.
+    //
+    // out_w / out_h are also deferred to the first frame for the same reason:
+    // decoder.width()/height() before packets can be coded dims.
+    let mut scaler: Option<SwsContext> = None;
+    let mut out_w: u32 = 0;
+    let mut out_h: u32 = 0;
 
     // last_good holds the most-recently scaled frame in case we hit EOF before
     // reaching seek_ts (e.g. requesting the final frame of a clip).
@@ -644,8 +668,32 @@ pub fn decode_frame(
         decoder.send_packet(&packet)?;
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            // Initialise scaler and output dimensions from the first decoded frame.
+            // Doing this here (lazily) rather than from decoder metadata avoids:
+            //   • AV_PIX_FMT_NONE for Annex-B streams (format unknown pre-packet)
+            //   • Coded-dimension mismatch for AVCC streams (1088 vs 1080)
+            if scaler.is_none() {
+                let frame_w = decoded.width();
+                let frame_h = decoded.height();
+                let (w, h) = if save_png || aspect <= 0.0 {
+                    (frame_w, frame_h)
+                } else {
+                    let w: u32 = 640;
+                    let h: u32 = ((w as f32 / aspect.max(0.01)) as u32).max(2) & !1;
+                    (w, h)
+                };
+                out_w = w;
+                out_h = h;
+                match SwsContext::get(
+                    decoded.format(), frame_w, frame_h,
+                    out_fmt, out_w, out_h, Flags::BILINEAR,
+                ) {
+                    Ok(s)  => { scaler = Some(s); }
+                    Err(e) => { return Err(anyhow::anyhow!("SwsContext::get failed: {e}")); }
+                }
+            }
             let mut out_frame = ffmpeg::util::frame::video::Video::empty();
-            scaler.run(&decoded, &mut out_frame)?;
+            scaler.as_mut().unwrap().run(&decoded, &mut out_frame)?;
             last_good = Some(out_frame.clone());
             // Skip frames that landed before our target due to keyframe-aligned seek.
             // Compare in seconds — pts+2 in raw units is timebase-dependent (22µs at
@@ -661,6 +709,7 @@ pub fn decode_frame(
 
     // EOF reached without hitting seek_ts — emit the last frame we saw.
     if let Some(out_frame) = last_good {
+        if out_w == 0 { return Err(anyhow::anyhow!("no frame found at t={timestamp:.3}")); }
         emit_frame(&out_frame, id, out_w, out_h, save_png, &dest, tx)?;
         return Ok(());
     }
