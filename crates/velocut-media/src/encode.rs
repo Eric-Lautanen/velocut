@@ -10,8 +10,16 @@
 //     PROGRESS_INTERVAL frames and EncodeError / EncodeDone on exit.
 //
 // Stream layout in the output MP4:
-//   Stream 0 — H.264 video (YUV420P, CRF 18, preset fast)
+//   Stream 0 — H.264 video (YUV420P, CRF 18, preset fast, or HW equivalent)
 //   Stream 1 — AAC audio  (FLTP stereo, 44100 Hz, 128 kbps)
+//
+// Hardware encoding:
+//   Attempted in priority order: NVENC (CUDA) → VAAPI → VideoToolbox → libx264.
+//   Each HW path uploads YUV420P software frames to the device via an
+//   AVHWFramesContext before calling send_frame; the muxer receives standard
+//   H.264 Annex-B / AVCC output regardless of which encoder ran.
+//   If all HW paths fail (missing driver, wrong platform) the pipeline falls
+//   through to software x264 automatically.
 //
 // PTS strategy:
 //   Video: monotonically increasing frame counter (output_frame_idx) in 1/fps.
@@ -27,17 +35,18 @@
 //   carries over into the next clip. At the very end the tail is zero-padded
 //   and flushed.
 //
+//   Audio resampler tail flush (1080p dropout fix):
+//   After the decoder EOF drain the resampler may hold a partial output block
+//   (SwrContext defers output until it has enough samples). A null-frame flush
+//   (swr_convert with null input) extracts these buffered samples before the
+//   FIFO carry-over check. Without this, 1080p clips lose the last ~20 ms of
+//   audio per clip, which accumulates into audible gaps on long timelines.
+//
 // Cancellation:
 //   `cancel` is an Arc<AtomicBool> checked after every video frame. When set,
 //   EncodeError { msg: "cancelled" } is sent — the UI treats that as an aborted
 //   state distinct from a real error, keeping the cancel path identical to the
 //   error path.
-//
-// Encoder ownership:
-//   Both the video::Encoder and audio::Audio are created once in `run_encode`
-//   and passed as `&mut` into `encode_clip` / the flush block. We never
-//   retrieve either from the output stream — `Stream::codec()` does not exist
-//   in this version of ffmpeg-the-third.
 
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -79,91 +88,431 @@ pub struct ClipSpec {
     /// Linear gain applied to decoded audio before encoding (1.0 = unity).
     pub volume:        f32,
     /// When true, no audio is decoded or pushed to the FIFO for this clip.
-    ///
-    /// Set by `begin_render()` for video-row clips whose audio has been
-    /// extracted to a separate A-row clip (`audio_muted = true`). The A-row
-    /// clip is included as a separate `ClipSpec` with `skip_audio = false`
-    /// covering the same time range so the FIFO receives the correct PCM.
-    /// See `begin_render()` in `app.rs` for the pairing logic.
     pub skip_audio:    bool,
 }
 
 /// A standalone audio clip that runs in parallel with the video timeline.
-///
-/// Unlike the clips in `EncodeSpec::clips`, which are processed sequentially
-/// and must have a video stream, an `AudioOverlay` is an audio-only file
-/// (or any file with audio) placed on an A-row track that does NOT correspond
-/// to an extracted V↔A pair.  Its PCM is mixed into the AAC encoder FIFO at
-/// the correct output-timeline position as each frame is encoded.
-///
-/// Created by `build_encode_plan` in `app.rs` for every standalone audio clip
-/// (odd `track_row`, no `linked_clip_id`) on the timeline.
 #[derive(Clone)]
 pub struct AudioOverlay {
-    /// Absolute path to the audio source file.
     pub path:           PathBuf,
-    /// Seconds into the source file at which this clip begins.
     pub source_offset:  f64,
-    /// Start position on the output timeline, in seconds.
     pub timeline_start: f64,
-    /// Duration in seconds to include from this clip.
     pub duration:       f64,
-    /// Linear gain applied to decoded audio (1.0 = unity).
     pub volume:         f32,
 }
 
 /// Complete description of an encode job.
 pub struct EncodeSpec {
-    /// Unique identifier used in all progress / done / error results.
     pub job_id:  Uuid,
-    /// Clips in timeline order. Gaps between clips are not filled.
     pub clips:   Vec<ClipSpec>,
     pub width:   u32,
     pub height:  u32,
-    /// Output frame rate (integer; fractional rates not needed for NLE output).
     pub fps:     u32,
-    /// Destination file, including extension (`.mp4`).
     pub output:  PathBuf,
-    /// Transitions between adjacent clips.
-    /// Index N means "between clips[N] and clips[N+1]".
-    /// Missing entries default to Cut (hard splice, zero overhead).
     pub transitions: Vec<ClipTransition>,
-    /// Standalone audio clips that run in parallel with the video timeline.
-    ///
-    /// These are NOT part of the sequential `clips` list and do NOT drive video
-    /// frame output.  Their PCM is pre-decoded once before the encode loop and
-    /// then mixed (summed) into every AAC encoder frame at the correct
-    /// output-timeline sample position.  Any number of overlays may be present;
-    /// each is mixed independently so they accumulate additively.
     pub audio_overlays: Vec<AudioOverlay>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Send a progress update every this many encoded video frames.
 const PROGRESS_INTERVAL: u64 = 15;
-
-/// Output audio sample rate for all exports.
 const AUDIO_RATE: i32 = 44100;
+
+// ── Hardware encoder selection ────────────────────────────────────────────────
+
+/// Which H.264 encoder backend is active for this encode job.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HwBackend {
+    /// libx264 software encoder — universal fallback.
+    Software,
+    /// NVIDIA NVENC via CUDA device frames.
+    Nvenc,
+    /// Intel/AMD VAAPI via DRM device frames.
+    Vaapi,
+    /// Apple VideoToolbox (macOS only).
+    VideoToolbox,
+}
+
+/// Open the best available H.264 encoder for the given output dimensions/rate.
+///
+/// Tries HW encoders in priority order; falls back to libx264 on any failure.
+/// Returns (encoder, backend_tag, hw_device_ctx) where hw_device_ctx is Some
+/// only for HW backends and must be kept alive for the encoder's lifetime.
+///
+/// The returned encoder is already open; callers must NOT call open_as_with again.
+/// For HW backends the encoder's pix_fmt is the HW surface format (cuda/vaapi);
+/// software frames in YUV420P are uploaded by `upload_frame_to_hw` before
+/// calling send_frame.
+fn try_open_hw_encoder(
+    width:   u32,
+    height:  u32,
+    fps:     u32,
+    out_tb:  Rational,
+    octx:    &ffmpeg::format::context::Output,
+) -> (ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>) {
+    // ── NVENC ─────────────────────────────────────────────────────────────────
+    if let Some(result) = try_nvenc_encoder(width, height, fps, out_tb, octx) {
+        eprintln!("[encode] HW encoder: NVENC (CUDA)");
+        return result;
+    }
+
+    // ── VAAPI ─────────────────────────────────────────────────────────────────
+    if let Some(result) = try_vaapi_encoder(width, height, fps, out_tb, octx) {
+        eprintln!("[encode] HW encoder: VAAPI");
+        return result;
+    }
+
+    // ── VideoToolbox ──────────────────────────────────────────────────────────
+    if let Some(result) = try_videotoolbox_encoder(width, height, fps, out_tb, octx) {
+        eprintln!("[encode] HW encoder: VideoToolbox");
+        return result;
+    }
+
+    // ── Software fallback ─────────────────────────────────────────────────────
+    eprintln!("[encode] HW encoder: none available, using libx264 software");
+    let enc = open_software_encoder(width, height, fps, out_tb, octx)
+        .expect("libx264 is required — ensure it is compiled in");
+    (enc, HwBackend::Software, None)
+}
+
+/// Opaque wrapper around an AVHWDeviceContext* kept alive next to the encoder.
+struct HwDeviceContext {
+    /// The raw AVBufferRef* for the device context.
+    /// Must stay alive for as long as the encoder is open.
+    ptr: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+// SAFETY: HwDeviceContext owns the buffer ref and is only accessed from the
+// encode thread. AVBufferRef itself is reference-counted and thread-safe for
+// the ref/unref operations the encoder calls internally.
+unsafe impl Send for HwDeviceContext {}
+unsafe impl Sync for HwDeviceContext {}
+
+impl Drop for HwDeviceContext {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut self.ptr); }
+        }
+    }
+}
+
+/// Upload a YUV420P software frame to the HW device surface.
+///
+/// Allocates a new HW surface frame via `av_hwframe_get_buffer`, transfers the
+/// software pixels via `av_hwframe_transfer_data`, then copies side data
+/// (PTS, SAR) so the encoder sees a correctly-timestamped HW frame.
+///
+/// Returns the HW frame ready for send_frame, or the original sw_frame on
+/// any error (the encoder will reject it, but we log and move on).
+unsafe fn upload_frame_to_hw(
+    sw_frame:   &VideoFrame,
+    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+) -> Result<VideoFrame, String> {
+    // Allocate a fresh HW surface.
+    let hw_raw = ffmpeg::ffi::av_frame_alloc();
+    if hw_raw.is_null() {
+        return Err("av_frame_alloc for HW frame failed".into());
+    }
+
+    (*hw_raw).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(hw_frames_ctx);
+    let ret = ffmpeg::ffi::av_hwframe_get_buffer((*hw_raw).hw_frames_ctx, hw_raw, 0);
+    if ret < 0 {
+        ffmpeg::ffi::av_frame_free(&mut (hw_raw as *mut _));
+        return Err(format!("av_hwframe_get_buffer failed: {ret}"));
+    }
+
+    // Copy pixel data from SW → HW surface.
+    let ret = ffmpeg::ffi::av_hwframe_transfer_data(hw_raw, sw_frame.as_ptr(), 0);
+    if ret < 0 {
+        ffmpeg::ffi::av_frame_free(&mut (hw_raw as *mut _));
+        return Err(format!("av_hwframe_transfer_data failed: {ret}"));
+    }
+
+    // Propagate PTS and SAR.
+    (*hw_raw).pts = (*sw_frame.as_ptr()).pts;
+    (*hw_raw).sample_aspect_ratio = (*sw_frame.as_ptr()).sample_aspect_ratio;
+
+    // Wrap in ffmpeg-the-third's VideoFrame (which will av_frame_free on drop).
+    Ok(VideoFrame::wrap(hw_raw))
+}
+
+/// Build the hw_frames_ctx for a given device context and surface formats.
+///
+/// The frames context tells the encoder how large each surface pool entry is
+/// (width × height × hw_pix_fmt) and how many to pre-allocate.
+unsafe fn build_hw_frames_ctx(
+    device_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    hw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
+    sw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
+    width:  u32,
+    height: u32,
+) -> Result<*mut ffmpeg::ffi::AVBufferRef, String> {
+    let frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(device_ctx);
+    if frames_ref.is_null() {
+        return Err("av_hwframe_ctx_alloc failed".into());
+    }
+
+    let frames_ctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
+    (*frames_ctx).format    = hw_pix_fmt;
+    (*frames_ctx).sw_format = sw_pix_fmt;
+    (*frames_ctx).width     = width as i32;
+    (*frames_ctx).height    = height as i32;
+    (*frames_ctx).initial_pool_size = 20;
+
+    let ret = ffmpeg::ffi::av_hwframe_ctx_init(frames_ref);
+    if ret < 0 {
+        ffmpeg::ffi::av_buffer_unref(&mut (frames_ref as *mut _));
+        return Err(format!("av_hwframe_ctx_init failed: {ret}"));
+    }
+
+    Ok(frames_ref)
+}
+
+fn try_nvenc_encoder(
+    width:  u32,
+    height: u32,
+    fps:    u32,
+    out_tb: Rational,
+    octx:   &ffmpeg::format::context::Output,
+) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
+    let codec = encoder::find_by_name("h264_nvenc")?;
+
+    // Create CUDA device context.
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        eprintln!("[encode] CUDA device init failed ({ret}), skipping NVENC");
+        return None;
+    }
+
+    let frames_ctx = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            width, height,
+        ) {
+            Ok(f)  => f,
+            Err(e) => {
+                eprintln!("[encode] NVENC frames ctx: {e}");
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+                return None;
+            }
+        }
+    };
+
+    // Build encoder using the safe ffmpeg-the-third API, then inject hw_frames_ctx.
+    let enc_ctx_obj = codec::context::Context::new_with_codec(codec);
+    let mut enc = enc_ctx_obj.encoder().video().ok()?;
+
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_time_base(out_tb);
+    enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+    enc.set_bit_rate(0);
+
+    unsafe {
+        // pix_fmt and hw_frames_ctx must be set via raw pointer — no safe wrappers.
+        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+        (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
+        ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
+    }
+
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    // NVENC options: rc=constqp, qp=18, preset=p4 (balanced quality/speed).
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("rc",     "constqp");
+    opts.set("qp",     "18");
+    opts.set("preset", "p4");
+    opts.set("g",      &fps.to_string());
+
+    match enc.open_as_with(codec, opts) {
+        Ok(opened) => {
+            let hw_dev = HwDeviceContext { ptr: device_ctx };
+            Some((opened, HwBackend::Nvenc, Some(hw_dev)))
+        }
+        Err(e) => {
+            eprintln!("[encode] h264_nvenc open failed: {e}, skipping");
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            None
+        }
+    }
+}
+
+fn try_vaapi_encoder(
+    width:  u32,
+    height: u32,
+    fps:    u32,
+    out_tb: Rational,
+    octx:   &ffmpeg::format::context::Output,
+) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
+    let codec = encoder::find_by_name("h264_vaapi")?;
+
+    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ctx,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            std::ptr::null(), // NULL = auto-detect render node
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        eprintln!("[encode] VAAPI device init failed ({ret}), skipping");
+        return None;
+    }
+
+    let frames_ctx = unsafe {
+        match build_hw_frames_ctx(
+            device_ctx,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            width, height,
+        ) {
+            Ok(f)  => f,
+            Err(e) => {
+                eprintln!("[encode] VAAPI frames ctx: {e}");
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+                return None;
+            }
+        }
+    };
+
+    let enc_ctx_obj = codec::context::Context::new_with_codec(codec);
+    let mut enc = enc_ctx_obj.encoder().video().ok()?;
+
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_time_base(out_tb);
+    enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+    enc.set_bit_rate(0);
+
+    unsafe {
+        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
+        ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
+    }
+
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    // VAAPI uses qp-based rate control; ~18 ≈ CRF 18 visually.
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("rc_mode", "CQP");
+    opts.set("qp",      "18");
+    opts.set("g",       &fps.to_string());
+
+    match enc.open_as_with(codec, opts) {
+        Ok(opened) => {
+            let hw_dev = HwDeviceContext { ptr: device_ctx };
+            Some((opened, HwBackend::Vaapi, Some(hw_dev)))
+        }
+        Err(e) => {
+            eprintln!("[encode] h264_vaapi open failed: {e}, skipping");
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            None
+        }
+    }
+}
+
+fn try_videotoolbox_encoder(
+    width:  u32,
+    height: u32,
+    fps:    u32,
+    out_tb: Rational,
+    octx:   &ffmpeg::format::context::Output,
+) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
+    // VideoToolbox accepts YUV420P input directly (no explicit HW upload needed);
+    // it manages the IOSurface pool internally.
+    let codec = encoder::find_by_name("h264_videotoolbox")?;
+
+    let enc_ctx_obj = codec::context::Context::new_with_codec(codec);
+    let mut enc = enc_ctx_obj.encoder().video().ok()?;
+
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_format(Pixel::YUV420P);  // VT accepts sw frames in yuv420p
+    enc.set_time_base(out_tb);
+    enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+    enc.set_bit_rate(0);
+
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    let mut opts = ffmpeg::Dictionary::new();
+    // VideoToolbox doesn't have CRF; use a high average bitrate for near-lossless quality.
+    opts.set("b:v",            "0");           // let profile control quality
+    opts.set("allow_sw",       "1");           // fall back to SW if GPU busy
+    opts.set("realtime",       "0");           // prefer quality over real-time
+    let gop = fps.to_string();
+    opts.set("g",              &gop);
+
+    match enc.open_as_with(codec, opts) {
+        Ok(opened) => {
+            // VideoToolbox: no external HwDeviceContext needed
+            Some((opened, HwBackend::VideoToolbox, None))
+        }
+        Err(e) => {
+            eprintln!("[encode] h264_videotoolbox open failed: {e}");
+            None
+        }
+    }
+}
+
+fn open_software_encoder(
+    width:  u32,
+    height: u32,
+    fps:    u32,
+    out_tb: Rational,
+    octx:   &ffmpeg::format::context::Output,
+) -> Result<ffmpeg::encoder::Video, String> {
+    let h264 = encoder::find(CodecId::H264)
+        .ok_or_else(|| "H.264 encoder not found — is libx264 available?".to_string())?;
+
+    let enc_ctx = codec::context::Context::new_with_codec(h264);
+    let mut enc = enc_ctx.encoder().video()
+        .map_err(|e| format!("create video encoder context: {e}"))?;
+
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_format(Pixel::YUV420P);
+    enc.set_time_base(out_tb);
+    enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+    enc.set_bit_rate(0);
+
+    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+        enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("crf",    "18");
+    opts.set("preset", "fast");
+    opts.set("g",      &fps.to_string());
+
+    enc.open_as_with(h264, opts)
+        .map_err(|e| format!("open H.264 encoder: {e}"))
+}
 
 // ── Center-crop scaler ────────────────────────────────────────────────────────
 
-/// SwsContext wrapper that center-crops the source to the output aspect ratio
-/// before scaling — prevents squishing when source and output AR differ.
-///
-/// Crop rect is computed once at construction from `src_w/src_h` vs `out_w/out_h`.
-/// For matching ARs the crop rect is the full source frame (zero overhead).
-///
-/// The horizontal crop is applied by advancing per-plane data pointers; the
-/// vertical crop is passed as `srcSliceY / srcSliceH` to `sws_scale`. Both
-/// offsets are always rounded to even so YUV420P sub-sampling stays aligned.
 struct CropScaler {
     ctx:    ScaleCtx,
-    /// Byte offset per Y-plane row (horizontal crop, advances data[0]).
     crop_x: u32,
-    /// First source row handed to sws_scale as srcSliceY.
     crop_y: u32,
-    /// Source row count handed to sws_scale as srcSliceH.
     crop_h: u32,
 }
 
@@ -178,17 +527,13 @@ impl CropScaler {
         let src_ar = src_w as f64 / src_h.max(1) as f64;
         let out_ar = out_w as f64 / out_h.max(1) as f64;
 
-        // Crop rect that maps source pixels to the output AR (center crop).
-        // All edges rounded to even for YUV420P chroma alignment.
         let (crop_x, crop_y, crop_w, crop_h) = if (src_ar - out_ar).abs() < 1e-4 {
             (0, 0, src_w, src_h)
         } else if src_ar > out_ar {
-            // Source wider — crop sides, keep full height.
             let cw = ((src_h as f64 * out_ar).round() as u32).min(src_w) & !1;
             let cx = ((src_w - cw) / 2) & !1;
             (cx, 0u32, cw, src_h)
         } else {
-            // Source taller — crop top/bottom, keep full width.
             let ch = ((src_w as f64 / out_ar).round() as u32).min(src_h) & !1;
             let cy = ((src_h - ch) / 2) & !1;
             (0u32, cy, src_w, ch)
@@ -203,18 +548,11 @@ impl CropScaler {
         Self { ctx, crop_x, crop_y, crop_h }
     }
 
-    /// Scale `src` into `dst` with center-crop.
-    ///
-    /// `dst` must be pre-allocated (e.g. `VideoFrame::new(YUV420P, out_w, out_h)`).
-    /// Handles planar YUV formats (YUV420P / 422P / 444P and their J-range
-    /// variants) which cover effectively all H.264 / H.265 decoder output.
-    /// For other formats the horizontal crop is skipped; vertical crop still applies.
     fn run(&mut self, src: &VideoFrame, dst: &mut VideoFrame) -> Result<(), String> {
         unsafe {
             let sf = src.as_ptr();
             let df = dst.as_mut_ptr();
 
-            // Per-plane horizontal byte offsets for the crop.
             let (off_y, off_uv): (usize, usize) = match src.format() {
                 Pixel::YUV420P | Pixel::YUVJ420P |
                 Pixel::YUV422P | Pixel::YUVJ422P => {
@@ -224,18 +562,9 @@ impl CropScaler {
                     let o = self.crop_x as usize;
                     (o, o)
                 }
-                _ => (0, 0), // unknown packed/HBD format — skip horizontal crop
+                _ => (0, 0),
             };
 
-            // Advance data pointers into the crop rect.
-            //
-            // The SwsContext was built with (crop_w × crop_h) as source dims.
-            // sws_scale's srcSliceY is an offset INTO those declared dims, so
-            // passing srcSliceY=crop_y makes (crop_y + crop_h) > crop_h → EINVAL.
-            // Instead, pre-advance data pointers to row crop_y and pass srcSliceY=0,
-            // which is consistent with the declared source dimensions.
-            //
-            // UV planes are half-height in YUV420P so their row offset is halved.
             let ls = &(*sf).linesize;
             let y_row_off  = self.crop_y as usize * ls[0] as usize;
             let uv_row_off = (self.crop_y as usize / 2) * ls[1] as usize;
@@ -251,7 +580,7 @@ impl CropScaler {
                 self.ctx.as_mut_ptr(),
                 src_planes.as_ptr() as _,
                 (*sf).linesize.as_ptr(),
-                0,                // srcSliceY=0: pointer is already at crop_y
+                0,
                 self.crop_h as _,
                 (*df).data.as_mut_ptr() as _,
                 (*df).linesize.as_mut_ptr(),
@@ -267,7 +596,6 @@ impl CropScaler {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Encode `spec` to disk. Blocking — run this on a dedicated thread.
 pub fn encode_timeline(
     spec:   EncodeSpec,
     cancel: Arc<AtomicBool>,
@@ -296,11 +624,6 @@ pub fn encode_timeline(
 
 // ── Audio FIFO ────────────────────────────────────────────────────────────────
 
-/// Stereo FLTP (float planar) sample ring buffer.
-///
-/// Left channel samples are in `self.left`; right in `self.right`.
-/// When a mono source is decoded, both planes are filled from channel 0
-/// so the output is always properly stereo.
 struct AudioFifo {
     left:  Vec<f32>,
     right: Vec<f32>,
@@ -308,15 +631,8 @@ struct AudioFifo {
 
 impl AudioFifo {
     fn new() -> Self { Self { left: Vec::new(), right: Vec::new() } }
-
-    /// How many samples are currently buffered (per channel).
     fn len(&self) -> usize { self.left.len() }
 
-    /// Append one decoded / resampled FLTP audio frame, scaled by `volume`.
-    ///
-    /// The frame must be in FLTP format (float planar); stereo or mono.
-    /// Mono frames are duplicated to both output channels.
-    /// Volume is a linear gain: 1.0 = unity, 0.0 = silence, 2.0 = +6 dB.
     fn push_scaled(&mut self, frame: &AudioFrame, volume: f32) {
         let n = frame.samples();
         if n == 0 { return; }
@@ -331,11 +647,6 @@ impl AudioFifo {
         }
     }
 
-    /// Pop one encoder-sized frame from the front of the FIFO.
-    ///
-    /// If fewer than `n` samples remain the tail is zero-padded (used only for
-    /// the final flush frame so the AAC encoder receives a full fixed-size input).
-    /// The returned frame has its PTS set to `sample_idx` in the 1/44100 timebase.
     fn pop_frame(&mut self, n: usize, sample_idx: i64) -> AudioFrame {
         let available = self.left.len().min(n);
 
@@ -361,66 +672,35 @@ impl AudioFifo {
 
         self.left.drain(..available);
         self.right.drain(..available);
-
         frame
     }
 }
 
 // ── Audio encoder state ───────────────────────────────────────────────────────
 
-/// Pre-decoded stereo f32 PCM for one `AudioOverlay`.
-///
-/// Indexed to the output timeline via `start_sample`: overlay sample at index `i`
-/// corresponds to output sample `start_sample + i`.  Built once in `run_encode`
-/// before the clip loop and stored on `AudioEncState` so it is available inside
-/// every `drain_fifo` call without threading it through every call-site.
 struct DecodedOverlay {
     left:         Vec<f32>,
     right:        Vec<f32>,
-    /// Absolute output-timeline sample index of the first sample in this overlay
-    /// (`overlay.timeline_start * AUDIO_RATE`).
     start_sample: i64,
-    /// Total number of samples decoded (per channel).
     sample_count: usize,
 }
 
-/// Everything needed to drive the AAC encoder across multiple clips.
 struct AudioEncState {
     encoder:        ffmpeg::encoder::Audio,
-    /// Next output frame's PTS in samples (audio stream timebase = 1/44100).
     out_sample_idx: i64,
-    /// AAC frame size in samples (typically 1024).
     frame_size:     usize,
     fifo:           AudioFifo,
-    /// 1/AUDIO_RATE — used for PTS rescaling when writing packets.
     audio_tb:       Rational,
-    /// The muxer-assigned timebase for stream 1 (may differ from audio_tb).
     ost_audio_tb:   Rational,
-    /// Pre-decoded standalone audio overlay tracks.  Mixed (summed) into every
-    /// AAC encoder frame inside `drain_fifo` at the correct absolute output-
-    /// timeline sample position.  Empty when no overlays are present.
     overlays:       Vec<DecodedOverlay>,
 }
 
 impl AudioEncState {
-    /// Drain buffered samples → encode → write interleaved to `octx`.
-    ///
-    /// In normal operation (`flush = false`) only full frames are sent.
-    /// At the end of the encode (`flush = true`) a partial tail frame is
-    /// zero-padded and flushed so no PCM is lost.
-    ///
-    /// Any pre-decoded `AudioOverlay` tracks stored in `self.overlays` are
-    /// mixed (summed and clamped) into each frame before it is sent to the
-    /// encoder.  The mix uses `self.out_sample_idx` as the absolute output-
-    /// timeline anchor so overlays are placed at exactly the right position
-    /// regardless of clip boundaries.
     fn drain_fifo(
         &mut self,
         octx:  &mut ffmpeg::format::context::Output,
         flush: bool,
     ) -> Result<(), String> {
-        // Warn if the FIFO is growing unusually deep — indicates audio is outrunning
-        // video consumption (e.g. audio packets pushing well past clip_end).
         if !flush && self.fifo.len() > 2 * self.frame_size {
             eprintln!(
                 "[encode] audio FIFO overrun: {} samples buffered (threshold={}); \
@@ -433,13 +713,6 @@ impl AudioEncState {
         {
             let frame = self.fifo.pop_frame(self.frame_size, self.out_sample_idx);
 
-            // Mix standalone audio overlays into this AAC frame.
-            //
-            // `out_sample_idx` is the absolute output-timeline sample position of
-            // the first sample in this frame (matches the PTS set by pop_frame).
-            // Each overlay's `start_sample` anchors it to the same coordinate
-            // space, so `out_sample_idx + i - ov.start_sample` gives the index
-            // into the pre-decoded PCM array for the i-th sample of this frame.
             if !self.overlays.is_empty() {
                 let n = self.frame_size;
                 unsafe {
@@ -466,13 +739,11 @@ impl AudioEncState {
 
             self.encoder.send_frame(&frame)
                 .map_err(|e| format!("send audio frame to encoder: {e}"))?;
-
             self.drain_packets(octx)?;
         }
         Ok(())
     }
 
-    /// Receive all available encoded packets and write them to the muxer.
     fn drain_packets(
         &mut self,
         octx: &mut ffmpeg::format::context::Output,
@@ -487,7 +758,6 @@ impl AudioEncState {
         Ok(())
     }
 
-    /// Send EOF to the AAC encoder and flush any remaining output packets.
     fn flush_encoder(
         &mut self,
         octx: &mut ffmpeg::format::context::Output,
@@ -498,17 +768,56 @@ impl AudioEncState {
     }
 }
 
+// ── Resampler tail flush ──────────────────────────────────────────────────────
+
+/// Flush any samples buffered inside a SwrContext by sending a null (EOF) input.
+///
+/// SwrContext buffers up to one output block internally and emits it only once
+/// it receives enough input. After decoder EOF the resampler may hold 512–1024
+/// samples that never appear in `receive_frame` output. This function extracts
+/// them by calling swr_convert with a null input pointer (the documented API for
+/// flushing the internal delay line).
+///
+/// This is the primary fix for audio dropouts at 1080p: at high resolution the
+/// encoder is slow enough that the packet loop's send_packet/receive_frame
+/// interleaving leaves the resampler partially filled at clip_end, and without
+/// this flush those samples are silently discarded.
+fn flush_audio_resampler(
+    resampler: &mut resampling::Context,
+    fifo:      &mut AudioFifo,
+    volume:    f32,
+) {
+    // A null-frame flush: allocate an output frame, call swr_convert with
+    // null input, repeat until the resampler reports zero output samples.
+    loop {
+        // Allocate a temporary frame large enough to drain the delay line.
+        // 4096 samples is safely larger than any SwrContext internal buffer.
+        let mut out_frame = AudioFrame::new(
+            Sample::F32(SampleType::Planar),
+            4096,
+            ChannelLayoutMask::STEREO,
+        );
+        out_frame.set_rate(AUDIO_RATE as u32);
+
+        unsafe {
+            let n_out = ffmpeg::ffi::swr_convert(
+                resampler.as_mut_ptr(),
+                (*out_frame.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                4096,
+                std::ptr::null_mut(), // null input = flush
+                0,
+            );
+            if n_out <= 0 { break; }
+            // Manually set the sample count so push_scaled reads the right slice.
+            (*out_frame.as_mut_ptr()).nb_samples = n_out;
+        }
+
+        fifo.push_scaled(&out_frame, volume);
+    }
+}
+
 // ── Overlay decode ────────────────────────────────────────────────────────────
 
-/// Decode audio from an `AudioOverlay` into a stereo f32 FLTP `DecodedOverlay`.
-///
-/// Opens the source file, seeks to `overlay.source_offset`, decodes
-/// `overlay.duration` seconds of audio, resamples to 44100 Hz stereo FLTP,
-/// and returns left+right sample arrays together with the absolute output-
-/// timeline start sample (`overlay.timeline_start * AUDIO_RATE`).
-///
-/// Soft-fails on any decode error: callers filter `Err` and log, allowing the
-/// rest of the encode to proceed without the overlay.
 fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::software::resampling;
@@ -535,8 +844,6 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     let mut adec = adec_ctx.decoder().audio()
         .map_err(|e| format!("overlay audio decoder: {e}"))?;
 
-    // Seek to source_offset.  Soft-fail: if seek fails we just decode from
-    // the beginning and the pre-roll filter below discards the extra frames.
     let seek_ts = {
         let tb = in_tb;
         (overlay.source_offset * tb.denominator() as f64 / tb.numerator() as f64) as i64
@@ -609,7 +916,6 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
         }
     }
 
-    // Flush decoder tail.
     let _ = adec.send_eof();
     let mut raw = AudioFrame::empty();
     while adec.receive_frame(&mut raw).is_ok() {
@@ -670,59 +976,40 @@ fn run_encode(
         .map_err(|e| format!("could not open output '{}': {e}", spec.output.display()))?;
 
     // ── Video encoder (stream 0) ──────────────────────────────────────────────
-    // Create the codec context independently of the output stream — Stream does
-    // not expose a .codec() accessor in this version of ffmpeg-the-third.
     let out_tb   = Rational::new(1, spec.fps as i32);
     let frame_tb = Rational::new(1, spec.fps as i32);
 
-    let h264 = encoder::find(CodecId::H264)
-        .ok_or_else(|| "H.264 encoder not found — is libx264 available?".to_string())?;
+    // Determine which codec we'll be registering for the stream.  HW encoders
+    // expose themselves under their own codec ID (hevc_nvenc, h264_nvenc, etc.)
+    // but we always want stream 0 to carry H.264, so use the H264 codec ID for
+    // the output stream regardless of which actual encoder won.
+    let h264_for_stream = encoder::find(CodecId::H264)
+        .ok_or_else(|| "H.264 codec not registered".to_string())?;
 
-    let mut ost_video = octx.add_stream(h264)
+    let mut ost_video = octx.add_stream(h264_for_stream)
         .map_err(|e| format!("add video stream: {e}"))?;
     ost_video.set_time_base(out_tb);
 
-    let video_enc_ctx = codec::context::Context::new_with_codec(h264);
-    let mut video_enc = video_enc_ctx.encoder().video()
-        .map_err(|e| format!("create video encoder context: {e}"))?;
+    // Open the best available encoder. This MUST happen before write_header
+    // so we can copy codecpar in.  HW context (if any) is kept alive here.
+    let (mut video_encoder, hw_backend, hw_device) =
+        try_open_hw_encoder(spec.width, spec.height, spec.fps, out_tb, &octx);
 
-    video_enc.set_width(spec.width);
-    video_enc.set_height(spec.height);
-    video_enc.set_format(Pixel::YUV420P);
-    video_enc.set_time_base(out_tb);
-    video_enc.set_frame_rate(Some(Rational::new(spec.fps as i32, 1)));
-    video_enc.set_bit_rate(0); // CRF controls quality; bit_rate 0 signals VBR
+    eprintln!("[encode] video encoder backend: {hw_backend:?}");
 
-    // MP4 requires SPS/PPS in the avcC box (AVCC format). Setting GLOBAL_HEADER
-    // tells libx264 to populate extradata during open so avcodec_parameters_from_context
-    // copies it into codecpar before the muxer writes the file header.
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
-        video_enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
-    }
+    // For HW backends we need the hw_frames_ctx pointer to upload frames later.
+    // It lives inside the opened encoder's AVCodecContext.
+    let hw_frames_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef = if hw_backend != HwBackend::Software
+        && hw_backend != HwBackend::VideoToolbox
+    {
+        unsafe { (*video_encoder.as_ptr()).hw_frames_ctx }
+    } else {
+        std::ptr::null_mut()
+    };
 
-    let mut opts = ffmpeg::Dictionary::new();
-    opts.set("crf",    "18");
-    opts.set("preset", "fast");
-    // Force a keyframe every second so scrubbing stays responsive after import.
-    // libx264 default is keyint=250 (~8s at 30fps); camera files and NLE-ready
-    // exports typically use 1-2s. The scrub thread seeks to the nearest keyframe
-    // then burns through — a 250-frame GOP makes that 8x slower than a 30-frame
-    // GOP for every seek, which is the primary cause of choppy scrub on exports.
-    opts.set("g", &spec.fps.to_string());
-
-    let mut video_encoder = video_enc.open_as_with(h264, opts)
-        .map_err(|e| format!("open H.264 encoder: {e}"))?;
-
-    // Force square pixels in the OPENED encoder context.  Must be set here —
-    // after open_as_with — because libavcodec resets sample_aspect_ratio to
-    // 0:1 during codec initialisation, clobbering anything set on video_enc
-    // before the open.  avcodec_parameters_from_context reads from video_encoder
-    // (the post-open context), so this is the only place that sticks.
+    // Force square pixels — same as the original code path.
     video_encoder.set_aspect_ratio(Rational::new(1, 1));
 
-    // Copy encoder params into the stream's codecpar so the muxer has resolution,
-    // format, and codec-private data. set_parameters() requires AsPtr<AVCodecParameters>;
-    // encoder::Video does not implement that trait, so we use FFI directly.
     unsafe {
         let ret = ffmpeg::ffi::avcodec_parameters_from_context(
             (**(*octx.as_mut_ptr()).streams.add(0)).codecpar,
@@ -734,9 +1021,6 @@ fn run_encode(
     }
 
     // ── Audio encoder (stream 1) ──────────────────────────────────────────────
-    // Target format: 44100 Hz stereo FLTP — the native AAC encoder accepts this
-    // without transcoding on the encoder side. All source audio is resampled to
-    // this format before being pushed into the FIFO.
     let audio_tb = Rational::new(1, AUDIO_RATE);
 
     let aac = encoder::find(CodecId::AAC)
@@ -755,7 +1039,6 @@ fn run_encode(
     audio_enc.set_format(Sample::F32(SampleType::Planar));
     audio_enc.set_bit_rate(128_000);
 
-    // Same GLOBAL_HEADER requirement as the video encoder above.
     if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
         audio_enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
@@ -763,7 +1046,6 @@ fn run_encode(
     let audio_encoder = audio_enc.open_as_with(aac, ffmpeg::Dictionary::new())
         .map_err(|e| format!("open AAC encoder: {e}"))?;
 
-    // Guard against a codec that returns 0 (shouldn't happen with AAC but be safe).
     let audio_frame_size = (audio_encoder.frame_size() as usize).max(1024);
 
     unsafe {
@@ -781,9 +1063,6 @@ fn run_encode(
     octx.write_header()
         .map_err(|e| format!("write output header: {e}"))?;
 
-    // Fetch the muxer-assigned timebase for stream 1 AFTER write_header — the MP4
-    // muxer may normalize stream timebases during avformat_write_header, so any
-    // value read before that call can be stale and cause audio drift.
     let ost_audio_tb = octx.stream(1).unwrap().time_base();
 
     let mut audio_state = AudioEncState {
@@ -793,9 +1072,6 @@ fn run_encode(
         fifo:           AudioFifo::new(),
         audio_tb,
         ost_audio_tb,
-        // Pre-decode all standalone audio overlay tracks before the clip loop.
-        // Any overlay that fails to decode is logged and skipped gracefully so
-        // the rest of the export is unaffected.
         overlays: spec.audio_overlays.iter()
             .filter_map(|ov| match decode_overlay(ov) {
                 Ok(d)  => Some(d),
@@ -806,17 +1082,8 @@ fn run_encode(
 
     // ── Per-clip encode loop ──────────────────────────────────────────────────
     let mut output_frame_idx: i64 = 0;
-    // Shared DTS monotonicity guard — persists across all encode_clip calls and
-    // into the final encoder flush so B-frame reorder packets are clamped
-    // consistently even at clip boundaries and at the very end.
     let mut last_video_dts: i64 = i64::MIN;
-    // How many seconds to skip at the START of the next clip (set when an
-    // outgoing transition has already blended the incoming clip's head, so
-    // encode_clip doesn't re-encode those frames).
     let mut incoming_skip_secs: f64 = 0.0;
-
-    // Build the transition registry once — cheap (zero-size structs) but no
-    // reason to reconstruct it on every clip iteration.
     let transition_registry = registry();
 
     for (clip_idx, clip) in spec.clips.iter().enumerate() {
@@ -824,12 +1091,9 @@ fn run_encode(
             return Err("cancelled".into());
         }
 
-        // Snapshot the incoming skip for this clip, then reset for the next one.
         let skip = incoming_skip_secs;
         incoming_skip_secs = 0.0;
 
-        // Find the transition after this clip (if any) and resolve its duration.
-        // Cut has no duration and no registry entry — short-circuit it here.
         let transition_entry = if clip_idx + 1 < spec.clips.len() {
             spec.transitions.iter()
                 .find(|t| t.after_clip_index == clip_idx)
@@ -842,10 +1106,6 @@ fn run_encode(
             .map(|t| t.kind.duration_secs as f64)
             .unwrap_or(0.0);
 
-        // Build the effective ClipSpec for this clip:
-        //   - skip: skip the head that was already blended by the incoming transition
-        //   - transition_secs: stop that many seconds early so apply_transition can
-        //     blend the tail with the next clip's head
         let effective = ClipSpec {
             path:          clip.path.clone(),
             source_offset: clip.source_offset + skip,
@@ -859,6 +1119,8 @@ fn run_encode(
             spec,
             &mut octx,
             &mut video_encoder,
+            hw_frames_ctx_ptr,
+            hw_backend,
             &mut audio_state,
             output_frame_idx,
             total_frames,
@@ -868,12 +1130,9 @@ fn run_encode(
             &mut last_video_dts,
         )?;
 
-        // ── Transition hook ───────────────────────────────────────────────────
         if let Some(entry) = transition_entry {
             let next_clip = &spec.clips[clip_idx + 1];
 
-            // Tail: last `transition_secs` of the current clip (just after encode_clip stopped).
-            // skip_audio = false: the transition audio blend needs PCM from both clips.
             let tail_spec = ClipSpec {
                 path:          clip.path.clone(),
                 source_offset: effective.source_offset + effective.duration,
@@ -881,7 +1140,6 @@ fn run_encode(
                 volume:        clip.volume,
                 skip_audio:    false,
             };
-            // Head: first `transition_secs` of the next clip.
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
                 source_offset: next_clip.source_offset,
@@ -898,6 +1156,8 @@ fn run_encode(
                     spec,
                     &mut octx,
                     &mut video_encoder,
+                    hw_frames_ctx_ptr,
+                    hw_backend,
                     &mut audio_state,
                     output_frame_idx,
                     total_frames,
@@ -907,7 +1167,6 @@ fn run_encode(
                     &mut last_video_dts,
                 )?;
 
-                // Tell the next iteration to skip the head it already blended.
                 incoming_skip_secs = transition_secs;
             }
         }
@@ -925,11 +1184,6 @@ fn run_encode(
     let mut pkt = Packet::empty();
     while video_encoder.receive_packet(&mut pkt).is_ok() {
         pkt.set_stream(0);
-        // Capture PTS in frame_tb units (frame-count) BEFORE rescale_ts.
-        // After rescale_ts the packet PTS is in ost_video_tb units (e.g. 1/12800),
-        // which is orders of magnitude larger than the frame index.  Using the
-        // post-rescale value for output_frame_idx would make target_audio_samples
-        // astronomically large, completely defeating the audio-trim block below.
         let frame_pts = pkt.pts().unwrap_or(pkt.dts().unwrap_or(0));
         pkt.rescale_ts(frame_tb, ost_video_tb);
         let raw_dts = pkt.dts().unwrap_or(0);
@@ -951,34 +1205,11 @@ fn run_encode(
         last_video_dts = pkt.dts().unwrap_or(raw_dts);
         pkt.write_interleaved(&mut octx)
             .map_err(|e| format!("write flush video packet: {e}"))?;
-        // Track the highest PTS seen so output_frame_idx reflects the true
-        // video duration including all B-frame lookahead frames.  The audio
-        // trim below uses this value, so it must be updated here.
-        // Use frame_pts (pre-rescale, in frame_tb / frame-count units) so
-        // the frame index stays comparable to the fps-based audio calculation.
         output_frame_idx = output_frame_idx.max(frame_pts + 1);
     }
 
     // ── Trim audio to video boundary ──────────────────────────────────────────
-    // The demuxer loop in encode_clip continues reading audio packets until
-    // file EOF — not until clip_end.  On the last clip this pushes potentially
-    // 1–2 s of extra PCM into the FIFO that has no corresponding video frames.
-    // drain_fifo(flush=true) below would write all of it, making the audio
-    // stream longer than the video stream.  Container duration = max(audio,
-    // video), so the player waits for video that never arrives → tail freeze.
-    //
-    // Trim the FIFO right now so that (out_sample_idx + fifo.len) does not
-    // exceed the exact sample count that matches the last video frame.
     {
-        // Subtract one AAC frame_size from the target.
-        //
-        // After the FIFO trim, drain_fifo(flush=true) zero-pads the remaining
-        // partial frame to exactly frame_size (1024 samples = 23 ms) before
-        // sending it to the encoder.  Without this adjustment the padded tail
-        // always pushes audio end ~23 ms past the last video frame, which some
-        // players render as a 1-2 frame hold.  Trimming one extra frame_size
-        // ensures the final padded AAC frame lands at or just before the last
-        // video frame rather than after it.
         let target_audio_samples =
             output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
         let total_audio =
@@ -1005,30 +1236,53 @@ fn run_encode(
     }
 
     // ── Flush audio FIFO then encoder ─────────────────────────────────────────
-    // drain_fifo(flush=true) zero-pads the tail and sends the final partial frame.
     audio_state.drain_fifo(&mut octx, true)?;
     audio_state.flush_encoder(&mut octx)?;
 
     octx.write_trailer()
         .map_err(|e| format!("write trailer: {e}"))?;
 
+    // Keep hw_device alive until after write_trailer — the encoder may still
+    // reference device memory during the trailer flush.
+    drop(hw_device);
+
     Ok(())
 }
 
-/// Encode one `ClipSpec` into `octx`, starting video output PTS at `out_frame_idx`.
+/// Send one YUV420P software frame to the video encoder, uploading to the HW
+/// surface if a HW backend is active.
 ///
-/// Video and audio are multiplexed from the same demuxer packet loop so their
-/// relative timing is preserved. Audio packets arriving before the clip's
-/// `source_offset` are discarded; those after `clip_end` are still pushed into
-/// the FIFO (they will be interleaved into subsequent clips). The video loop
-/// break-out on `clip_end` is the authoritative end-of-clip trigger.
-///
-/// Returns the next unused `out_frame_idx`.
+/// This helper centralises the upload logic so encode_clip and apply_transition
+/// both call a single function rather than duplicating the unsafe block.
+fn send_video_frame(
+    yuv:              &VideoFrame,
+    video_encoder:    &mut ffmpeg::encoder::Video,
+    hw_frames_ctx:    *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend:       HwBackend,
+) -> Result<(), String> {
+    if !hw_frames_ctx.is_null()
+        && hw_backend != HwBackend::Software
+        && hw_backend != HwBackend::VideoToolbox
+    {
+        // CUDA / VAAPI: upload SW frame to HW surface before encoding.
+        let hw_frame = unsafe { upload_frame_to_hw(yuv, hw_frames_ctx) }
+            .map_err(|e| format!("HW frame upload: {e}"))?;
+        video_encoder.send_frame(&hw_frame)
+            .map_err(|e| format!("send HW video frame to encoder: {e}"))
+    } else {
+        // Software or VideoToolbox: pass frame directly.
+        video_encoder.send_frame(yuv)
+            .map_err(|e| format!("send video frame to encoder: {e}"))
+    }
+}
+
 fn encode_clip(
     clip:               &ClipSpec,
     spec:               &EncodeSpec,
     octx:               &mut ffmpeg::format::context::Output,
-    video_encoder:      &mut ffmpeg::encoder::video::Video,
+    video_encoder:      &mut ffmpeg::encoder::Video,
+    hw_frames_ctx:      *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend:         HwBackend,
     audio_state:        &mut AudioEncState,
     mut out_frame_idx:  i64,
     total_frames:       u64,
@@ -1037,7 +1291,6 @@ fn encode_clip(
     tx:                 &Sender<MediaResult>,
     last_video_dts:     &mut i64,
 ) -> Result<i64, String> {
-    // ── Open input ────────────────────────────────────────────────────────────
     let mut ictx = open_input(&clip.path)
         .map_err(|e| format!("open '{}': {e}", clip.path.display()))?;
 
@@ -1047,8 +1300,6 @@ fn encode_clip(
         .ok_or_else(|| format!("no video stream in '{}'", clip.path.display()))?
         .index();
 
-    // Audio stream is optional — clips with no audio (muted recordings, etc.)
-    // produce silence in the output for their duration via FIFO carry-over.
     let audio_stream_idx: Option<usize> = ictx
         .streams()
         .best(MediaType::Audio)
@@ -1056,7 +1307,6 @@ fn encode_clip(
 
     let in_video_tb = ictx.stream(video_stream_idx).unwrap().time_base();
 
-    // ── Video decoder ─────────────────────────────────────────────────────────
     let vdec_ctx = codec::context::Context::from_parameters(
         ictx.stream(video_stream_idx).unwrap().parameters(),
     ).map_err(|e| format!("video decoder context: {e}"))?;
@@ -1064,20 +1314,13 @@ fn encode_clip(
     let mut video_decoder = vdec_ctx.decoder().video()
         .map_err(|e| format!("open video decoder: {e}"))?;
 
-    // ── Audio decoder (optional) ──────────────────────────────────────────────
     let mut audio_decoder: Option<ffmpeg::decoder::audio::Audio> = None;
     let mut in_audio_tb = Rational::new(1, AUDIO_RATE);
 
-    // Only open the audio decoder when this clip contributes audio.
-    // skip_audio is set by begin_render() for video-row clips whose audio has
-    // been extracted to a paired A-row ClipSpec — opening the decoder here
-    // would push duplicate PCM into the FIFO alongside the A-row clip's audio.
     if !clip.skip_audio {
         if let Some(asi) = audio_stream_idx {
             let ast = ictx.stream(asi).unwrap();
             in_audio_tb = ast.time_base();
-            // Soft-fail: a corrupt/unsupported audio stream should not abort the
-            // entire encode; video will still be processed correctly.
             match codec::context::Context::from_parameters(ast.parameters()) {
                 Ok(ctx) => match ctx.decoder().audio() {
                     Ok(dec) => { audio_decoder = Some(dec); }
@@ -1088,46 +1331,16 @@ fn encode_clip(
         }
     }
 
-    // ── Display dimensions (visible pixels, no macroblock padding) ───────────
-    // AVFrame.width/height (decoded.*) are the *coded* dimensions — H.264/H.265
-    // pads the frame height to the next multiple of 16 for macroblock alignment
-    // (e.g. 1920×1088 for a 1080p clip). AVCodecParameters.width/height are the
-    // *display* dimensions (1920×1080). Feeding the coded height to sws_scale
-    // causes it to include the black padding rows in the output, producing
-    // visible letterboxing even when source and output share the same DAR.
     let (src_display_w, src_display_h) = {
         let stream = ictx.stream(video_stream_idx).unwrap();
         let params = stream.parameters();
         let w = params.width() as u32;
         let h = params.height() as u32;
-        // Paranoia: fall back to decoder context dims if the container is missing them.
         if w > 0 && h > 0 { (w, h) } else { (video_decoder.width(), video_decoder.height()) }
     };
 
-    // Seek to source_offset using a BACKWARD seek (max_ts constraint) so we
-    // always land on the keyframe BEFORE source_offset.
-    //
-    // WHY BACKWARD, NOT FORWARD:
-    //   A forward seek (seek_ts..) lands on the keyframe AT OR AFTER source_offset.
-    //   When source_offset falls mid-GOP — which is always the case for the clip
-    //   following a transition, because effective_B.source_offset = B.source_offset
-    //   + transition_secs — that forward keyframe may be several seconds away.
-    //   Every source frame between source_offset and that keyframe is then absent
-    //   from the decode stream.  The fps-conversion loop below interprets the gap
-    //   as a slow-motion source and REPEATS the first available frame to fill
-    //   the missing output slots, producing a freeze that lasts exactly as long
-    //   as the keyframe gap (up to a full GOP — 5–30 s in camera footage).
-    //
-    //   A backward seek instead lands on the keyframe BEFORE source_offset.
-    //   The pre-roll frames between that keyframe and source_offset are discarded
-    //   by the PTS filter (frame_pts_secs < clip.source_offset - half_frame),
-    //   so the first encoded frame is still correctly at source_offset.
-    //   No duplication, no freeze.
-    //
-    // Seek failure is a soft-fail: the PTS filter catches any pre-roll regardless.
     seek_to_secs(&mut ictx, clip.source_offset, "encode_clip");
 
-    // ── Format converters (deferred until first frame of each type) ───────────
     let mut video_scaler:    Option<CropScaler>          = None;
     let mut audio_resampler: Option<resampling::Context> = None;
 
@@ -1135,31 +1348,8 @@ fn encode_clip(
     let ost_tb     = octx.stream(0).unwrap().time_base();
     let half_frame = 0.5 / spec.fps as f64;
 
-    // ── Packet loop ───────────────────────────────────────────────────────────
-    // packets() yields Result<(Stream, Packet), Error> — always destructure with ?.
-    //
-    // IMPORTANT: we do NOT break the demuxer loop the moment a decoded frame
-    // hits clip_end.  H.264 B-frames are delivered in display (PTS) order, which
-    // differs from decode (DTS) order.  When the first frame with pts >= clip_end
-    // emerges from the decoder, its reorder buffer may still hold earlier-PTS
-    // B-frames that are waiting for a later reference packet.  Breaking the
-    // demuxer loop here deprives those frames of their reference data;
-    // send_eof then forces them out incomplete and libavcodec drops them —
-    // causing the last ~0.5-1 s of each clip to be missing, which manifests
-    // as a freeze at clip boundaries and at the very end of the export.
-    //
-    // Fix: `video_clip_done` stops *encoding* output once we've seen a frame
-    // at/past clip_end, but the demuxer loop continues so all in-flight
-    // B-frames can receive their reference packets.  The decoder is flushed
-    // properly by the send_eof block below.  Audio packets continue to drive
-    // the FIFO normally regardless of video_clip_done.
-    // Capture output frame index at start of this clip for fps-conversion mapping.
     let clip_start_frame_idx = out_frame_idx;
-
     let mut video_clip_done = false;
-    // DTS monotonicity guard — passed in from run_encode so it persists across
-    // clips and into the final encoder flush.
-    // first_pts_logged is still local since it resets per clip.
     let mut first_pts_logged = false;
 
     for result in ictx.packets() {
@@ -1174,15 +1364,10 @@ fn encode_clip(
 
         // ── Video packet ──────────────────────────────────────────────────────
         if sidx == video_stream_idx {
-            // ALWAYS feed the decoder every packet, even after video_clip_done.
-            // B-frames near clip_end (PTS) may depend on I/P packets that arrive
-            // after clip_end in DTS order.  Stopping send_packet early starves
-            // the decoder of those reference packets and silently drops frames.
             video_decoder.send_packet(&packet)
                 .map_err(|e| format!("send video packet to decoder: {e}"))?;
 
             if video_clip_done {
-                // Drain decoder output to prevent EAGAIN on next send_packet.
                 let mut _discard = VideoFrame::empty();
                 while video_decoder.receive_frame(&mut _discard).is_ok() {}
                 continue;
@@ -1194,11 +1379,8 @@ fn encode_clip(
                     .map(|pts| pts as f64 * f64::from(in_video_tb))
                     .unwrap_or(0.0);
 
-                // Skip pre-roll frames before the clip's trim in-point.
                 if frame_pts_secs < clip.source_offset - half_frame { continue; }
 
-                // Log the first frame that passes the seek/pre-roll filter so we
-                // can verify the seek landed accurately.
                 if !first_pts_logged {
                     eprintln!(
                         "[encode] first decoded PTS after seek: {frame_pts_secs:.4}s \
@@ -1208,17 +1390,11 @@ fn encode_clip(
                     first_pts_logged = true;
                 }
 
-                // Past the out-point: stop encoding output and stop feeding
-                // the decoder, but do NOT break the demuxer loop so audio
-                // packets can still reach the FIFO.
                 if frame_pts_secs >= clip_end {
                     video_clip_done = true;
                     continue;
                 }
 
-                // Initialise center-crop scaler on the first valid frame.
-                // Uses display dimensions (not coded) to exclude macroblock padding.
-                // When source AR matches output AR the crop rect is the full frame.
                 let sc = video_scaler.get_or_insert_with(|| {
                     CropScaler::build(
                         decoded.format(), src_display_w, src_display_h,
@@ -1229,17 +1405,11 @@ fn encode_clip(
                 let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
                 sc.run(&decoded, &mut yuv)?;
 
-                // swscale inherits source SAR; override to 1:1.
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
 
-                // ── Frame-rate conversion ─────────────────────────────────────
-                // Map source timestamp to output frame slot.  When source fps <
-                // output fps (e.g. 24→30) a source frame covers multiple output
-                // slots; duplicate it to fill them.  When source fps > output fps,
-                // the slot is already covered; skip.
                 let src_rel_secs = (frame_pts_secs - clip.source_offset).max(0.0);
                 let target_out_pts = clip_start_frame_idx
                     + (src_rel_secs * spec.fps as f64).round() as i64;
@@ -1248,8 +1418,7 @@ fn encode_clip(
                     loop {
                         yuv.set_pts(Some(out_frame_idx));
 
-                        video_encoder.send_frame(&yuv)
-                            .map_err(|e| format!("send video frame to encoder: {e}"))?;
+                        send_video_frame(&yuv, video_encoder, hw_frames_ctx, hw_backend)?;
 
                         let mut pkt = Packet::empty();
                         while video_encoder.receive_packet(&mut pkt).is_ok() {
@@ -1295,7 +1464,6 @@ fn encode_clip(
         // ── Audio packet ──────────────────────────────────────────────────────
         else if Some(sidx) == audio_stream_idx {
             if let Some(ref mut adec) = audio_decoder {
-                // Soft-fail: a bad audio packet should not abort the encode.
                 if adec.send_packet(&packet).is_err() { continue; }
 
                 let mut raw = AudioFrame::empty();
@@ -1304,29 +1472,9 @@ fn encode_clip(
                         .map(|pts| pts as f64 * f64::from(in_audio_tb))
                         .unwrap_or(0.0);
 
-                    // Discard pre-roll audio (before the clip's in-point).
-                    // Use a slightly generous window (-0.05 s) to avoid silencing
-                    // audio frames that span the exact trim boundary.
                     if pts_secs < clip.source_offset - 0.05 { continue; }
-
-                    // Hard-cut audio at clip_end.
-                    //
-                    // drain_fifo() is called eagerly on every decoded audio frame,
-                    // so any audio past clip_end gets encoded and written to the
-                    // output file immediately — before the post-encode trim block
-                    // in run_encode even runs.  For a source file that extends 2 s
-                    // past clip_end (~88 k samples), drain_fifo would write ~86
-                    // full AAC frames that can never be un-written; the trim block
-                    // can only remove the ≤1023 leftover FIFO samples.
-                    //
-                    // A partial encoder frame (≤1023 samples) naturally stays in
-                    // the FIFO and carries over into the next clip — that is the
-                    // only carry-over needed for a seamless audio timeline.
                     if pts_secs >= clip_end { continue; }
 
-                    // Resample to FLTP stereo 44100 if the source differs in any way.
-                    // The resampler is created lazily on the first audio frame so we
-                    // know the real input format before building the SwrContext.
                     let target_fmt = Sample::F32(SampleType::Planar);
                     let raw_channels = raw.ch_layout().channels();
                     let needs_resample = raw.format()  != target_fmt
@@ -1335,8 +1483,6 @@ fn encode_clip(
 
                     if needs_resample {
                         let rs = audio_resampler.get_or_insert_with(|| {
-                            // Mono sources must be declared as MONO or swr will
-                            // misinterpret the channel layout.
                             let src_layout = if raw.ch_layout().channels() >= 2 {
                                 raw.ch_layout()
                             } else {
@@ -1356,8 +1502,6 @@ fn encode_clip(
                         audio_state.fifo.push_scaled(&raw, clip.volume as f32);
                     }
 
-                    // Drain full frames from the FIFO immediately so we don't
-                    // accumulate an unbounded buffer across long clips.
                     audio_state.drain_fifo(octx, false)?;
                 }
             }
@@ -1365,13 +1509,6 @@ fn encode_clip(
     }
 
     // ── Drain video decoder at clip end ───────────────────────────────────────
-    // After the demuxer loop the decoder may still hold B-frames in its reorder
-    // buffer (frames whose reference packets arrived but which haven't been
-    // output yet).  send_eof flushes them.  Because the demuxer loop above
-    // continued past clip_end (via the video_clip_done flag) all reference
-    // packets were delivered, so these flushed frames are complete.
-    // Frames with pts >= clip_end are discarded here — they belong to a future
-    // GOP and must not pollute the output timeline.
     video_decoder.send_eof()
         .map_err(|e| format!("send EOF to video decoder '{}': {e}", clip.path.display()))?;
     let mut decoded = VideoFrame::empty();
@@ -1388,15 +1525,13 @@ fn encode_clip(
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
-                // Same fps-conversion logic as the main packet loop.
                 let src_rel_secs = (pts_secs - clip.source_offset).max(0.0);
                 let target_out_pts = clip_start_frame_idx
                     + (src_rel_secs * spec.fps as f64).round() as i64;
                 if target_out_pts >= out_frame_idx {
                     loop {
                         yuv.set_pts(Some(out_frame_idx));
-                        video_encoder.send_frame(&yuv)
-                            .map_err(|e| format!("send decoder-flush frame to encoder: {e}"))?;
+                        send_video_frame(&yuv, video_encoder, hw_frames_ctx, hw_backend)?;
                         let mut pkt = Packet::empty();
                         while video_encoder.receive_packet(&mut pkt).is_ok() {
                             pkt.set_stream(0);
@@ -1434,14 +1569,11 @@ fn encode_clip(
         let _ = adec.send_eof();
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
-            // Same clip_end ceiling as the packet loop — decoder-buffered frames
-            // can also extend past clip_end if the source file continues.
             let pts_secs = raw.pts()
                 .map(|pts| pts as f64 * f64::from(in_audio_tb))
                 .unwrap_or(0.0);
             if pts_secs >= clip_end { break; }
 
-            // Same resample path as the packet loop above.
             let target_fmt = Sample::F32(SampleType::Planar);
             let raw_channels = raw.ch_layout().channels();
             let needs_resample = raw.format()  != target_fmt
@@ -1459,21 +1591,25 @@ fn encode_clip(
                 audio_state.fifo.push_scaled(&raw, clip.volume as f32);
             }
         }
+
+        // ── Resampler tail flush (1080p audio dropout fix) ────────────────────
+        // After decoder EOF the SwrContext may hold a partial output block that
+        // was never emitted because it was waiting for more input. Flush it now
+        // by sending a null input frame. Without this, the tail ~20 ms per clip
+        // is silently discarded, causing audible audio gaps at higher resolutions
+        // where the encode thread is slower relative to the audio decode rate.
+        if let Some(ref mut rs) = audio_resampler {
+            flush_audio_resampler(rs, &mut audio_state.fifo, clip.volume);
+        }
+
         audio_state.drain_fifo(octx, false)?;
     }
 
     Ok(out_frame_idx)
 }
+
 // ── Crossfade helpers ─────────────────────────────────────────────────────────
 
-/// Decode all video frames from `clip` into packed YUV420P byte vectors.
-///
-/// Each entry in the returned Vec is one frame's worth of YUV420P data laid out
-/// as: [Y plane (w×h)] ++ [U plane (w/2 × h/2)] ++ [V plane (w/2 × h/2)].
-/// Strides are removed — each row is packed tightly to exactly `w` (or `w/2`) bytes.
-///
-/// Used by apply_transition to collect the tail frames of clip A and head frames
-/// of clip B before blending them.
 fn decode_clip_frames(
     clip: &ClipSpec,
     spec: &EncodeSpec,
@@ -1502,8 +1638,6 @@ fn decode_clip_frames(
     let mut video_decoder = vdec_ctx.decoder().video()
         .map_err(|e| format!("crossfade open video decoder: {e}"))?;
 
-    // Backward seek: land on the keyframe BEFORE source_offset so we never miss
-    // frames in the transition window. See seek_to_secs for the full rationale.
     seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
 
     let mut video_scaler: Option<CropScaler> = None;
@@ -1549,7 +1683,6 @@ fn decode_clip_frames(
         }
     }
 
-    // Flush decoder tail
     let _ = video_decoder.send_eof();
     let mut decoded = VideoFrame::empty();
     while video_decoder.receive_frame(&mut decoded).is_ok() {
@@ -1569,18 +1702,6 @@ fn decode_clip_frames(
     Ok(frames)
 }
 
-/// Decode audio from `clip` into flat left/right FLTP sample vecs at 44 100 Hz,
-/// covering `[source_offset, source_offset + duration)`.
-///
-/// Called by `apply_transition` to supply PCM for the cross-fade window so audio
-/// is not silent during transitions.  Without this, `encode_clip` cuts audio off
-/// at clip_end and the FIFO is nearly empty while `apply_transition` runs, producing
-/// near-silence for `transition_secs` seconds and shifting all of clip B's audio
-/// forward by that amount.
-///
-/// Volume gain (`clip.volume`) is applied and samples are clamped to [-1.0, 1.0].
-/// Soft-fails: missing audio stream → empty vecs (silence carried through);
-/// corrupt packets are skipped rather than aborting the encode.
 fn decode_clip_audio(
     clip: &ClipSpec,
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
@@ -1589,7 +1710,7 @@ fn decode_clip_audio(
 
     let audio_stream_idx = match ictx.streams().best(MediaType::Audio) {
         Some(s) => s.index(),
-        None    => return Ok((Vec::new(), Vec::new())), // no audio track — silence
+        None    => return Ok((Vec::new(), Vec::new())),
     };
 
     let ast         = ictx.stream(audio_stream_idx).unwrap();
@@ -1608,7 +1729,6 @@ fn decode_clip_audio(
     let mut left  = Vec::<f32>::new();
     let mut right = Vec::<f32>::new();
 
-    // Inner helper: append one decoded/resampled FLTP stereo frame into left/right vecs.
     fn push_frame(frame: &AudioFrame, vol: f32, left: &mut Vec<f32>, right: &mut Vec<f32>) {
         let n = frame.samples();
         if n == 0 { return; }
@@ -1628,7 +1748,7 @@ fn decode_clip_audio(
             .map_err(|e| format!("transition audio read packet: {e}"))?;
         if stream.index() != audio_stream_idx { continue; }
 
-        if adec.send_packet(&packet).is_err() { continue; } // soft-fail on bad packet
+        if adec.send_packet(&packet).is_err() { continue; }
 
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
@@ -1665,7 +1785,6 @@ fn decode_clip_audio(
         }
     }
 
-    // Flush decoder tail — same clip_end ceiling as the packet loop.
     let _ = adec.send_eof();
     let mut raw = AudioFrame::empty();
     while adec.receive_frame(&mut raw).is_ok() {
@@ -1691,31 +1810,40 @@ fn decode_clip_audio(
         }
     }
 
+    // Flush resampler tail (same fix as encode_clip).
+    if let Some(ref mut rs) = audio_resampler {
+        let n_buffered = unsafe { ffmpeg::ffi::swr_get_delay(rs.as_mut_ptr(), AUDIO_RATE as i64) };
+        if n_buffered > 0 {
+            let mut tmp_frame = AudioFrame::new(
+                Sample::F32(SampleType::Planar), 4096, ChannelLayoutMask::STEREO);
+            tmp_frame.set_rate(AUDIO_RATE as u32);
+            unsafe {
+                let n_out = ffmpeg::ffi::swr_convert(
+                    rs.as_mut_ptr(),
+                    (*tmp_frame.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                    4096,
+                    std::ptr::null_mut(), 0,
+                );
+                if n_out > 0 {
+                    (*tmp_frame.as_mut_ptr()).nb_samples = n_out;
+                    push_frame(&tmp_frame, clip.volume, &mut left, &mut right);
+                }
+            }
+        }
+    }
+
     Ok((left, right))
 }
 
-/// Encode the blended frames between `tail_spec` (end of clip A) and
-/// `head_spec` (start of clip B) using the provided `VideoTransition` impl.
-///
-/// Steps:
-///   1. Decode all frames from both specs into packed YUV420P.
-///   2. For each frame pair compute alpha via frame_alpha(i, n) and delegate
-///      blending entirely to `transition.apply()` — no blend math lives here.
-///   3. Encode each blended frame into octx, advancing `out_frame_idx`.
-///   4. Drain the audio FIFO after each video frame (audio carries over naturally
-///      from clip A's tail that was pushed during encode_clip).
-///
-/// Generic over any `VideoTransition` — adding a new transition type requires
-/// no changes to this function.
-///
-/// Returns the next unused `out_frame_idx`.
 fn apply_transition(
     transition:    &dyn VideoTransition,
     tail_spec:     &ClipSpec,
     head_spec:     &ClipSpec,
     spec:          &EncodeSpec,
     octx:          &mut ffmpeg::format::context::Output,
-    video_encoder: &mut ffmpeg::encoder::video::Video,
+    video_encoder: &mut ffmpeg::encoder::Video,
+    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend:    HwBackend,
     audio_state:   &mut AudioEncState,
     mut out_frame_idx: i64,
     total_frames:  u64,
@@ -1727,18 +1855,9 @@ fn apply_transition(
     let tail_frames = decode_clip_frames(tail_spec, spec)?;
     let head_frames = decode_clip_frames(head_spec, spec)?;
 
-    // Decode PCM for both sides of the transition so we can cross-fade audio in
-    // lockstep with the video blend.  encode_clip intentionally cuts its audio off
-    // at clip_end (to avoid writing un-un-writable AAC frames), so the FIFO is
-    // nearly empty when we arrive here.  Without these decoded buffers the output
-    // has near-silence for the full transition_secs window, which also shifts every
-    // subsequent clip B's audio later by that amount.
     let (tail_audio_l, tail_audio_r) = decode_clip_audio(tail_spec)?;
     let (head_audio_l, head_audio_r) = decode_clip_audio(head_spec)?;
 
-    // Exact rational samples-per-video-frame at the output rate.
-    // Using f64 accumulation (sample_start/end via round) avoids integer drift
-    // that would otherwise accumulate 1–2 samples per frame over long transitions.
     let samples_per_frame_f = AUDIO_RATE as f64 / spec.fps as f64;
 
     let n = tail_frames.len().min(head_frames.len());
@@ -1757,9 +1876,6 @@ fn apply_transition(
             return Err("cancelled".into());
         }
 
-        // alpha goes from just above 0 to just below 1 — no pure A or pure B frame
-        // (those are handled by encode_clip on each side).
-        // Easing is the transition impl's responsibility.
         let alpha   = velocut_core::transitions::helpers::frame_alpha(i, n);
         let blended = transition.apply(
             &tail_frames[i],
@@ -1778,19 +1894,12 @@ fn apply_transition(
 
         write_yuv(&blended, &mut yuv, w, h, uv_w, uv_h);
 
-        video_encoder.send_frame(&yuv)
-            .map_err(|e| format!("transition encode frame: {e}"))?;
+        send_video_frame(&yuv, video_encoder, hw_frames_ctx, hw_backend)?;
 
         let mut pkt = Packet::empty();
         while video_encoder.receive_packet(&mut pkt).is_ok() {
             pkt.set_stream(0);
             pkt.rescale_ts(frame_tb, ost_tb);
-            // DTS monotonicity guard — same as encode_clip.
-            // The H.264 encoder's B-frame reorder buffer spans the encode_clip →
-            // apply_transition → encode_clip boundaries, so delayed B-frame packets
-            // from the previous clip can emerge here with non-monotonic DTS values.
-            // Without clamping, write_interleaved rejects the packet and the player
-            // stalls at the transition point.
             let raw_dts = pkt.dts().unwrap_or(0);
             if *last_video_dts != i64::MIN {
                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
@@ -1809,10 +1918,6 @@ fn apply_transition(
                 .map_err(|e| format!("transition write packet: {e}"))?;
         }
 
-        // Cross-fade audio for this video frame and push it into the FIFO before
-        // draining.  The sample range for frame i is [round(i*spf), round((i+1)*spf)).
-        // Using .get().copied().unwrap_or(0.0) gracefully handles the case where
-        // decoded audio is slightly shorter than the video (source edge cases).
         let sample_start = (i       as f64 * samples_per_frame_f).round() as usize;
         let sample_end   = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
         let af = alpha as f32;
@@ -1825,7 +1930,6 @@ fn apply_transition(
             audio_state.fifo.right.push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
         }
 
-        // Drain full AAC frames now that this video frame's audio has been pushed.
         audio_state.drain_fifo(octx, false)?;
 
         out_frame_idx += 1;
