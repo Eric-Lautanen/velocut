@@ -72,6 +72,11 @@ pub struct VeloCutApp {
     /// the very first frame. Runs exactly once per process lifetime.
     startup_size_checked: bool,
 
+    /// True once fix_taskbar_icon() has been called from update().
+    /// Must be deferred to update() — new() runs before the OS window exists,
+    /// so EnumThreadWindows finds nothing to patch if called there.
+    taskbar_icon_fixed: bool,
+
     /// Set to true by ClearProject and checked in save() and on_exit().
     ///
     /// eframe calls save() automatically after the export_module deletes the
@@ -94,11 +99,10 @@ impl VeloCutApp {
             o.theme_preference = egui::ThemePreference::Dark;
         });
 
-        // Fix taskbar icon: WS_POPUP (from with_decorations(false)) doesn't get
-        // WS_EX_APPWINDOW automatically — the shell omits or icon-strips the button.
-        // fix_taskbar_icon() enumerates windows on this thread and patches the style.
-        // No rwh import needed; see main.rs for implementation.
-        crate::fix_taskbar_icon();
+        // fix_taskbar_icon() is intentionally NOT called here.
+        // new() is the app factory — it runs before the OS window is created,
+        // so EnumThreadWindows would find nothing to patch. The call is deferred
+        // to the first update() frame via the taskbar_icon_fixed flag.
 
         let state = cc.storage
             .and_then(|s| eframe::get_value::<AppStorage>(s, eframe::APP_KEY))
@@ -127,6 +131,7 @@ impl VeloCutApp {
             undo_stack:   VecDeque::new(),
             redo_stack:   VecDeque::new(),
             startup_size_checked: false,
+            taskbar_icon_fixed:   false,
             reset_done:           false,
             memory_manager,
         }
@@ -726,6 +731,14 @@ impl eframe::App for VeloCutApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Taskbar icon fix (Windows only, fires once) ───────────────────────
+        // Must run from update(), not new() — the OS window doesn't exist yet
+        // when new() is called, so EnumThreadWindows finds nothing to patch there.
+        if !self.taskbar_icon_fixed {
+            crate::fix_taskbar_icon();
+            self.taskbar_icon_fixed = true;
+        }
+
         // ── Startup size guard ────────────────────────────────────────────────
         // eframe restores persisted window geometry. If a previous run left the
         // window at tiny/zero dimensions (e.g. the resizable-panel bug), we snap

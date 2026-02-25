@@ -74,7 +74,12 @@ fn load_icon() -> egui::IconData {
 #[cfg(target_os = "windows")]
 pub fn fix_taskbar_icon() {
     const GWL_EXSTYLE:     i32   = -20;
+    const GCL_HICON:       i32   = -14; // large icon stored on the window class by eframe
+    const GCL_HICONSM:     i32   = -34; // small icon stored on the window class by eframe
     const WS_EX_APPWINDOW: isize = 0x0004_0000;
+    const WM_SETICON:       u32  = 0x0080;
+    const ICON_SMALL:      usize = 0;
+    const ICON_BIG:        usize = 1;
 
     extern "system" {
         fn GetCurrentThreadId() -> u32;
@@ -85,13 +90,32 @@ pub fn fix_taskbar_icon() {
         ) -> i32;
         fn GetWindowLongPtrW(hwnd: isize, n_index: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: isize, n_index: i32, new_val: isize) -> isize;
+        fn GetClassLongPtrW(hwnd: isize, n_index: i32) -> usize;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     }
 
     // Callback invoked by EnumThreadWindows for each window on the thread.
-    // Patches WS_EX_APPWINDOW onto every window it visits (there will be one).
+    // 1. Patches WS_EX_APPWINDOW so the shell gives us a taskbar button.
+    // 2. Reads the HICON that eframe stored on the window *class* (via with_icon())
+    //    and sends WM_SETICON to bind it to the window *instance* explicitly.
+    //    Without step 2, WS_POPUP windows show the generic exe icon in the taskbar
+    //    even though the class icon is set correctly.
     unsafe extern "system" fn patch_one(hwnd: isize, _param: isize) -> i32 {
+        // Step 1 — extended style
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
+
+        // Step 2 — propagate class icons to the window instance so the taskbar
+        //           and alt-tab switcher display the correct icon.
+        let hicon_big = GetClassLongPtrW(hwnd, GCL_HICON);
+        if hicon_big != 0 {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big as isize);
+        }
+        let hicon_sm = GetClassLongPtrW(hwnd, GCL_HICONSM);
+        if hicon_sm != 0 {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_sm as isize);
+        }
+
         1 // non-zero = continue enumeration
     }
 
