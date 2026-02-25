@@ -10,7 +10,7 @@
 //     PROGRESS_INTERVAL frames and EncodeError / EncodeDone on exit.
 //
 // Stream layout in the output MP4:
-//   Stream 0 — H.264 video (YUV420P, CRF 18, preset fast, or HW equivalent)
+//   Stream 0 — H.264 video (YUV420P, CRF 18, preset medium, or HW equivalent)
 //   Stream 1 — AAC audio  (FLTP stereo, 44100 Hz, 128 kbps)
 //
 // Hardware encoding:
@@ -123,13 +123,14 @@ pub struct EncodeSpec {
 
 /// Result of the startup hardware encoder probe.
 ///
-/// The UI reads this to decide which resolution options to offer.
-/// SW-only machines are capped at 1080p — above that libx264 is too slow
-/// and will stall the machine for several minutes per minute of footage.
+/// The UI reads this to decide which resolution options to annotate.
+/// SW-only machines can encode at any resolution — higher resolutions
+/// will be slower but the encode thread is throttled (priority + thread
+/// cap) so the system stays responsive throughout.
 #[derive(Debug, Clone)]
 pub struct HwEncodeCapabilities {
     /// True when no HW encoder is available and libx264 will be used.
-    /// 2K and 4K are disabled in the UI when this is true.
+    /// The UI shows an informational note but does not restrict resolutions.
     pub sw_only:      bool,
     /// Human-readable name of the winning backend, e.g. "AMF", "NVENC",
     /// "VAAPI", "VideoToolbox", or "Software (libx264)".
@@ -172,7 +173,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
         return HwEncodeCapabilities { sw_only: false, backend_name: "VideoToolbox" };
     }
 
-    eprintln!("[encode] probe: no HW encoder available — SW only, 2K/4K disabled");
+    eprintln!("[encode] probe: no HW encoder available — SW only, 2K/4K throttled (not disabled)");
     HwEncodeCapabilities { sw_only: true, backend_name: "Software (libx264)" }
 }
 
@@ -761,10 +762,24 @@ fn open_software_encoder(
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
+    // Cap libx264 to half the logical CPU count so the encoder never saturates
+    // every core.  The OS schedules UI, audio, and scrub-decode threads on the
+    // remaining cores; the encode runs at a reduced but consistent pace without
+    // making the system unresponsive.  Minimum 1 thread; falls back to 2 if
+    // available_parallelism() fails (e.g. inside a restricted sandbox).
+    let thread_cap = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(2);
+
     let mut opts = ffmpeg::Dictionary::new();
-    opts.set("crf",    "18");
-    opts.set("preset", "fast");
-    opts.set("g",      &fps.to_string());
+    opts.set("crf",     "18");
+    // "medium" is more CPU-efficient per thread than "fast" — it does more work
+    // per encode pass, so the total core-seconds consumed for equivalent quality
+    // is lower.  Combined with the thread cap above, this keeps peak CPU usage
+    // manageable at 2K/4K on a laptop without a hardware encoder.
+    opts.set("preset",  "medium");
+    opts.set("threads", &thread_cap.to_string());
+    opts.set("g",       &fps.to_string());
 
     enc.open_as_with(h264, opts)
         .map_err(|e| format!("open H.264 encoder: {e}"))

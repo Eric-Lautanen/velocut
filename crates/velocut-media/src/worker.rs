@@ -3,6 +3,9 @@
 // MediaWorker: owns the frame-request slot and playback decode thread.
 // All public API that velocut-ui calls lives here.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern crate libc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
@@ -949,6 +952,43 @@ impl MediaWorker {
                     msg: "worker shutting down".into(),
                 });
                 return;
+            }
+
+            // Lower the encode thread's OS scheduling priority so the UI,
+            // audio, and scrub-decode threads are never starved.  The encoder
+            // still runs as fast as the CPU allows when nothing else competes,
+            // but yields the moment any higher-priority thread needs a core.
+            // Combined with the libx264 thread cap in open_software_encoder,
+            // this prevents system lockups during 2K/4K CPU encodes.
+            #[cfg(windows)]
+            {
+                extern "system" {
+                    fn GetCurrentThread() -> *mut core::ffi::c_void;
+                    fn SetThreadPriority(
+                        hThread:   *mut core::ffi::c_void,
+                        nPriority: i32,
+                    ) -> i32;
+                }
+                // THREAD_PRIORITY_BELOW_NORMAL = -1: yields to normal-priority
+                // threads (UI, audio) but still outranks idle/background work.
+                // THREAD_PRIORITY_LOWEST (-2) is too aggressive and makes even
+                // 1080p SW encodes feel glacially slow.
+                const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+                unsafe {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+            }
+
+            // Linux + macOS: nice(10) lowers the encode thread's scheduler
+            // priority relative to normal (0). Range is 0–19; 10 is a
+            // well-established middle ground for background CPU work — the
+            // encode runs full-speed when cores are idle but yields
+            // immediately to the UI, audio, and scrub-decode threads.
+            // nice() applies to the calling thread on Linux (via NPTL) and
+            // to the calling thread on macOS; it does not affect the process.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            unsafe {
+                libc::nice(10);
             }
 
             encode_timeline(spec, cancel, tx);

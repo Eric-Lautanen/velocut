@@ -43,7 +43,6 @@ use eframe::egui;
 use velocut_core::state::ProjectState;
 use crate::context::{AppContext, CacheContext};
 use crate::velocut_log;
-use std::collections::HashMap;
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
@@ -151,6 +150,17 @@ impl MemoryManager {
         let play_changed  = state.is_playing != self.prev_playing;
         let clips_changed = state.library.len() != self.prev_clip_count;
 
+        // An encode in progress counts as continuous activity — Stage 2 must
+        // never fire during an encode because replacing egui::Memory would wipe
+        // the encode modal's internal UI state mid-progress.
+        let encoding = state.encode_job.is_some()
+            && state.encode_done.is_none()
+            && state.encode_error.is_none();
+
+        // Encode finishing (done or error) resets the idle clock so the timer
+        // starts fresh from the moment the user comes back to check the result.
+        let encode_finished = state.encode_done.is_some() || state.encode_error.is_some();
+
         if time_moved {
             // Playhead moved — reset scrub idle timer and re-arm both stages
             // so the next idle period fires fresh.
@@ -159,7 +169,7 @@ impl MemoryManager {
             self.deep_flush_done = false;
         }
 
-        if time_moved || play_changed || clips_changed {
+        if time_moved || play_changed || clips_changed || encoding || encode_finished {
             self.last_activity   = Instant::now();
             self.deep_flush_done = false;
         }
@@ -203,10 +213,20 @@ impl MemoryManager {
     fn deep_flush(&self, cache: &mut CacheContext, ctx: &egui::Context) {
         let buckets_before = cache.frame_bucket_cache.len();
 
-        cache.frame_cache        = HashMap::new();
-        cache.frame_bucket_cache = HashMap::new();
+        // Use .clear() rather than = HashMap::new() to retain the heap allocation —
+        // avoids a pointless dealloc+realloc on the next project open (same rationale
+        // as CacheContext::clear_all() in context.rs).
+        cache.frame_cache.clear();
+        cache.frame_bucket_cache.clear();
         cache.frame_cache_bytes  = 0;
         cache.pending_pb_frame   = None;
+
+        // scrub_textures holds one persistent GPU TextureHandle per scrubbed clip.
+        // It is intentionally kept alive during Stage 1 (so short seeks after idle
+        // still hit the GPU texture without reallocating), but at 30s deep idle there
+        // is no reason to hold those GPU allocations any longer.
+        let textures_before = cache.scrub_textures.len();
+        cache.scrub_textures.clear();
 
         ctx.forget_all_images();
 
@@ -217,8 +237,8 @@ impl MemoryManager {
         });
 
         velocut_log!(
-            "[memory] deep idle flush: evicted {} frame buckets + egui memory",
-            buckets_before
+            "[memory] deep idle flush: evicted {} frame buckets, {} scrub textures + egui memory",
+            buckets_before, textures_before
         );
     }
 }

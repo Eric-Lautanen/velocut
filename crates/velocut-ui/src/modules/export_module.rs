@@ -89,11 +89,6 @@ impl QualityPreset {
         }
     }
 
-    /// Returns true if this preset requires a GPU (HW encoder) to run safely.
-    fn requires_hw(self) -> bool {
-        matches!(self, QualityPreset::QHD1440 | QualityPreset::UHD4K)
-    }
-
     /// Compute (width, height) for a given aspect ratio.
     ///
     /// The short side is always `self.short_side()` pixels. The long side is
@@ -539,11 +534,6 @@ impl ExportModule {
         let sw_only = hw_caps.sw_only;
         let backend_name = hw_caps.backend_name;
 
-        // If the user somehow had a HW-only preset selected and HW is now gone,
-        // reset to 1080p to avoid a stale selection being passed to the encoder.
-        if sw_only && self.quality.requires_hw() {
-            self.quality = QualityPreset::FHD1080;
-        }
         // Resolve the effective aspect ratio and its f32 value for dimension math.
         let effective_ar    = self.export_aspect.unwrap_or(state.aspect_ratio);
         let effective_ratio = aspect_ratio_value(effective_ar);
@@ -625,40 +615,41 @@ impl ExportModule {
                         QualityPreset::QHD1440,
                         QualityPreset::UHD4K,
                     ] {
-                        let disabled = sw_only && q.requires_hw();
-                        let (w, h)   = q.dimensions(effective_ratio);
-                        let label    = if disabled {
-                            format!("{}  — {w}×{h}  🔒", q.label())
+                        let high_res_sw = sw_only
+                            && matches!(q, QualityPreset::QHD1440 | QualityPreset::UHD4K);
+                        let (w, h) = q.dimensions(effective_ratio);
+                        let label  = if high_res_sw {
+                            format!("{}  — {w}×{h}  ⚠", q.label())
                         } else {
                             format!("{}  — {w}×{h}", q.label())
                         };
-                        let resp = ui.add_enabled(
-                            !disabled,
-                            egui::Button::selectable(self.quality == q, &label),
-                        );
+                        let resp = ui.add(egui::Button::selectable(self.quality == q, &label));
                         if resp.clicked() {
                             self.quality = q;
                         }
-                        if disabled {
+                        if high_res_sw {
                             resp.on_hover_text(format!(
-                                "Requires GPU acceleration\n\
-                                 Current encoder: {backend_name}\n\
-                                 2K and 4K are disabled on software-only encode\n\
-                                 to prevent long stalls on this machine."
+                                "CPU encode at this resolution will be slow.\n\
+                                 Encoder: {backend_name}\n\
+                                 The encode thread is throttled (priority + thread cap)\n\
+                                 so the system stays responsive — it will complete,\n\
+                                 just at a reduced pace."
                             ));
                         }
                     }
                 });
         });
 
-        // Show the resolved pixel dimensions below the ComboBox as a hint.
-        // Also show a warning if SW-only so users understand the cap.
+        // Show an informational note when SW encoding so users know 2K/4K
+        // will be slow but won't freeze the system.
         if sw_only {
             ui.add_space(2.0);
             ui.label(
-                RichText::new(format!("⚠ GPU encode unavailable ({backend_name}) — max 1080p"))
-                    .size(10.0)
-                    .color(Color32::from_rgb(220, 160, 60)),
+                RichText::new(format!(
+                    "ℹ CPU encode ({backend_name}) — 2K/4K available, runs slower"
+                ))
+                .size(10.0)
+                .color(Color32::from_rgb(140, 180, 220)),
             );
         }
 
