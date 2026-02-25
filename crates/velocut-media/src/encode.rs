@@ -158,15 +158,27 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     eprintln!("[encode] probing HW encode capabilities...");
 
     // AMF — D3D11, Windows (AMD/Intel/discrete NVIDIA via AMF runtime)
-    if encoder::find_by_name("h264_amf").is_some() && probe_d3d11_device(128, 128) {
-        eprintln!("[encode] probe: AMF available");
-        return HwEncodeCapabilities { sw_only: false, backend_name: "AMF" };
+    if encoder::find_by_name("h264_amf").is_some() {
+        if probe_d3d11_device(128, 128) {
+            eprintln!("[encode] probe: AMF available");
+            return HwEncodeCapabilities { sw_only: false, backend_name: "AMF" };
+        } else {
+            eprintln!("[encode] probe: h264_amf found but D3D11 device init failed — skipping AMF");
+        }
+    } else {
+        eprintln!("[encode] probe: h264_amf not found in FFmpeg build — recompile with --enable-encoder=h264_amf for AMD/Intel GPU support");
     }
 
     // NVENC — CUDA, Windows/Linux
-    if encoder::find_by_name("h264_nvenc").is_some() && probe_cuda_device(128, 128) {
-        eprintln!("[encode] probe: NVENC available");
-        return HwEncodeCapabilities { sw_only: false, backend_name: "NVENC" };
+    if encoder::find_by_name("h264_nvenc").is_some() {
+        if probe_cuda_device(128, 128) {
+            eprintln!("[encode] probe: NVENC available");
+            return HwEncodeCapabilities { sw_only: false, backend_name: "NVENC" };
+        } else {
+            eprintln!("[encode] probe: h264_nvenc found but CUDA device init failed — skipping NVENC");
+        }
+    } else {
+        eprintln!("[encode] probe: h264_nvenc not found in FFmpeg build — skipping NVENC");
     }
 
     // VAAPI — Linux (AMD/Intel)
@@ -1602,6 +1614,10 @@ fn run_encode(
                 }
 
                 output_frame_idx += 1;
+                // Yield to the OS scheduler after each blank frame on HW paths.
+                if hw_backend != HwBackend::Software {
+                    std::thread::yield_now();
+                }
 
                 // Pad silence into the FIFO so drain_fifo can mix the overlay tail.
                 let expected = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
@@ -1912,6 +1928,15 @@ fn encode_clip(
                         }
 
                         out_frame_idx += 1;
+                        // Yield to the OS scheduler after each frame on HW paths.
+                        // SW encoding is already throttled structurally (thread cap
+                        // at n_cores/2).  HW encoders offload to dedicated silicon
+                        // but the CPU decode+scale loop feeding them runs flat-out —
+                        // yield_now() lets UI, audio, and scrub threads run whenever
+                        // they're waiting, at zero cost when the system is idle.
+                        if hw_backend != HwBackend::Software {
+                            std::thread::yield_now();
+                        }
 
                         // Keep audio timeline in sync with video when this clip
                         // has no audio stream, or after the clip's audio has been
@@ -2058,6 +2083,15 @@ fn encode_clip(
                                 .map_err(|e| format!("decoder-flush write video packet: {e}"))?;
                         }
                         out_frame_idx += 1;
+                        // Yield to the OS scheduler after each frame on HW paths.
+                        // SW encoding is already throttled structurally (thread cap
+                        // at n_cores/2).  HW encoders offload to dedicated silicon
+                        // but the CPU decode+scale loop feeding them runs flat-out —
+                        // yield_now() lets UI, audio, and scrub threads run whenever
+                        // they're waiting, at zero cost when the system is idle.
+                        if hw_backend != HwBackend::Software {
+                            std::thread::yield_now();
+                        }
                         // Same silence-padding logic as the main packet loop.
                         if audio_decoder.is_none() || audio_has_started {
                             let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
@@ -2486,6 +2520,10 @@ fn apply_transition(
         audio_state.drain_fifo(octx, false)?;
 
         out_frame_idx += 1;
+        // Yield to the OS scheduler after each transition frame on HW paths.
+        if hw_backend != HwBackend::Software {
+            std::thread::yield_now();
+        }
 
         if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
             let _ = tx.send(MediaResult::EncodeProgress {

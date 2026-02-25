@@ -321,8 +321,11 @@ unsafe fn center_crop_and_scale(
     let nv12     = ffi::AVPixelFormat::AV_PIX_FMT_NV12     as i32;
     let yuv420p  = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P  as i32;
     let yuvj420p = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
+    // P010LE: D3D11VA output for 10-bit content (H.264 Hi10P, HEVC Main10, etc.).
+    // Same semi-planar layout as NV12 but 2 bytes per luma and chroma sample.
+    let p010le   = ffi::AVPixelFormat::AV_PIX_FMT_P010LE   as i32;
 
-    if fmt_i != nv12 && fmt_i != yuv420p && fmt_i != yuvj420p {
+    if fmt_i != nv12 && fmt_i != yuv420p && fmt_i != yuvj420p && fmt_i != p010le {
         return None; // unsupported — caller uses stretch fallback
     }
 
@@ -339,11 +342,19 @@ unsafe fn center_crop_and_scale(
     // NV12:    plane-0 = Y  (1 B/luma-px), plane-1 = UV interleaved (2 B per 2×2 block)
     //          → chroma stride is half-height; horiz offset equals luma horiz offset.
     //
+    // P010LE:  identical semi-planar layout to NV12 but 2 B/sample throughout,
+    //          so horizontal byte offset = crop_x * 2 for both Y and UV planes.
+    //
     // YUV420P: plane-0 = Y  (1 B/luma-px), plane-1 = U, plane-2 = V (quarter-size each)
     //          → chroma stride and offset are both halved in each axis.
     let (src_ptrs, src_strides): ([*const u8; 4], [i32; 4]) = if fmt_i == nv12 {
         let p0 = d0.add(crop_y as usize * s0 + crop_x as usize);
         let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize);
+        ([p0, p1, std::ptr::null(), std::ptr::null()],
+         [s0 as i32, s1 as i32, 0, 0])
+    } else if fmt_i == p010le {
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize * 2);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize * 2);
         ([p0, p1, std::ptr::null(), std::ptr::null()],
          [s0 as i32, s1 as i32, 0, 0])
     } else { // YUV420P / YUVJ420P
@@ -357,6 +368,7 @@ unsafe fn center_crop_and_scale(
     // Build a one-shot SwsContext from (crop_w × crop_h) → (dst_w × dst_h) RGBA.
     // SWS_BILINEAR = 2.
     let pixel_fmt = if fmt_i == nv12 { ffi::AVPixelFormat::AV_PIX_FMT_NV12 }
+                    else if fmt_i == p010le { ffi::AVPixelFormat::AV_PIX_FMT_P010LE }
                     else if fmt_i == yuv420p { ffi::AVPixelFormat::AV_PIX_FMT_YUV420P }
                     else { ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P };
 
@@ -564,6 +576,8 @@ impl LiveDecoder {
         // after a None return.
         const MAX_SKIP_PACKETS: usize = 60;
         let mut skip_packets = 0usize;
+        let tb_num = self.tb_num;
+        let tb_den = self.tb_den;
 
         for (stream, packet) in self.ictx.packets().flatten() {
             if stream.index() != self.video_idx { continue; }
@@ -578,7 +592,7 @@ impl LiveDecoder {
                     continue;
                 }
                 self.skip_until_pts = 0; // reached target — disable skip
-                let ts_secs = self.pts_to_secs(pts);
+                let ts_secs = pts as f64 * tb_num as f64 / tb_den as f64;
 
                 // Transfer GPU surface to CPU.  ensure_cpu_frame takes ownership of
                 // `decoded` by value, so reinitialise the outer binding immediately
