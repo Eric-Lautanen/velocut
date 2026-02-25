@@ -12,7 +12,8 @@
 ## Stack
 Rust desktop, Windows MINGW64, Cargo workspace.
 Deps: `eframe`/`egui` 0.33, `ffmpeg-the-third` 4 (fork `eric-lautanen/velocut-ffmpeg-the-third` — owns long-term, do not blindly rebase upstream), `crossbeam-channel` 0.5, `rodio` 0.21.1, `rfd` 0.14, `uuid` 1.10, `serde` 1.0, `png` 0.18.1.
-FFmpeg: custom static build, MINGW64. Fork exposes flush control upstream lacks. Encode/decode changes may need fork changes + `Cargo.toml` bump.
+FFmpeg: custom static build, MINGW64, FFmpeg 8.0.1 source. Fork exposes flush control upstream lacks. Encode/decode changes may need fork changes + `Cargo.toml` bump.
+**FFmpeg hardware accel compiled in**: D3D11VA (decode, all GPUs via DirectX), NVENC/NVDEC (NVIDIA encode+decode), AMF (AMD encode), QSV via libvpl (Intel encode+decode). All are **header-only at build time** — no GPU/driver required on the build machine. At runtime FFmpeg loads the vendor DLL lazily; missing driver = graceful error, CPU path still works. nv-codec-headers (`n12.2.72.0`) installed to `/mingw64`; AMF headers (`GPUOpen-LibrariesAndSDKs/AMF`) copied to `/mingw64/include/AMF/`; `mingw-w64-x86_64-libvpl` installed via pacman.
 ffmpeg-the-third 4 API: no `Stream::codec()` — use `Context::from_parameters(stream.parameters())` for decoders, `Context::new_with_codec(codec)` for encoders. `set_parameters()` needs `AsPtr<AVCodecParameters>` via `avcodec_parameters_from_context` FFI. `packets()` → `Result<(Stream, Packet), Error>` — always destructure with `?`. `set_frame_rate` needs explicit `Rational`.
 
 ---
@@ -61,8 +62,9 @@ Key variants: `SetTransition { after_clip_id, kind: TransitionType }`, `RemoveTr
 ## velocut-media/src/
 
 **`worker.rs`** — `MediaWorker`. Owns: latest-wins condvar scrub slot, pb decode thread (32-frame bounded channel), probe semaphore (max 4), shared result channel, **dedicated scrub channel `scrub_rx` cap=8** (scrub VideoFrames bypass shared rx), `encode_cancels: Arc<Mutex<HashMap<Uuid,Arc<AtomicBool>>>>`.
-Methods: `probe_clip` (dur+thumb+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot — sends `aspect > 0` = scrub/low-res), `request_frame_hq(id,path,ts)` (**NEW** — spawns one-shot thread calling `decode_frame` with `aspect=0.0`; result goes to `scrub_rx` so UI picks it up via low-latency path; used by L3 idle decode), `request_transition_frame(TransitionScrubRequest)` (spawns one-shot thread: decode_one_frame_rgba×2, blend, send to scrub_rx keyed by clip_a_id), `start_playback` (sends Start **before** draining pb_rx — logs loudly if try_send fails), `start_blend_playback(id,path,ts,aspect,PlaybackTransitionSpec)` (sends StartBlend **before** draining pb_rx — logs loudly if try_send fails), `stop_playback` (sends Stop then **drains pb_rx** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
-**`ActiveBlend` struct** (pb thread internal): `{ spec: PlaybackTransitionSpec, aspect: f32, decoder_b: Option<LiveDecoder> }` — `decoder_b` is always opened **lazily** at blend zone entry in the frame loop. **No eager/async pre-open**: `LiveDecoder` contains `ffmpeg::software::scaling::Context` (`*mut SwsContext`) which is not `Send` — cannot cross thread boundaries. Lazy open uses `skip_until_pts` (decode-only, ~4× faster than `burn_to_pts`) for decoder_b only; safe because decoder_b frames are never checked against `poll_playback`'s lower-bound timestamp gate.
+Methods: `probe_clip` (dur+thumb+VideoSize under semaphore, waveform+audio after), `request_frame` (overwrites scrub slot — sends `aspect > 0` = scrub/low-res), `request_frame_hq(id,path,ts)` — spawns one-shot thread calling `decode_frame` with `aspect=0.0`; result goes to `scrub_rx` so UI picks it up via low-latency path; used by L3 idle decode, `request_transition_frame(TransitionScrubRequest)` (spawns one-shot thread: decode_one_frame_rgba×2, blend, send to scrub_rx keyed by clip_a_id), `start_playback(id,path,ts,aspect,preview_size)` (sends Start **before** draining pb_rx — logs loudly if try_send fails), `start_blend_playback(id,path,ts,aspect,blend,preview_size)` (sends StartBlend **before** draining pb_rx — logs loudly if try_send fails), `stop_playback` (sends Stop then **drains pb_rx** — frees ~30 MB), `extract_frame_hq`, `start_encode`, `cancel_encode`, `shutdown`.
+**`PlaybackCmd::Start`** and **`PlaybackCmd::StartBlend`** both carry `preview_size: Option<(u32, u32)>` — the pixel dimensions of the preview panel at the moment playback begins (e.g. `960×540`). Passed directly to `LiveDecoder::open`; not stored in `ActiveBlend` (there is nothing to retrieve it from later — the decoder is already open by the time it would be needed). Both cmd variants pattern-match `preview_size` at the call site and forward it to `LiveDecoder::open`.
+**`ActiveBlend` struct** (pb thread internal): `{ spec: PlaybackTransitionSpec, aspect: f32, decoder_b: Option<LiveDecoder> }` — `preview_size` intentionally absent; it is consumed at `LiveDecoder::open` time and not needed again. `decoder_b` is always opened **lazily** at blend zone entry in the frame loop. **No eager/async pre-open**: `LiveDecoder` contains `ffmpeg::software::scaling::Context` (`*mut SwsContext`) which is not `Send` — cannot cross thread boundaries. Lazy open uses `skip_until_pts` (decode-only, ~4× faster than `burn_to_pts`) for decoder_b only; safe because decoder_b frames are never checked against `poll_playback`'s lower-bound timestamp gate.
 **decoder_b forced_size**: When opening decoder_b lazily, `primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))` is passed as `forced_size` to `LiveDecoder::open`. This ensures both decoders produce identically-sized RGBA buffers even when clips have different native resolutions — prevents the blend size mismatch guard from skipping all blend frames.
 Pb thread state also includes `held_blend: Option<Vec<u8>>` — the last successfully produced blended frame. Cleared on every Start/StartBlend/Stop/primary-EOF so it never bleeds across sessions.
 Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {..., decoder_b: None })`, clears `held_blend`, then opens+burns the **primary** decoder (same as Start). In frame loop: when `ts_secs >= spec.blend_start_ts`, `alpha = (alpha_start + local_t/duration).clamp(0,1)`. Lazy decoder_b open: set `db.skip_until_pts = tpts` then push to `b.decoder_b`. While `skip_until_pts > 0` (still_burning), `next_frame()` returns None in chunks of MAX_SKIP_PACKETS=60 (~30ms each) — during this window the frame loop sends `held_blend` (last blended frame, frozen) instead of raw primary. **Never send raw primary during still_burning** — that flashes the transition effect away for each skip chunk. Once burn completes, normal blend resumes and `held_blend` is updated each frame. Dimension guard: `data_b.len() != data.len() || wb != w || hb != h` → log + fall through to unblended frame (should never trigger now that forced_size is passed). `decoder_b_exhausted` flag (set inside mutable-borrow closure, acted on after) clears `blend` at EOF. If `spec.invert_ab`, calls `blend_rgba_transition(data_b, data, ...)` else `blend_rgba_transition(data, data_b, ...)`. Blend cleared on Start/Stop/primary-EOF/decoder_b-EOF.
@@ -70,39 +72,55 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 **Instrumentation** (all `eprintln!`): Start/StartBlend received with ts, primary burn elapsed ms, frame #N every 60 frames with ts, primary EOF. `[tick]` logs: clip_changed event with current_time/clip.start_time/media_ids, which branch taken (start_blend_playback vs start_playback with alpha_start). `[blend_in]` logs: guard values (current_time, clip_b_start, elapsed, half_d, duration, kind), GUARD TRIGGERED message when returning None, returning Some with alpha_start/clip_a_tail/clip_b.source_offset.
 `blend_rgba_transition(a,b,w,h,alpha,kind)` — RGBA in-process blend matching YUV encode-path. All transition kinds implemented.
 
-**`encode.rs`** — `ClipSpec { path, source_offset, duration, volume, skip_audio }`, `EncodeSpec { job_id, clips, width, height, fps, output, transitions: Vec<ClipTransition> }`. `encode_timeline` blocking, own thread. `Context::new_with_codec(h264)`, CRF 18, preset fast, **`g=fps`** (keyframe/sec, critical for scrub), **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with`**, **fetch `ost_audio_tb` after `write_header`**. `CropScaler`: center-crop, pre-advance data ptrs to `crop_y` row, **pass `srcSliceY=0`** (never `crop_y` → EINVAL). Transition dispatch: `registry()` built once before clip loop. Decoder flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
+**`encode.rs`** — `ClipSpec { path, source_offset, duration, volume, skip_audio }`, `EncodeSpec { job_id, clips, width, height, fps, output, transitions: Vec<ClipTransition> }`. `encode_timeline` blocking, own thread. Hardware encoder fallback: `try_hw_encoder()` tries `h264_nvenc` → `h264_amf` → `h264_qsv` in order; falls back to `libx264` if all fail. `apply_encoder_quality_opts(opts, codec_name)` branches on name: NVENC uses `cq` + `preset p4`; AMF uses `qp_i`/`qp_p`/`qp_b` + `quality balanced`; QSV uses `b:v` bitrate mode; libx264 uses `crf 18` + `preset fast`. `AV_CODEC_FLAG_GLOBAL_HEADER` and `g=fps` applied unconditionally before `open_as_with` regardless of encoder. `Context::new_with_codec(h264)`, **`g=fps`** (keyframe/sec, critical for scrub), **`AV_CODEC_FLAG_GLOBAL_HEADER` before `open_as_with`**, **fetch `ost_audio_tb` after `write_header`**. `CropScaler`: center-crop, pre-advance data ptrs to `crop_y` row, **pass `srcSliceY=0`** (never `crop_y` → EINVAL). Transition dispatch: `registry()` built once before clip loop. Decoder flush uses `VideoFrame::new(YUV420P,w,h)` — **never `VideoFrame::empty()` as sws_scale dst**.
+**HW encode quality opts by codec** (do not cross-apply — each vendor uses a different quality parameter name):
+- `h264_nvenc` / `hevc_nvenc`: `cq=18`, `preset=p4`, `rc=vbr`
+- `h264_amf` / `hevc_amf`: `qp_i=18`, `qp_p=20`, `qp_b=22`, `quality=balanced`
+- `h264_qsv` / `hevc_qsv`: `b:v=8M` (bitrate mode; QSV CQ not reliably available across all drivers)
+- `libx264`: `crf=18`, `preset=fast`
 
 **`decode.rs`** — `LiveDecoder`: stateful per-clip. `next_frame()->Option<(Vec<u8>,w,h,ts_secs)>`, `advance_to(pts)` forward scrub, `burn_to_pts(pts)` sync pre-roll.
 
-`open(path, ts, aspect, cached_scaler, forced_size)` — **5 args now**:
+`open(path, ts, aspect, cached_scaler, forced_size, preview_size)` — **6 args now**:
 - `cached_scaler: Option<(SwsContext,Pixel,u32,u32)>` reused if fmt+dims match.
 - `forced_size: Option<(u32,u32)>` — highest priority override; used by decoder_b to match primary's exact output dims.
-- `aspect > 0` → scrub mode: fixed 320px wide, native source AR height. Low-res intentionally — L1/L2 only.
-- `aspect <= 0` → HQ/playback mode: native source resolution, no downscale. **pb thread always passes 0.0.**
+- `preview_size: Option<(u32,u32)>` — UI preview panel pixel dimensions (e.g. `960×540`). Used by pb thread to decode at player resolution instead of full native res. Ignored for scrub (`aspect > 0`) and when `forced_size` is set.
+- `aspect > 0` → scrub mode: fixed 320px wide, native source AR height.
+- `aspect <= 0` + `preview_size Some(w,h)` → decode at player dimensions. Avoids decoding 4K only to display at 960×540.
+- `aspect <= 0` + `preview_size None` → native source resolution (fallback if UI size unavailable).
 
 **Resolution rules** (in priority order):
 1. `forced_size` overrides everything — decoder_b always uses this.
 2. `aspect > 0` → 320px scrub decode.
-3. `aspect <= 0` → native source resolution.
+3. `aspect <= 0` + `preview_size Some` → decode at player panel dimensions.
+4. `aspect <= 0` + `preview_size None` → native source resolution.
 
-**`hw_device_ctx: Option<HwDeviceCtx>`** field added to `LiveDecoder`. D3D11VA hardware acceleration:
+**`hw_device_ctx: Option<HwDeviceCtx>`** field added to `LiveDecoder`. Hardware decode acceleration:
+- **D3D11VA** (all GPUs via DirectX): `try_create_d3d11va_device()` — creates `AV_HWDEVICE_TYPE_D3D11VA`, returns `None` on failure (CPU fallback). `get_format` callback selects `AV_PIX_FMT_D3D11` when available.
+- **NVDEC/CUVID** (NVIDIA GPUs): selected automatically when `*_cuvid` decoders are used (e.g. `h264_cuvid`). `get_format` returns `AV_PIX_FMT_CUDA`. Transfer path: `av_hwframe_transfer_data` → NV12 → sws_scale → RGBA.
 - `HwDeviceCtx` RAII wrapper — calls `av_buffer_unref` on drop. Prevents device context leak on every scrub reset.
-- `try_create_d3d11va_device()` — creates `AV_HWDEVICE_TYPE_D3D11VA` device, returns `None` on failure (silent CPU fallback). Prints `[hwaccel] D3D11VA device created` on success.
 - Only enabled when `aspect <= 0.0` (playback/HQ). Scrub decoders (320px, short-lived, skip 99% of frames) skip hwaccel — PCIe transfer overhead not worth it.
-- `ensure_cpu_frame(frame)` — calls `av_hwframe_transfer_data` only when format is `AV_PIX_FMT_D3D11` (172) or `AV_PIX_FMT_D3D11VA_VLD` (113). CPU frames pass through untouched.
-- Scaler rebuilt lazily in `next_frame`/`advance_to` if `actual_fmt != decoder_fmt` — happens on first frame after D3D11VA transfer (D3D11→NV12). Only rebuilds once per decoder lifetime.
+- `ensure_cpu_frame(frame)` — calls `av_hwframe_transfer_data` only when format is `AV_PIX_FMT_D3D11` (171), `AV_PIX_FMT_D3D11VA_VLD` (113), or `AV_PIX_FMT_CUDA`. CPU frames pass through untouched.
+- Scaler rebuilt lazily in `next_frame`/`advance_to` if `actual_fmt != decoder_fmt` — happens on first frame after HW surface transfer (D3D11→NV12, CUDA→NV12). Only rebuilds once per decoder lifetime.
 - `let mut decoder` required (not `let decoder`) — `hw_device_ctx` is assigned via raw pointer after construction.
 
-**D3D11VA ordering fix applied.** Root cause was confirmed: `hw_device_ctx` was being set on `(*decoder.as_mut_ptr())` after `dec_ctx.decoder().video()?` had already called `avcodec_open2` internally — FFmpeg silently ignored the late attachment. Fix: added `let mut dec_ctx = dec_ctx;` to make the context mutable, moved `try_create_d3d11va_device()` + `(*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref` to **before** `dec_ctx.decoder().video()?`, and removed the old post-open block. The pre-open log message is now `[hwaccel] D3D11VA attached to decoder context (pre-open)`. The lazy scaler rebuild in `next_frame()`/`advance_to()` handles the D3D11→NV12 format change on the first frame, as before.
+**HW decode ordering fix applied.** Root cause was confirmed: `hw_device_ctx` was being set on `(*decoder.as_mut_ptr())` after `dec_ctx.decoder().video()?` had already called `avcodec_open2` internally — FFmpeg silently ignored the late attachment. Fix: added `let mut dec_ctx = dec_ctx;` to make the context mutable, moved `try_create_hw_device()` + `(*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref` to **before** `dec_ctx.decoder().video()?`, and removed the old post-open block. Applies to both D3D11VA and CUVID device contexts. The lazy scaler rebuild in `next_frame()`/`advance_to()` handles the HW→NV12 format change on the first frame, as before.
 
 `skip_until_pts` field: decode-only burn, ~4× faster than scale. `decode_one_frame_rgba(path,ts)->Result<(Vec<u8>,w,h)>` — one-shot for scrub transition blend (still uses fixed 320px, no hwaccel).
 
-**FFmpeg configure (D3D11VA build)**:
-- Removed `--disable-d3d11va`, added `--enable-d3d11va`
-- Added `--enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,vp9_d3d11va,vp9_d3d11va2,av1_d3d11va,av1_d3d11va2,mpeg2_d3d11va,mpeg2_d3d11va2,mpeg4_d3d11va`
-- Added `-ld3d11 -ldxgi` to `--extra-ldflags`
+**FFmpeg configure (full hardware accel build)**:
+- Base: `--disable-shared --enable-static --disable-programs --disable-doc --disable-network --disable-everything`
+- D3D11VA decode: removed `--disable-d3d11va`, added `--enable-d3d11va`, `--enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,...`
+- NVIDIA NVENC encode: `--enable-nvenc`, `--enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc`
+- NVIDIA NVDEC/CUVID decode: `--enable-nvdec --enable-cuvid`, `--enable-decoder=h264_cuvid,hevc_cuvid,vp9_cuvid,av1_cuvid`
+- AMD AMF encode: `--enable-amf`, `--enable-encoder=h264_amf,hevc_amf,av1_amf`
+- Intel QSV encode+decode: `--enable-libvpl`, `--enable-encoder=h264_qsv,hevc_qsv`, `--enable-decoder=h264_qsv,hevc_qsv`, `--enable-filter=scale_qsv,vpp_qsv`
+- Extra ldflags: `--extra-ldflags="-L/mingw64/lib -static -ld3d11 -ldxgi"`
 - `d3d11.dll`/`dxgi.dll` are Windows system DLLs — link against MinGW import libs (`/mingw64/lib/libd3d11.a`, `/mingw64/lib/libdxgi.a`), no bundling needed
 - If import libs missing: `pacman -S mingw-w64-x86_64-headers`
+- **NVENC/AMF/QSV are header-only at build time** — nv-codec-headers provide `ffnvcodec/` include; AMF headers provide `AMF/` include; libvpl provides `vpl/` include. No GPU or driver on the build machine is required. Runtime: FFmpeg loads `nvenc64_*.dll`, `amfrt64.dll`, Intel MFX dispatcher lazily at encode init.
+- `/mingw64/lib/libvpl.dll.a` must be renamed to `.bak` (same `.dll.a` preference problem as x264/zlib)
+- `build.rs` `link_to_libraries()` static block adds: `cargo:rustc-link-lib=vpl`, `cargo:rustc-link-lib=d3d11`, `cargo:rustc-link-lib=dxgi`
 - **Do NOT use backtick comments** (`` `# comment` ``) in the configure script — bash executes them as subshells, passes empty strings as args, configure exits silently
 
 **`probe.rs`** — `probe_duration`, `probe_video_size_and_thumbnail`. **SwsContext built lazily from first decoded frame** — never upfront (AVCC reports coded dims; Annex-B has `AV_PIX_FMT_NONE` pre-packet).
@@ -142,7 +160,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 
 **L3 repaint scheduling**: done in the `else` (not-scrub-moved) branch. Each tick while waiting computes `remaining = 150ms - elapsed + 5ms` and calls `egui_ctx.request_repaint_after(remaining)` — self-rescheduling until threshold crossed. **Do NOT put `request_repaint_after` in `scrub_moved` branch** — that's a one-shot bet that fails if the repaint fires slightly early or egui drops it.
 
-**`tick()` playback mode**: passes `aspect=0.0` to both `start_playback` and `start_blend_playback` → `LiveDecoder` opens at native resolution → full quality in preview player. `crop_uv_rect` in `preview_module` handles any AR mismatch on the GPU at zero cost.
+**`tick()` playback mode**: passes `aspect=0.0` and `preview_size=Some(panel_px_size)` to both `start_playback` and `start_blend_playback` → `LiveDecoder` opens at player panel resolution (e.g. `960×540`) instead of full native resolution — reduces PCIe/memory bandwidth for 4K sources displayed at sub-4K preview sizes. `preview_size` is read from `preview_module.last_render_size: Option<(u32,u32)>` which is written each frame by `preview_module.ui()`. Falls back to `None` (native decode) if `last_render_size` is not yet set (first frame). `crop_uv_rect` in `preview_module` handles any AR mismatch on the GPU at zero cost.
 
 `tick()` playback mode: on `just_started || clip_changed`, calls `build_incoming_blend_spec(state,clip)` first then `.or_else(||build_blend_spec(state,clip))`. **Order is critical** — `build_blend_spec` has no time guard and returns `Some` for any clip with an outgoing transition; it must be the fallback or it shadows the incoming spec. `build_incoming_blend_spec` has a direct time guard (`current_time < clip_b.start_time + D/2`) and safely returns `None` once the incoming zone has passed. Uses `start_blend_playback` if either returns `Some`, else `start_playback`.
 `build_blend_spec`: finds non-Cut transition after clip_a + next V-row clip → `PlaybackTransitionSpec { blend_start_ts = clip_a.source_offset + clip_a.duration − D/2, alpha_start: 0.0, invert_ab: false }`.
@@ -156,7 +174,7 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 
 **`modules/export_module.rs`** — `{ filename, quality: QualityPreset, fps, export_aspect, clear_confirm_at }`. Quality = short-side px. Two-stage Reset (5s countdown). Three states: Idle / Encoding (progress + Stop) / Done (green, 5s auto-dismiss) / Error.
 
-**`modules/preview_module.rs`** — `current_frame: Option<TextureHandle>` set by app.rs pre-`ui()`. UV crop helper `crop_uv_rect` for center-crop to project AR. Transport bar with custom-painted buttons.
+**`modules/preview_module.rs`** — `current_frame: Option<TextureHandle>` set by app.rs pre-`ui()`. `last_render_size: Option<(u32,u32)>` written each frame from `ui.available_size()` (rounded to u32) — read by `video_module::tick()` to pass `preview_size` to `start_playback`. UV crop helper `crop_uv_rect` for center-crop to project AR. Transport bar with custom-painted buttons.
 `crop_uv_rect(tex_w, tex_h, target_ar)` — GPU-side center-crop. Returns `(0,0)→(1,1)` when ARs match (no overhead). Handles mixed-AR clips where source native AR ≠ project AR without any CPU scaling. This is the correct layer for AR handling — **never use project AR to size decoder output**.
 
 ---
@@ -194,11 +212,14 @@ Pb thread blend logic: `StartBlend` handler sets `blend = Some(ActiveBlend {...,
 - **`alpha_start` in `build_incoming_blend_spec` is always `0.5` (flat).** Never make it dynamic (`0.5 + elapsed/D`). The pb thread formula `alpha = alpha_start + local_t/D` already has elapsed baked into `local_t` because the primary decoder burns to `source_offset + elapsed` — making `alpha_start` dynamic double-counts elapsed and causes a visible effect-size pop.
 - **`held_blend` in pb thread cleared on every Start/StartBlend/Stop/primary-EOF.** Never let it bleed across blend sessions. Updated on each successful `blend_rgba_transition` call. Used as fallback only during `still_burning` skip window — never used as default output.
 - **`egui::Options::reduce_texture_memory` — do not enable.** Causes +20 MB idle overhead. Only beneficial for no-re-upload texture workloads; scrub/playback re-uploads every frame.
-- **`LiveDecoder::open` takes 5 args**: `(path, ts, aspect, cached_scaler, forced_size)`. All call sites must pass `None` for `forced_size` except the lazy decoder_b open in the pb thread blend loop, which passes `decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))`.
+- **`LiveDecoder::open` takes 6 args**: `(path, ts, aspect, cached_scaler, forced_size, preview_size)`. All call sites must pass `None` for `forced_size` except the lazy decoder_b open in the pb thread blend loop, which passes `decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h))`. Scrub call sites pass `None` for `preview_size`; playback call sites pass `Some(panel_px)`.
 - **pb thread always passes `aspect=0.0`** to `LiveDecoder::open` (both Start and StartBlend primary opens, and decoder_b pre-open). Scrub thread passes `aspect=active_video_ratio()` (> 0).
+- **`preview_size` is NOT stored in `ActiveBlend`** — it is consumed by `LiveDecoder::open` at decoder creation time. Pattern-match it from `PlaybackCmd::StartBlend { ..., preview_size }` and pass directly to the primary `LiveDecoder::open`. Decoder_b open in the blend loop uses `forced_size` (primary's dims), not `preview_size`.
+- **HW encoder fallback order**: `h264_nvenc` → `h264_amf` → `h264_qsv` → `libx264`. Use `apply_encoder_quality_opts(opts, codec_name)` — never apply NVENC `cq` to AMF or vice versa.
+- **`ensure_cpu_frame` checks for D3D11 (171), D3D11VA_VLD (113), and CUDA pixel formats.** Never hardcode numeric values — use `ffi::AVPixelFormat::*` constants. Fork's `AV_PIX_FMT_D3D11` is 171, not mainline 172.
 - **L3 `request_repaint_after` belongs in the `else` branch** (idle wait), not `scrub_moved`. It must be self-rescheduling, not a one-shot.
 - **`blend_rgba_transition` is rayon-parallelised** — `apply_rgba` in each `VideoTransition` impl splits the output row range with `par_chunks_mut`. All transition impls must be stateless (no shared mutable state across rows). The `rayon` dep lives in `velocut-core`. `blend_rgba_transition` in `worker.rs` is unchanged — parallelism is inside each transition's `apply_rgba`.
-- **AVPixelFormat comparisons use ffi enum constants, never hardcoded integers.** The numeric value of `AV_PIX_FMT_D3D11` is 171 in this fork (not mainline 172). Always `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`.
+- **AVPixelFormat comparisons use ffi enum constants, never hardcoded integers.** The numeric value of `AV_PIX_FMT_D3D11` is 171 in this fork (not mainline 172). Always `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`. Same applies to `AV_PIX_FMT_CUDA`.
 
 ---
 
@@ -269,6 +290,12 @@ For a transition of duration D between clip_a and clip_b:
 
 **D3D11VA: static image with audio — RESOLVED** — Root cause confirmed: `hw_device_ctx` was set on `(*decoder.as_mut_ptr())` after `dec_ctx.decoder().video()?` which calls `avcodec_open2` internally. Fix: `let mut dec_ctx = dec_ctx` + set `(*dec_ctx.as_mut_ptr()).hw_device_ctx` before `.decoder().video()?`. Old post-open block removed. Lazy scaler rebuild in `next_frame()`/`advance_to()` handles D3D11→NV12 format change on first frame.
 
+**NVENC `cq` option rejected at runtime ("Option cq not found")** — AMF or QSV encoder selected but NVENC quality opts applied. Fix: `apply_encoder_quality_opts` dispatches on codec name string. Each vendor uses a completely different parameter namespace — never cross-apply.
+
+**`preview_size` field in `ActiveBlend` — dead code warning** — `preview_size` was stored in the struct but never read back from it. The value was already consumed by `LiveDecoder::open` at the same moment `ActiveBlend` was constructed. Fix: remove field from `ActiveBlend`. Pattern-match `preview_size` from `PlaybackCmd::StartBlend { ..., preview_size }` at the match arm and forward directly to `LiveDecoder::open`. No information is lost.
+
+**4K source decoded at native res for 960×540 preview panel** — `LiveDecoder::open` in playback mode always decoded at native source resolution regardless of player size. At 4K this produces ~32 MB/frame RGBA buffers when only ~2 MB is needed. Fix: `preview_size: Option<(u32,u32)>` added as 6th arg to `LiveDecoder::open`. `video_module::tick()` reads `preview_module.last_render_size` and passes it to `start_playback`/`start_blend_playback`. Resolution priority: `forced_size` > `aspect > 0` (320px scrub) > `preview_size` > native.
+
 ---
 
 ## Adding a Feature
@@ -304,7 +331,7 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 
 ## Known Future Work
 - **wgpu GPU compute blend** *(high value, medium effort)*: replace `blend_rgba_transition` CPU path with a WGSL compute shader dispatched from the pb thread. eframe 0.33 already owns a wgpu `Device`+`Queue` — expose them via `Arc` at `MediaWorker::new()`. Upload both NV12 frames as textures, blend in shader (NV12→RGBA in one pass), output a `wgpu::Texture` returned via `register_native_texture` instead of `Vec<u8>`. Touches: `worker.rs`, `media_types.rs` (`PlaybackFrame` gains texture-ID variant), `context.rs`, `video_module.rs`, `preview_module.rs`. **Do not attempt until rayon interim is confirmed stable.**
-- **Hardware encode fallback** *(high value, low effort)*: try `h264_nvenc` → `h264_amf` → `h264_qsv` → `libx264` at encode start. Hardware encoders use different quality opts — need `apply_encoder_quality_opts(opts, codec_name)` helper that branches on codec name (NVENC uses `cq`, AMF uses `qp_i`/`qp_p`/`qp_b`). `AV_CODEC_FLAG_GLOBAL_HEADER` and `g=fps` carry over unchanged. ~8–12× faster at 4K, offloads CPU during export so playback stays smooth. Optional UI toggle: Software (best quality) / Hardware (faster).
+- **NVENC/AMF/QSV decode in playback pipeline**: Currently D3D11VA + NVDEC are compiled in but decoder selection is automatic via `get_format`. Could expose explicit `*_cuvid` decoder paths for NVIDIA (fully GPU-resident decode → encode pipeline with no PCIe round-trip). Low priority given D3D11VA already offloads decode.
 - **Lower-res bucket frames**: store ≤640px (~1.2 MB vs ~8 MB/frame), fit ~160 frames in 192 MB. Needs downscale pass in scrub decode.
 - **Velocity-scaled L2b prefetch**: scale 2s window to 8–10s on fast fling. Track scrub velocity in timeline.rs.
 - **Hover prefetch / cursor frame preview**: `RequestScrubPrefetch(hover_time)` before drag. Read `frame_bucket_cache` by nearest bucket.
@@ -318,11 +345,14 @@ All else auto: `TransitionKind` variant, registry, badge, popup, slider, encode,
 - Transitions: Crossfade, Dip-to-Black, Iris, Wipe, Push — registry-driven, zero hardcoding
 - Transition preview: scrub blend correct (both halves). L3 idle (150ms) now fires `request_transition_frame_hq` when playhead is inside a transition zone — both clips decoded at native resolution and blended, replacing the 320px scrub thumbnail with a full-quality frame. L2 drag-pixel path unchanged (320px fast). Live playback blend: both clip_a and clip_b halves work correctly for same-AR clips. Mixed-res clips: forced_size fix applied — decoder_b now matches primary dimensions.
 - **Outgoing-blend stutter eliminated**: `StartBlend` (active decoder branch, `invert_ab=false`) now detects that the primary decoder is already on clip_a's path and reuses it directly instead of reopening. File-open + keyframe-seek + burn_to_pts no longer stalls the pb thread at transition onset. Fallback fresh-open still used when decoder is absent or on a different path.
-- Preview quality: 4-tier scrub (L1 cached 320px, L2 exact 320px, L3 idle HQ native-res single-clip, L3 idle HQ native-res transition blend). Playback at native resolution. AR mismatch handled by GPU-side `crop_uv_rect`.
+- Preview quality: 4-tier scrub (L1 cached 320px, L2 exact 320px, L3 idle HQ native-res single-clip, L3 idle HQ native-res transition blend). Playback at **player panel resolution** (not full native res) — `preview_size` passed from UI to `LiveDecoder::open`; reduces memory bandwidth for 4K sources in sub-4K preview panels. AR mismatch handled by GPU-side `crop_uv_rect`.
 - Audio extraction: dedicated audio library entry, correct WAV playback
 - Undo/redo: 50-snapshot, VecDeque
-- Encode: H.264 MP4, CRF 18, keyframe/sec GOP, global header, lazy SwsContext
+- **Encode: hardware encoder fallback chain** — `h264_nvenc` → `h264_amf` → `h264_qsv` → `libx264`. Encoder-specific quality opts via `apply_encoder_quality_opts`. ~8–12× faster at 4K on supported GPUs; offloads CPU so playback stays smooth during export. `AV_CODEC_FLAG_GLOBAL_HEADER` and `g=fps` applied regardless of encoder.
 - Playback: PTS-gated single-slot, stable_dt master clock, blend playback across clip boundary with held_blend frozen-frame mechanism
-- FFmpeg: custom static build with D3D11VA compiled in. **D3D11VA active and confirmed** — `get_format` callback fires, `AV_PIX_FMT_D3D11 (171)` selected for all three decoders (primary, decoder_b, recycled primary). Format value is build-specific (171 in this fork, not mainline 172) — all comparisons use `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`, never hardcoded integers. CPU fallback still available if device init fails.
-- **Transition blend perf**: blend done in RGBA on CPU (`blend_rgba_transition`). At 1504×832 this is ~10 MB/frame; at 4K it becomes ~64 MB/frame and saturates CPU memory bandwidth. **Interim fix: rayon parallel blend — DONE** (`apply_rgba` in all 5 transition impls uses `par_chunks_mut`). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
-- `decode_one_frame_rgba` now accepts `aspect: f32` (same convention as `LiveDecoder::open`). `aspect > 0` → 320px scrub. `aspect <= 0` → native resolution. `request_transition_frame` passes `1.0`; `request_transition_frame_hq` passes `0.0`.
+- **FFmpeg: custom static build (FFmpeg 8.0.1, MINGW64) with full hardware accel**:
+  - **Decode**: D3D11VA active and confirmed (all GPU brands via DirectX); NVDEC/CUVID compiled in for NVIDIA `*_cuvid` decoders. HW device attached pre-`avcodec_open2` (ordering fix confirmed). CPU fallback if device init fails.
+  - **Encode**: NVENC (`h264_nvenc`, `hevc_nvenc`, `av1_nvenc`), AMF (`h264_amf`, `hevc_amf`, `av1_amf`), QSV via libvpl (`h264_qsv`, `hevc_qsv`) — all compiled in via headers only. Actual encoding requires user's GPU driver at runtime.
+  - `AV_PIX_FMT_D3D11` is 171 in this fork (not mainline 172) — all comparisons use `ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32`.
+- **Transition blend perf**: blend done in RGBA on CPU (`blend_rgba_transition`). **Rayon parallel blend — DONE** (`apply_rgba` in all 5 transition impls uses `par_chunks_mut`). **Long-term: wgpu GPU compute blend** (planned — see Known Future Work).
+- `decode_one_frame_rgba` accepts `aspect: f32`. `aspect > 0` → 320px scrub. `aspect <= 0` → native resolution. `request_transition_frame` passes `1.0`; `request_transition_frame_hq` passes `0.0`.
