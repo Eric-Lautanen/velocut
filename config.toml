@@ -6,4 +6,4 @@ rustflags = [
 ]
 
 [env]
-FFMPEG_DIR = "/c/github/ffmpeg-src"
+FFMPEG_DIR = "/c/ffmpeg-velocut"

@@ -159,7 +159,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
 
     // AMF — D3D11, Windows (AMD/Intel/discrete NVIDIA via AMF runtime)
     if encoder::find_by_name("h264_amf").is_some() {
-        if probe_d3d11_device(128, 128) {
+        if probe_d3d11_device(1920, 1080) {
             eprintln!("[encode] probe: AMF available");
             return HwEncodeCapabilities { sw_only: false, backend_name: "AMF" };
         } else {
@@ -171,7 +171,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
 
     // NVENC — CUDA, Windows/Linux
     if encoder::find_by_name("h264_nvenc").is_some() {
-        if probe_cuda_device(128, 128) {
+        if probe_cuda_device(1920, 1080) {
             eprintln!("[encode] probe: NVENC available");
             return HwEncodeCapabilities { sw_only: false, backend_name: "NVENC" };
         } else {
@@ -182,7 +182,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     }
 
     // VAAPI — Linux (AMD/Intel)
-    if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(128, 128) {
+    if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(11920, 1080) {
         eprintln!("[encode] probe: VAAPI available");
         return HwEncodeCapabilities { sw_only: false, backend_name: "VAAPI" };
     }
