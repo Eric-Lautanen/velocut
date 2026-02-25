@@ -271,6 +271,127 @@ fn ensure_cpu_frame(
     }
 }
 
+// ── Center-crop + scale helper ────────────────────────────────────────────────
+
+/// Decode `frame` (already on CPU) to `(dst_w × dst_h)` RGBA with a
+/// **center-crop** so the output matches the canvas AR exactly.
+///
+/// How it works: the crop region in source coordinates that matches the
+/// `(dst_w / dst_h)` aspect ratio is identified, then `sws_scale` is called
+/// with pointer arithmetic that points directly into the cropped window — no
+/// intermediate buffer needed.  The SwsContext is built for the crop region,
+/// so swscale scales `(crop_w × crop_h)` → `(dst_w × dst_h)` in one pass.
+///
+/// Handles **NV12** (D3D11VA CPU readback) and **YUV420P / YUVJ420P**
+/// (software decoders).  Returns `None` for any other pixel format or on any
+/// FFmpeg failure; callers fall back to a stretch-scale in that case so
+/// playback degrades gracefully instead of freezing.
+///
+/// # Safety
+/// Uses raw FFmpeg API: `sws_getContext`, `sws_scale`, `sws_freeContext`.
+unsafe fn center_crop_and_scale(
+    frame: &ffmpeg::util::frame::video::Video,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<Vec<u8>> {
+    if dst_w == 0 || dst_h == 0 { return None; }
+    let src_w = frame.width()  as u32;
+    let src_h = frame.height() as u32;
+    if src_w == 0 || src_h == 0 { return None; }
+
+    let src_ar = src_w as f32 / src_h as f32;
+    let dst_ar = dst_w as f32 / dst_h as f32;
+
+    // Center-crop region in source pixels that matches the target AR.
+    let (crop_x, crop_y, crop_w, crop_h) = if (src_ar - dst_ar).abs() < 0.02 {
+        // ARs already match — use the full source frame.
+        (0u32, 0u32, src_w, src_h)
+    } else if src_ar > dst_ar {
+        // Source is wider → crop left and right.
+        let w = ((src_h as f32 * dst_ar) as u32 & !1).max(2).min(src_w);
+        ((src_w - w) / 2, 0, w, src_h)
+    } else {
+        // Source is taller → crop top and bottom.
+        let h = ((src_w as f32 / dst_ar) as u32 & !1).max(2).min(src_h);
+        (0, (src_h - h) / 2, src_w, h)
+    };
+
+    let raw      = frame.as_ptr();
+    let fmt_i    = (*raw).format;
+    let nv12     = ffi::AVPixelFormat::AV_PIX_FMT_NV12     as i32;
+    let yuv420p  = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P  as i32;
+    let yuvj420p = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
+
+    if fmt_i != nv12 && fmt_i != yuv420p && fmt_i != yuvj420p {
+        return None; // unsupported — caller uses stretch fallback
+    }
+
+    // Per-plane strides and base pointers.
+    let s0 = (*raw).linesize[0] as usize;
+    let s1 = (*raw).linesize[1] as usize;
+    let s2 = (*raw).linesize[2] as usize;
+    let d0 = (*raw).data[0];
+    let d1 = (*raw).data[1];
+    let d2 = (*raw).data[2];
+
+    // Offset each plane pointer to the top-left corner of the crop window.
+    //
+    // NV12:    plane-0 = Y  (1 B/luma-px), plane-1 = UV interleaved (2 B per 2×2 block)
+    //          → chroma stride is half-height; horiz offset equals luma horiz offset.
+    //
+    // YUV420P: plane-0 = Y  (1 B/luma-px), plane-1 = U, plane-2 = V (quarter-size each)
+    //          → chroma stride and offset are both halved in each axis.
+    let (src_ptrs, src_strides): ([*const u8; 4], [i32; 4]) = if fmt_i == nv12 {
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize);
+        ([p0, p1, std::ptr::null(), std::ptr::null()],
+         [s0 as i32, s1 as i32, 0, 0])
+    } else { // YUV420P / YUVJ420P
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize / 2);
+        let p2 = d2.add((crop_y as usize / 2) * s2 + crop_x as usize / 2);
+        ([p0, p1, p2, std::ptr::null()],
+         [s0 as i32, s1 as i32, s2 as i32, 0])
+    };
+
+    // Build a one-shot SwsContext from (crop_w × crop_h) → (dst_w × dst_h) RGBA.
+    // SWS_BILINEAR = 2.
+    let pixel_fmt = if fmt_i == nv12 { ffi::AVPixelFormat::AV_PIX_FMT_NV12 }
+                    else if fmt_i == yuv420p { ffi::AVPixelFormat::AV_PIX_FMT_YUV420P }
+                    else { ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P };
+
+    let sws = ffi::sws_getContext(
+        crop_w as i32, crop_h as i32, pixel_fmt,
+        dst_w  as i32, dst_h  as i32, ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+        2, // SWS_BILINEAR
+        std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+    );
+    if sws.is_null() { return None; }
+
+    // Allocate packed RGBA output — no stride padding needed.
+    let row_bytes   = dst_w as usize * 4;
+    let mut buf     = vec![0u8; row_bytes * dst_h as usize];
+    let dst_stride  = row_bytes as i32;
+    let mut dst_ptrs: [*mut u8; 4] = [
+        buf.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+    ];
+    let mut dst_strides = [dst_stride, 0i32, 0i32, 0i32];
+
+    // srcSliceY = 0: the source pointers already start at the crop row.
+    // srcSliceH = crop_h: process exactly the crop window height.
+    let rows = ffi::sws_scale(
+        sws,
+        src_ptrs.as_ptr(),
+        src_strides.as_ptr(),
+        0, crop_h as i32,
+        dst_ptrs.as_mut_ptr(),
+        dst_strides.as_mut_ptr(),
+    );
+    ffi::sws_freeContext(sws);
+
+    if rows > 0 { Some(buf) } else { None }
+}
+
 // ── Stateful per-clip decoder ─────────────────────────────────────────────────
 impl LiveDecoder {
     /// Open a decoder at `timestamp` seconds.
@@ -377,12 +498,21 @@ impl LiveDecoder {
         let dec_w   = decoder.width();
         let dec_h   = decoder.height();
 
-        // The decoder format reported before the first packet can be wrong
-        // (AVCC coded dims, AV_PIX_FMT_NONE for some Annex-B streams).
-        // We record what the codec metadata says here; the scaler is built
-        // from the *actual* first-frame format in next_frame() when hwaccel
-        // is active, since the output format changes after D3D11 transfer.
-        // For CPU-only paths the existing eager scaler construction is fine.
+        // [Fix] Guard against AV_PIX_FMT_NONE (Annex-B H.264 in MP4 containers
+        // never report a pixel format until the first packet is decoded) and zero
+        // coded dimensions.  Without this guard, SwsContext::get returns Err, the
+        // `?` propagates, open() fails, the pb thread sets decoder=None and goes
+        // idle — but tick() never restarts it because playback_media_id was already
+        // updated before the start_playback call.  Result: permanent playback freeze
+        // when a clip with a different resolution/container follows the initial clips
+        // (e.g. a 1080p 16:9 clip after 480p 2:3 clips on the same timeline).
+        //
+        // The placeholder format (YUV420P) is intentionally different from the
+        // stored decoder_fmt (Pixel::None), so the first decoded frame always
+        // triggers the `actual_fmt != self.decoder_fmt` mismatch check in
+        // next_frame()/advance_to(), which rebuilds the SwsContext with the real
+        // format and display dimensions before running the scaler.
+        //
         // [Opt #1] Reuse cached SwsContext when source format/dimensions haven't
         // changed — avoids re-running lookup-table initialisation on every
         // backward scrub or cross-clip reset.  Out dimensions are fixed for the
@@ -390,7 +520,12 @@ impl LiveDecoder {
         // source key is sufficient to guarantee safe reuse.
         let scaler = match cached_scaler {
             Some((sws, cf, cw, ch)) if cf == dec_fmt && cw == dec_w && ch == dec_h => sws,
-            _ => SwsContext::get(dec_fmt, dec_w, dec_h, Pixel::RGBA, out_w, out_h, Flags::BILINEAR)?,
+            _ => {
+                let sws_src_fmt = if dec_fmt == Pixel::None { Pixel::YUV420P } else { dec_fmt };
+                let sws_src_w   = dec_w.max(2);
+                let sws_src_h   = dec_h.max(2);
+                SwsContext::get(sws_src_fmt, sws_src_w, sws_src_h, Pixel::RGBA, out_w, out_h, Flags::BILINEAR)?
+            }
         };
 
         Ok(Self {
@@ -444,35 +579,45 @@ impl LiveDecoder {
                 }
                 self.skip_until_pts = 0; // reached target — disable skip
                 let ts_secs = self.pts_to_secs(pts);
-                // Transfer GPU surface to CPU if this is a hardware frame.
-                let decoded = ensure_cpu_frame(decoded);
-                // Rebuild the SwsContext if the actual decoded format differs
-                // from what was recorded at open() — happens on the first frame
-                // after D3D11VA transfer (D3D11 → NV12) and for AVCC streams.
-                // Use the live frame's width/height, not self.decoder_w/h — those
-                // were set from codec metadata before any packets and can be coded
-                // dims (e.g. 1088) rather than display dims (e.g. 1080).
-                let actual_fmt = decoded.format();
-                let actual_w   = decoded.width();
-                let actual_h   = decoded.height();
-                if actual_fmt != self.decoder_fmt
-                    || actual_w != self.decoder_w
-                    || actual_h != self.decoder_h
-                {
-                    if let Ok(new_sws) = SwsContext::get(
-                        actual_fmt, actual_w, actual_h,
-                        Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
-                    ) {
-                        self.scaler      = new_sws;
-                        self.decoder_fmt = actual_fmt;
-                        self.decoder_w   = actual_w;
-                        self.decoder_h   = actual_h;
-                    }
+
+                // Transfer GPU surface to CPU.  ensure_cpu_frame takes ownership of
+                // `decoded` by value, so reinitialise the outer binding immediately
+                // so receive_frame() gets a live &mut on the next loop iteration.
+                let cpu = ensure_cpu_frame(decoded);
+                decoded = ffmpeg::util::frame::video::Video::empty();
+
+                // Primary path: center-crop source to canvas AR, scale to (out_w × out_h).
+                // Handles NV12 and YUV420P/YUVJ420P.  Falls back to the cached stretch-
+                // scaler for other formats.  If both fail, skip this frame — the while loop
+                // naturally retries with the re-initialised `decoded` above; no freeze.
+                let data_opt = unsafe { center_crop_and_scale(&cpu, self.out_w, self.out_h) }
+                    .or_else(|| {
+                        // Fallback: rebuild SwsContext if format/dims changed, then stretch.
+                        let af = cpu.format();
+                        let aw = cpu.width();
+                        let ah = cpu.height();
+                        if af != self.decoder_fmt
+                            || aw != self.decoder_w
+                            || ah != self.decoder_h
+                        {
+                            if let Ok(sws) = SwsContext::get(
+                                af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                            ) {
+                                self.scaler      = sws;
+                                self.decoder_fmt = af;
+                                self.decoder_w   = aw;
+                                self.decoder_h   = ah;
+                            }
+                        }
+                        let mut out = ffmpeg::util::frame::video::Video::empty();
+                        self.scaler.run(&cpu, &mut out).ok()?;
+                        Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
+                    });
+                if let Some(data) = data_opt {
+                    return Some((data, self.out_w, self.out_h, ts_secs));
                 }
-                let mut out = ffmpeg::util::frame::video::Video::empty();
-                if self.scaler.run(&decoded, &mut out).is_err() { return None; }
-                let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
-                return Some((data, self.out_w, self.out_h, ts_secs));
+                // Both paths failed (e.g. GPU→CPU transfer error, scaler mismatch):
+                // skip this frame; the while loop retries automatically.
             }
             // After each video packet in skip mode, check the chunk limit.
             // Return None with skip_until_pts still set so the caller knows
@@ -512,30 +657,38 @@ impl LiveDecoder {
                 // [Opt 2] Decode-only for all frames before the target PTS.
                 // ~4x faster than decode+scale+alloc for the same set of frames.
                 if pts < target_pts { continue; }
-                // Target reached — transfer GPU surface to CPU if needed,
-                // rebuild scaler if format or dimensions changed, then scale exactly this frame.
-                let decoded    = ensure_cpu_frame(decoded);
-                let actual_fmt = decoded.format();
-                let actual_w   = decoded.width();
-                let actual_h   = decoded.height();
-                if actual_fmt != self.decoder_fmt
-                    || actual_w != self.decoder_w
-                    || actual_h != self.decoder_h
-                {
-                    if let Ok(new_sws) = SwsContext::get(
-                        actual_fmt, actual_w, actual_h,
-                        Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
-                    ) {
-                        self.scaler      = new_sws;
-                        self.decoder_fmt = actual_fmt;
-                        self.decoder_w   = actual_w;
-                        self.decoder_h   = actual_h;
-                    }
+                // Target reached — center-crop source to canvas AR and scale.
+                // Same pattern as next_frame: reinitialise `decoded` after the move
+                // so the while loop can retry on failure without a borrow-after-move.
+                let cpu = ensure_cpu_frame(decoded);
+                decoded = ffmpeg::util::frame::video::Video::empty();
+
+                let data_opt = unsafe { center_crop_and_scale(&cpu, self.out_w, self.out_h) }
+                    .or_else(|| {
+                        let af = cpu.format();
+                        let aw = cpu.width();
+                        let ah = cpu.height();
+                        if af != self.decoder_fmt
+                            || aw != self.decoder_w
+                            || ah != self.decoder_h
+                        {
+                            if let Ok(sws) = SwsContext::get(
+                                af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                            ) {
+                                self.scaler      = sws;
+                                self.decoder_fmt = af;
+                                self.decoder_w   = aw;
+                                self.decoder_h   = ah;
+                            }
+                        }
+                        let mut out = ffmpeg::util::frame::video::Video::empty();
+                        self.scaler.run(&cpu, &mut out).ok()?;
+                        Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
+                    });
+                if let Some(data) = data_opt {
+                    return Some((data, self.out_w, self.out_h));
                 }
-                let mut out = ffmpeg::util::frame::video::Video::empty();
-                if self.scaler.run(&decoded, &mut out).is_err() { return None; }
-                let data = copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h);
-                return Some((data, self.out_w, self.out_h));
+                // Both paths failed: skip this frame, try the next.
             }
         }
         // EOF before target_pts: return None. Caller retains its current frame.

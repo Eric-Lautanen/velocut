@@ -188,14 +188,19 @@ fn decode_to_wav(src: &PathBuf, dst: &PathBuf, source_offset: f64, duration: f64
             let mut resampled = AudioFrame::empty();
             if rs.run(frame, &mut resampled).is_ok() && resampled.samples() > pre_roll_samples {
                 // OUT_FMT is packed interleaved f32: each sample is 2 channels × 4 bytes = 8 bytes.
+                // Cap at valid_end — data(0) returns the full allocated FFmpeg buffer which is
+                // often larger than the actual decoded sample count. Writing the full slice
+                // appends uninitialized garbage bytes to the WAV, which manifests as crackle.
                 let skip_bytes = pre_roll_samples * 2 * 4;
-                let data = &resampled.data(0)[skip_bytes..];
+                let valid_end  = resampled.samples() * 2 * 4;
+                let data = &resampled.data(0)[skip_bytes..valid_end];
                 w.write_all(data).map_err(|e| format!("write WAV samples: {e}"))?;
                 *data_bytes += data.len() as u64;
             }
         } else {
             let skip_bytes = pre_roll_samples * 2 * 4;
-            let data = &frame.data(0)[skip_bytes..];
+            let valid_end  = frame.samples() * 2 * 4;
+            let data = &frame.data(0)[skip_bytes..valid_end];
             w.write_all(data).map_err(|e| format!("write WAV samples: {e}"))?;
             *data_bytes += data.len() as u64;
         }
