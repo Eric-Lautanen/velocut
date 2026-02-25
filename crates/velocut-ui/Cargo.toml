@@ -23,10 +23,8 @@ ffmpeg-the-third  = { workspace = true }
 anyhow            = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot       = { workspace = true }
-ureq              = { workspace = true }
 rodio             = { workspace = true }
 png               = { workspace = true }
-cpal              = { workspace = true }
 egui-desktop      = { workspace = true }
 
 [build-dependencies]
