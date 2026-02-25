@@ -48,6 +48,14 @@
 //   FIFO carry-over check. Without this, 1080p clips lose the last ~20 ms of
 //   audio per clip, which accumulates into audible gaps on long timelines.
 //
+// Overlay audio boundary contract:
+//   Audio overlay tracks are encoded exactly as the user placed them — no
+//   gap-filling, no truncation.  If an overlay ends before the video it simply
+//   stops contributing samples (the FIFO holds silence).  If an overlay extends
+//   *past* the last video clip the encoder appends black (YUV black, Y=16) video
+//   frames for the duration of the tail so the audio is preserved with a blank
+//   screen rather than silently dropped.
+//
 // Cancellation:
 //   `cancel` is an Arc<AtomicBool> checked after every video frame. When set,
 //   EncodeError { msg: "cancelled" } is sent — the UI treats that as an aborted
@@ -1514,6 +1522,109 @@ fn run_encode(
         }
     }
 
+    // ── Extend video for overlay tail ─────────────────────────────────────────
+    // If any audio overlay extends past the last video frame, generate black
+    // (YUV limited-range black: Y=16, U=128, V=128) video frames for the
+    // duration of the tail.  This preserves the user's explicit overlay
+    // placement — the overlay ends exactly where they set it, not where the
+    // video ends.  The FIFO is silence-padded each frame so drain_fifo mixes
+    // the overlay in normally.
+    {
+        let video_end_sample = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+        let overlay_end_sample = audio_state.overlays.iter()
+            .map(|ov| ov.start_sample + ov.sample_count as i64)
+            .max()
+            .unwrap_or(0);
+
+        if overlay_end_sample > video_end_sample {
+            let extra_samples = overlay_end_sample - video_end_sample;
+            // Round up so the last partial AAC frame is always included.
+            let extra_frames = ((extra_samples as f64 * spec.fps as f64 / AUDIO_RATE as f64)
+                .ceil() as i64)
+                .max(0);
+
+            eprintln!(
+                "[encode] overlay tail: {:.3}s past video end — appending {} blank frame(s)",
+                extra_samples as f64 / AUDIO_RATE as f64,
+                extra_frames,
+            );
+
+            let ost_video_tb = octx.stream(0).unwrap().time_base();
+
+            // Pre-allocate one black YUV420P frame and reuse it for all blank frames.
+            // Y=16 (black, BT.709 limited), U=V=128 (neutral chroma).
+            let mut blank = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
+            unsafe {
+                let ptr = blank.as_mut_ptr();
+                let y_stride  = (*ptr).linesize[0] as usize;
+                let uv_stride = (*ptr).linesize[1] as usize;
+                for row in 0..spec.height as usize {
+                    let p = (*ptr).data[0].add(row * y_stride);
+                    std::slice::from_raw_parts_mut(p, spec.width as usize).fill(16u8);
+                }
+                for row in 0..(spec.height as usize / 2) {
+                    let pu = (*ptr).data[1].add(row * uv_stride);
+                    let pv = (*ptr).data[2].add(row * uv_stride);
+                    std::slice::from_raw_parts_mut(pu, spec.width as usize / 2).fill(128u8);
+                    std::slice::from_raw_parts_mut(pv, spec.width as usize / 2).fill(128u8);
+                }
+                (*ptr).sample_aspect_ratio = ffmpeg::ffi::AVRational { num: 1, den: 1 };
+            }
+
+            for _ in 0..extra_frames {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+
+                blank.set_pts(Some(output_frame_idx));
+                send_video_frame(&blank, &mut video_encoder, hw_frames_ctx_ptr, hw_backend)?;
+
+                let mut pkt = Packet::empty();
+                while video_encoder.receive_packet(&mut pkt).is_ok() {
+                    pkt.set_stream(0);
+                    pkt.rescale_ts(frame_tb, ost_video_tb);
+                    let raw_dts = pkt.dts().unwrap_or(0);
+                    if last_video_dts != i64::MIN {
+                        let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
+                        let dts_s  = raw_dts          as f64 * f64::from(ost_video_tb);
+                        if dts_s < prev_s {
+                            let clamped = last_video_dts + 1;
+                            eprintln!(
+                                "[encode] blank-frame non-monotonic DTS \
+                                 ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
+                            );
+                            unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                        }
+                    }
+                    last_video_dts = pkt.dts().unwrap_or(raw_dts);
+                    pkt.write_interleaved(&mut octx)
+                        .map_err(|e| format!("write blank video packet: {e}"))?;
+                }
+
+                output_frame_idx += 1;
+
+                // Pad silence into the FIFO so drain_fifo can mix the overlay tail.
+                let expected = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
+                let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                let gap      = (expected - have).max(0) as usize;
+                if gap > 0 {
+                    audio_state.fifo.left .extend(std::iter::repeat(0.0f32).take(gap));
+                    audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                }
+
+                audio_state.drain_fifo(&mut octx, false)?;
+
+                if output_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+                    let _ = tx.send(MediaResult::EncodeProgress {
+                        job_id:       spec.job_id,
+                        frame:        output_frame_idx as u64,
+                        total_frames,
+                    });
+                }
+            }
+        }
+    }
+
     // ── Flush video encoder ───────────────────────────────────────────────────
     video_encoder.send_eof()
         .map_err(|e| format!("send EOF to video encoder: {e}"))?;
@@ -1543,7 +1654,16 @@ fn run_encode(
         output_frame_idx = output_frame_idx.max(frame_pts + 1);
     }
 
-    // ── Trim audio to video boundary ──────────────────────────────────────────
+    // ── Trim clip audio to video boundary ─────────────────────────────────────
+    // Removes clip audio (silence padding, decoded PCM) that overshot the video
+    // endpoint.  Overlay audio has already been mixed into encoded AAC packets
+    // by drain_fifo — the FIFO at this point contains only the clip-audio tail,
+    // so trimming here never discards overlay content.
+    //
+    // Note: if overlays extended past video (handled above) output_frame_idx was
+    // already advanced to cover the full overlay tail.  Any residual FIFO content
+    // is a sub-frame rounding artifact (< frame_size samples) that is safe to
+    // trim or flush.
     {
         let target_audio_samples =
             output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
@@ -1552,8 +1672,8 @@ fn run_encode(
         let excess = (total_audio - target_audio_samples).max(0) as usize;
         if excess > 0 {
             eprintln!(
-                "[encode] trimming {} trailing audio samples ({:.3}s) — \
-                 audio ran past video end ({:.3}s)",
+                "[encode] trimming {} trailing clip-audio samples ({:.3}s) — \
+                 clip audio ran past video end ({:.3}s)",
                 excess,
                 excess as f64 / AUDIO_RATE as f64,
                 output_frame_idx as f64 / spec.fps as f64,
@@ -1697,7 +1817,18 @@ fn encode_clip(
     let half_frame = 0.5 / spec.fps as f64;
 
     let clip_start_frame_idx = out_frame_idx;
-    let mut video_clip_done = false;
+    let mut video_clip_done  = false;
+    // True once the first real audio frame has been pushed to the FIFO.
+    // Used to gate the silence gap padding: before audio starts we must NOT
+    // pre-fill zeros, because real audio samples are arriving in the very next
+    // packet. Eagerly padding silence before audio has been decoded causes the
+    // AAC encoder to emit a silence→audio step that manifests as a pop/click
+    // at the start of the first clip (or any clip whose first video packet is
+    // demuxed before its first audio packet — the common case).
+    // After audio_has_started=true the gap is typically 0 (audio is flowing),
+    // but we still allow padding for the video-tail case where all audio frames
+    // have been decoded but a few video frames remain (overlay mixer continuity).
+    let mut audio_has_started = false;
 
     for result in ictx.packets() {
         let (stream, packet) = result
@@ -1782,13 +1913,19 @@ fn encode_clip(
 
                         out_frame_idx += 1;
 
-                        // Keep audio timeline in sync with video even when this clip
-                        // has no audio stream (or audio has been fully consumed).
-                        // Without this, video-only clips never push samples into the
-                        // FIFO, drain_fifo(false) is always a no-op (fifo.len() < 1024),
-                        // and overlay tracks stop being mixed after the last audio clip.
-                        // Push silence up to the expected sample count for this frame.
-                        {
+                        // Keep audio timeline in sync with video when this clip
+                        // has no audio stream, or after the clip's audio has been
+                        // fully consumed (video-tail frames).
+                        //
+                        // IMPORTANT: do NOT push silence before audio_has_started.
+                        // Before the first audio packet is decoded, the FIFO is
+                        // empty and the gap equals the full expected sample count.
+                        // Pre-filling that with zeros causes the AAC encoder to
+                        // emit a silence block immediately followed by real audio,
+                        // which produces an audible pop/click at the start of the
+                        // clip. Real audio arrives in the very next demux packet,
+                        // so no padding is needed — it will fill the gap itself.
+                        if audio_decoder.is_none() || audio_has_started {
                             let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
                             let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
                             let gap      = (expected - have).max(0) as usize;
@@ -1851,9 +1988,11 @@ fn encode_clip(
                         let mut resampled = AudioFrame::empty();
                         if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
                             audio_state.fifo.push_scaled_from(&resampled, clip.volume as f32, pre_roll);
+                            audio_has_started = true;
                         }
                     } else {
                         audio_state.fifo.push_scaled_from(&raw, clip.volume as f32, pre_roll);
+                        audio_has_started = true;
                     }
                     // Do NOT drain here — draining after every audio frame causes
                     // audio to run many seconds ahead of video in the muxer interleave
@@ -1920,7 +2059,7 @@ fn encode_clip(
                         }
                         out_frame_idx += 1;
                         // Same silence-padding logic as the main packet loop.
-                        {
+                        if audio_decoder.is_none() || audio_has_started {
                             let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
                             let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
                             let gap      = (expected - have).max(0) as usize;
