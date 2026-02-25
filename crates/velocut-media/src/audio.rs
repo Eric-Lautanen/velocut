@@ -55,7 +55,7 @@ pub fn extract_audio(path: &PathBuf, id: Uuid, source_offset: f64, duration: f64
     match decode_to_wav(path, &wav_path, source_offset, duration) {
         Ok(bytes) => {
             eprintln!("[media] audio WAV written ({bytes} bytes PCM) ← {}", path.display());
-            let _ = tx.send(MediaResult::AudioPath { id, path: wav_path });
+            let _ = tx.send(MediaResult::AudioPath { id, path: wav_path, trimmed_offset: source_offset });
         }
         Err(e) => {
             eprintln!("[media] audio extract failed for '{}': {e}", path.display());
@@ -155,10 +155,17 @@ fn decode_to_wav(src: &PathBuf, dst: &PathBuf, source_offset: f64, duration: f64
                            w: &mut std::io::BufWriter<&mut std::fs::File>,
                            data_bytes: &mut u64,
                            pts_secs: f64| -> Result<bool, String> {
-        // Skip frames that landed before source_offset due to keyframe-aligned seek.
+        // Skip frames entirely before the pre-roll window.
         if pts_secs < source_offset - 0.05 { return Ok(false); }
         // Signal caller to stop when we've passed clip_end.
         if pts_secs >= clip_end { return Ok(true); }
+
+        // Trim pre-roll: after a keyframe-aligned seek the first decoded frame
+        // may start before source_offset.  Writing those samples shifts playback
+        // audio early — same bug as encode.rs.  Only write samples from
+        // source_offset onwards (decode.rs skips video frames the same way).
+        let pre_roll_samples = ((source_offset - pts_secs).max(0.0) * OUT_RATE as f64)
+            .round() as usize;
 
         let src_channels   = frame.ch_layout().channels();
         let needs_resample = frame.format() != OUT_FMT
@@ -179,13 +186,16 @@ fn decode_to_wav(src: &PathBuf, dst: &PathBuf, source_offset: f64, duration: f64
             });
 
             let mut resampled = AudioFrame::empty();
-            if rs.run(frame, &mut resampled).is_ok() && resampled.samples() > 0 {
-                let data = resampled.data(0);
+            if rs.run(frame, &mut resampled).is_ok() && resampled.samples() > pre_roll_samples {
+                // OUT_FMT is packed interleaved f32: each sample is 2 channels × 4 bytes = 8 bytes.
+                let skip_bytes = pre_roll_samples * 2 * 4;
+                let data = &resampled.data(0)[skip_bytes..];
                 w.write_all(data).map_err(|e| format!("write WAV samples: {e}"))?;
                 *data_bytes += data.len() as u64;
             }
         } else {
-            let data = frame.data(0);
+            let skip_bytes = pre_roll_samples * 2 * 4;
+            let data = &frame.data(0)[skip_bytes..];
             w.write_all(data).map_err(|e| format!("write WAV samples: {e}"))?;
             *data_bytes += data.len() as u64;
         }

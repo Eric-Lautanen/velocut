@@ -99,6 +99,16 @@ pub struct AudioModule {
     ///   3. Drop it after FADE_OUT_HOLD_SECS so the OS buffer has time to
     ///      flush the now-silent samples before the rodio thread releases it.
     draining_sinks: Vec<(rodio::Sink, Instant)>,
+
+    /// Last volume value passed to set_volume() for each primary sink.
+    /// set_volume() is only called when the new value differs by more than
+    /// VOLUME_EPSILON — preventing the 60fps stream of instantaneous amplitude
+    /// steps that rodio applies as hard sample-level discontinuities, which
+    /// manifests as crackling when mix_factor changes or fade_out ramps.
+    sink_last_volume: HashMap<Uuid, f32>,
+
+    /// Same deduplication cache for overlay sinks.
+    overlay_last_volume: HashMap<Uuid, f32>,
 }
 
 impl AudioModule {
@@ -113,6 +123,8 @@ impl AudioModule {
             overlay_created_at: HashMap::new(),
             sink_clip_durations: HashMap::new(),
             draining_sinks: Vec::new(),
+            sink_last_volume: HashMap::new(),
+            overlay_last_volume: HashMap::new(),
         }
     }
 
@@ -125,6 +137,8 @@ impl AudioModule {
         self.overlay_has_played.clear();
         self.overlay_created_at.clear();
         self.sink_clip_durations.clear();
+        self.sink_last_volume.clear();
+        self.overlay_last_volume.clear();
     }
 
     /// Remove tracking state for a single clip ID. Called on stale-sink eviction.
@@ -136,6 +150,8 @@ impl AudioModule {
         self.overlay_has_played.remove(&id);
         self.overlay_created_at.remove(&id);
         self.sink_clip_durations.remove(&id);
+        self.sink_last_volume.remove(&id);
+        self.overlay_last_volume.remove(&id);
     }
 
     /// Move every primary + overlay sink from `ctx` into the drain pool at vol=0.
@@ -162,6 +178,33 @@ impl AudioModule {
         if let Some(sink) = ctx.audio_sinks.remove(&id) {
             sink.set_volume(0.0);
             self.draining_sinks.push((sink, Instant::now()));
+        }
+    }
+
+    /// Call sink.set_volume() only when the value has changed by more than
+    /// VOLUME_EPSILON. rodio applies every set_volume() as an instantaneous
+    /// hard step at the sample level — calling it 60 times/sec with floating
+    /// point micro-variations produces a constant stream of tiny amplitude
+    /// discontinuities that the ear hears as crackling, especially when
+    /// mix_factor changes or fade_out ramps are active.
+    ///
+    /// 0.002 ≈ −54 dB change threshold: inaudible as a volume difference but
+    /// large enough to absorb all f32 rounding noise at 60 fps.
+    const VOLUME_EPSILON: f32 = 0.002;
+
+    fn set_primary_volume(&mut self, id: Uuid, sink: &rodio::Sink, vol: f32) {
+        let last = self.sink_last_volume.get(&id).copied().unwrap_or(-1.0);
+        if (vol - last).abs() > Self::VOLUME_EPSILON {
+            sink.set_volume(vol);
+            self.sink_last_volume.insert(id, vol);
+        }
+    }
+
+    fn set_overlay_volume(&mut self, id: Uuid, sink: &rodio::Sink, vol: f32) {
+        let last = self.overlay_last_volume.get(&id).copied().unwrap_or(-1.0);
+        if (vol - last).abs() > Self::VOLUME_EPSILON {
+            sink.set_volume(vol);
+            self.overlay_last_volume.insert(id, vol);
         }
     }
 
@@ -240,6 +283,32 @@ impl AudioModule {
         // A-row clips (extracted audio) take priority over V-row clips.
         // Logic lives in clip_query::active_audio_clip — single source of truth.
         let active_clip = clip_query::active_audio_clip(state, t);
+
+        // Compute overlay clip list early so we know the total sink count before
+        // setting ANY volume. This is the key input for mix normalization below.
+        // (Previously this call happened after the primary sink block; moved up
+        // so the count is available for mix_factor before primary volume is set.)
+        let overlay_clips = clip_query::active_overlay_clips(state, t);
+
+        // ── Mix normalization ─────────────────────────────────────────────────
+        // rodio's mixer sums sample values additively. With N simultaneous sinks
+        // each at volume=1.0, the combined output reaches ±N, which hard-clips
+        // to ±1.0 at the DAC — producing the harsh crackling heard when an audio
+        // overlay plays alongside a primary clip.
+        //
+        // Equal-power mixing (1/√N per sink) is the standard solution:
+        //   N=1 → scale=1.000  (no change when playing alone)
+        //   N=2 → scale=0.707  (−3 dB each; combined RMS ≈ 1.0 for random phase)
+        //   N=3 → scale=0.577  (−4.8 dB each)
+        //
+        // Users can still adjust the balance via per-clip volume controls; this
+        // factor only prevents unintended clipping from additive summation.
+        let n_sinks = active_clip.is_some() as usize + overlay_clips.len();
+        let mix_factor = if n_sinks > 1 {
+            1.0_f32 / (n_sinks as f32).sqrt()
+        } else {
+            1.0_f32
+        };
 
         if let Some(clip) = active_clip {
             // Use a labeled block so early exits (WAV not ready, exhausted) fall
@@ -367,8 +436,9 @@ impl AudioModule {
                                     sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
                                     let _ = sink.try_seek(
                                         std::time::Duration::from_secs_f64(seek_t));
-                                    sink.set_volume(
-                                        if state.muted { 0.0 } else { state.volume * clip.volume });
+                                    let initial_vol = if state.muted { 0.0 } else { state.volume * clip.volume * mix_factor };
+                                    sink.set_volume(initial_vol);
+                                    self.sink_last_volume.insert(clip.id, initial_vol);
                                     sink.play();
                                     audio_log(&format!(
                                         "sink created seek_t={seek_t:.3} vol={}",
@@ -396,7 +466,8 @@ impl AudioModule {
                         1.0_f32
                     };
                     if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                        sink.set_volume(if state.muted { 0.0 } else { state.volume * clip.volume * fade_out });
+                        let vol = if state.muted { 0.0 } else { state.volume * clip.volume * fade_out * mix_factor };
+                        self.set_primary_volume(clip.id, sink, vol);
                     }
                 }
             }
@@ -415,7 +486,8 @@ impl AudioModule {
         // Each gets its own entry in ctx.audio_overlay_sinks, keyed by clip ID.
         // The logic mirrors the primary sink block: WAV guard, exhaustion check,
         // create-on-miss, volume sync.
-        let overlay_clips = clip_query::active_overlay_clips(state, t);
+        // overlay_clips was computed above (before the primary block) so that
+        // mix_factor could be derived from the total active-sink count.
 
         // Evict overlay sinks for clips no longer active.
         let active_overlay_ids: HashSet<Uuid> =
@@ -447,7 +519,22 @@ impl AudioModule {
                 continue;
             };
 
-            let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
+            // seek_t within the WAV file.
+            //
+            // Two cases depending on how the WAV was extracted:
+            //   • probe_clip path (always used for newly imported clips): extracts the
+            //     FULL source file starting at t=0. The WAV's t=0 = source file's t=0,
+            //     so seek to (elapsed + source_offset) is correct.
+            //   • extract_audio_trimmed path (overlay trim changed): extracts only
+            //     [source_offset, source_offset+duration). WAV's t=0 already represents
+            //     source_offset in the source, so adding source_offset again double-counts
+            //     it. Correct seek is just elapsed time in the clip.
+            //
+            // lib.audio_trimmed_offset records which offset the current WAV was
+            // extracted at (0.0 for probe_clip, actual source_offset for trimmed).
+            // Subtracting it normalises both paths to the same formula.
+            let wav_start = lib.audio_trimmed_offset;
+            let seek_t = (t - clip.start_time + clip.source_offset - wav_start).max(0.0);
 
             if self.overlay_exhausted.contains(&clip.id) {
                 continue;
@@ -489,8 +576,9 @@ impl AudioModule {
                                 sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
                                 let _ = sink.try_seek(
                                     std::time::Duration::from_secs_f64(seek_t));
-                                sink.set_volume(
-                                    if state.muted { 0.0 } else { state.volume * clip.volume });
+                                let initial_vol = if state.muted { 0.0 } else { state.volume * clip.volume * mix_factor };
+                                sink.set_volume(initial_vol);
+                                self.overlay_last_volume.insert(clip.id, initial_vol);
                                 sink.play();
                                 audio_log(&format!(
                                     "overlay sink created seek_t={seek_t:.3} vol={}",
@@ -513,7 +601,8 @@ impl AudioModule {
                 } else {
                     1.0_f32
                 };
-                sink.set_volume(if state.muted { 0.0 } else { state.volume * clip.volume * fade_out });
+                let vol = if state.muted { 0.0 } else { state.volume * clip.volume * fade_out * mix_factor };
+                self.set_overlay_volume(clip.id, sink, vol);
             }
         }
     }

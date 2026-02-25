@@ -15,7 +15,7 @@ pub enum MediaResult {
     VideoFrame { id: Uuid, width: u32, height: u32, data: Vec<u8> },
     VideoSize  { id: Uuid, width: u32, height: u32 },
     FrameSaved { path: PathBuf },
-    AudioPath  { id: Uuid, path: PathBuf },
+    AudioPath  { id: Uuid, path: PathBuf, trimmed_offset: f64 },
     Error      { id: Uuid, msg: String },
 
     // ── Encode results ────────────────────────────────────────────────────────

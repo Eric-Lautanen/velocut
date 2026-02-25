@@ -911,6 +911,21 @@ impl AudioFifo {
     fn new() -> Self { Self { left: Vec::new(), right: Vec::new() } }
     fn len(&self) -> usize { self.left.len() }
 
+    /// Like `push_scaled` but discards the first `skip` samples (pre-roll trim).
+    fn push_scaled_from(&mut self, frame: &AudioFrame, volume: f32, skip: usize) {
+        let n = frame.samples();
+        if n <= skip { return; }
+        unsafe {
+            let l_bytes = frame.data(0);
+            let l_f32 = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
+            self.left.extend(l_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+
+            let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
+            let r_f32 = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
+            self.right.extend(r_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+        }
+    }
+
     fn push_scaled(&mut self, frame: &AudioFrame, volume: f32) {
         let n = frame.samples();
         if n == 0 { return; }
@@ -1811,6 +1826,9 @@ fn encode_clip(
                     if pts_secs < clip.source_offset - 0.05 { continue; }
                     if pts_secs >= clip_end { continue; }
 
+                    let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
+                        * AUDIO_RATE as f64).round() as usize;
+
                     let target_fmt = Sample::F32(SampleType::Planar);
                     let raw_channels = raw.ch_layout().channels();
                     let needs_resample = raw.format()  != target_fmt
@@ -1832,10 +1850,10 @@ fn encode_clip(
 
                         let mut resampled = AudioFrame::empty();
                         if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                            audio_state.fifo.push_scaled(&resampled, clip.volume as f32);
+                            audio_state.fifo.push_scaled_from(&resampled, clip.volume as f32, pre_roll);
                         }
                     } else {
-                        audio_state.fifo.push_scaled(&raw, clip.volume as f32);
+                        audio_state.fifo.push_scaled_from(&raw, clip.volume as f32, pre_roll);
                     }
                     // Do NOT drain here — draining after every audio frame causes
                     // audio to run many seconds ahead of video in the muxer interleave
@@ -1928,6 +1946,9 @@ fn encode_clip(
                 .unwrap_or(0.0);
             if pts_secs >= clip_end { break; }
 
+            let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
+                * AUDIO_RATE as f64).round() as usize;
+
             let target_fmt = Sample::F32(SampleType::Planar);
             let raw_channels = raw.ch_layout().channels();
             let needs_resample = raw.format()  != target_fmt
@@ -1938,11 +1959,11 @@ fn encode_clip(
                 if let Some(rs) = &mut audio_resampler {
                     let mut resampled = AudioFrame::empty();
                     if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                        audio_state.fifo.push_scaled(&resampled, clip.volume as f32);
+                        audio_state.fifo.push_scaled_from(&resampled, clip.volume as f32, pre_roll);
                     }
                 }
             } else {
-                audio_state.fifo.push_scaled(&raw, clip.volume as f32);
+                audio_state.fifo.push_scaled_from(&raw, clip.volume as f32, pre_roll);
             }
         }
 
@@ -1959,21 +1980,26 @@ fn encode_clip(
         audio_state.drain_fifo(octx, false)?;
     }
 
-    // ── Final silence pad for the whole clip ──────────────────────────────────
-    // If this clip has no audio stream, or if the audio ended before the video
-    // (e.g. source audio shorter than video), the FIFO may be behind the video
-    // timeline. Pad silence to the exact video endpoint so that:
-    //   1. Overlay tracks continue to be mixed through the whole clip duration.
-    //   2. The FIFO carry-over into the next clip starts at the right position.
-    // This is the definitive fix for overlays stopping at the first audio clip
-    // boundary on timelines that mix audio-only and video-only source files.
+    // ── Final silence pad / excess trim for the whole clip ────────────────────
+    // Ensures the FIFO is exactly aligned to the clip video endpoint:
+    //   • Gap   → pad silence so overlays continue to be mixed.
+    //   • Excess → trim FIFO so the last AAC frame's tail (which may extend a
+    //              few ms past clip_end due to frame alignment) is removed before
+    //              apply_transition pushes the transition audio starting at the
+    //              same clip_end position.  Without the trim the FIFO contains a
+    //              ~23ms duplicate of the transition-start audio → crackle.
     {
         let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
         let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
-        let gap      = (expected - have).max(0) as usize;
-        if gap > 0 {
+        if have < expected {
+            let gap = (expected - have) as usize;
             audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
             audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+        } else if have > expected {
+            let excess = (have - expected) as usize;
+            let new_len = audio_state.fifo.left.len().saturating_sub(excess);
+            audio_state.fifo.left.truncate(new_len);
+            audio_state.fifo.right.truncate(new_len);
         }
         // Drain any full frames the silence padding completed.
         audio_state.drain_fifo(octx, false)?;
@@ -2103,17 +2129,17 @@ fn decode_clip_audio(
     let mut left  = Vec::<f32>::new();
     let mut right = Vec::<f32>::new();
 
-    fn push_frame(frame: &AudioFrame, vol: f32, left: &mut Vec<f32>, right: &mut Vec<f32>) {
+    fn push_frame(frame: &AudioFrame, vol: f32, left: &mut Vec<f32>, right: &mut Vec<f32>, skip: usize) {
         let n = frame.samples();
-        if n == 0 { return; }
+        if n <= skip { return; }
         unsafe {
             let l_bytes = frame.data(0);
             let l_f32   = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
-            left.extend(l_f32.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+            left.extend(l_f32[skip..].iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
 
             let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
             let r_f32   = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
-            right.extend(r_f32.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
+            right.extend(r_f32[skip..].iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
         }
     }
 
@@ -2131,6 +2157,9 @@ fn decode_clip_audio(
                 .unwrap_or(0.0);
             if pts_secs < clip.source_offset - 0.05 { continue; }
             if pts_secs >= clip_end { break 'pkt; }
+
+            let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
+                * AUDIO_RATE as f64).round() as usize;
 
             let raw_channels   = raw.ch_layout().channels();
             let needs_resample = raw.format() != target_fmt
@@ -2151,10 +2180,10 @@ fn decode_clip_audio(
                 });
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                    push_frame(&resampled, clip.volume, &mut left, &mut right);
+                    push_frame(&resampled, clip.volume, &mut left, &mut right, pre_roll);
                 }
             } else {
-                push_frame(&raw, clip.volume, &mut left, &mut right);
+                push_frame(&raw, clip.volume, &mut left, &mut right, pre_roll);
             }
         }
     }
@@ -2176,11 +2205,11 @@ fn decode_clip_audio(
             if let Some(rs) = &mut audio_resampler {
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                    push_frame(&resampled, clip.volume, &mut left, &mut right);
+                    push_frame(&resampled, clip.volume, &mut left, &mut right, 0);
                 }
             }
         } else {
-            push_frame(&raw, clip.volume, &mut left, &mut right);
+            push_frame(&raw, clip.volume, &mut left, &mut right, 0);
         }
     }
 
@@ -2200,7 +2229,7 @@ fn decode_clip_audio(
                 );
                 if n_out > 0 {
                     (*tmp_frame.as_mut_ptr()).nb_samples = n_out;
-                    push_frame(&tmp_frame, clip.volume, &mut left, &mut right);
+                    push_frame(&tmp_frame, clip.volume, &mut left, &mut right, 0);
                 }
             }
         }
@@ -2295,11 +2324,22 @@ fn apply_transition(
         let sample_start = (i       as f64 * samples_per_frame_f).round() as usize;
         let sample_end   = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
         let af = alpha as f32;
+
+        // Clamp tail/head vec access: if AAC frame alignment leaves the vec a few
+        // samples short of sample_end, hold the last valid sample rather than
+        // snapping to 0.0.  A hard snap to silence mid-crossfade is audible as
+        // crackling; holding the last sample produces a near-identical waveform
+        // (alpha≈1 at tail-end so tail contribution is ≈0 anyway).
+        let tail_last_l = tail_audio_l.last().copied().unwrap_or(0.0);
+        let tail_last_r = tail_audio_r.last().copied().unwrap_or(0.0);
+        let head_last_l = head_audio_l.last().copied().unwrap_or(0.0);
+        let head_last_r = head_audio_r.last().copied().unwrap_or(0.0);
+
         for s in sample_start..sample_end {
-            let t_l = tail_audio_l.get(s).copied().unwrap_or(0.0);
-            let t_r = tail_audio_r.get(s).copied().unwrap_or(0.0);
-            let h_l = head_audio_l.get(s).copied().unwrap_or(0.0);
-            let h_r = head_audio_r.get(s).copied().unwrap_or(0.0);
+            let t_l = tail_audio_l.get(s).copied().unwrap_or(tail_last_l);
+            let t_r = tail_audio_r.get(s).copied().unwrap_or(tail_last_r);
+            let h_l = head_audio_l.get(s).copied().unwrap_or(head_last_l);
+            let h_r = head_audio_r.get(s).copied().unwrap_or(head_last_r);
             audio_state.fifo.left .push((t_l * (1.0 - af) + h_l * af).clamp(-1.0, 1.0));
             audio_state.fifo.right.push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
         }

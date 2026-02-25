@@ -353,16 +353,17 @@ impl VeloCutApp {
                         let effective_path = wav_path.clone()
                             .unwrap_or_else(|| src_path.clone());
                         self.state.library.push(LibraryClip {
-                            id:              audio_lib_id,
-                            path:            effective_path,
-                            name:            format!("[Audio] {src_name}"),
+                            id:                   audio_lib_id,
+                            path:                 effective_path,
+                            name:                 format!("[Audio] {src_name}"),
                             duration,
-                            clip_type:       ClipType::Audio,
-                            thumbnail_path:  None,
-                            duration_probed: true,
-                            waveform_peaks:  peaks,
-                            video_size:      None,
-                            audio_path:      wav_path,
+                            clip_type:            ClipType::Audio,
+                            thumbnail_path:       None,
+                            duration_probed:      true,
+                            waveform_peaks:       peaks,
+                            video_size:           None,
+                            audio_path:           wav_path,
+                            audio_trimmed_offset: 0.0,
                         });
                         // Rewire the A-row timeline clip to the audio library entry.
                         if let Some(tc) = self.state.timeline.iter_mut()

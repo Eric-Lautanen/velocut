@@ -275,11 +275,9 @@ impl AppContext {
         // ── Shared channel: probes, waveforms, audio, encode, HQ frames ───────
         while let Ok(result) = self.media_worker.rx.try_recv() {
             match result {
-                MediaResult::AudioPath { id, path } => {
-                    velocut_log!("[audio] AudioPath arrived id={id} path={}", path.display());
-                    if let Some(clip) = state.library.iter_mut().find(|c| c.id == id) {
-                        clip.audio_path = Some(path);
-                    }
+                MediaResult::AudioPath { id, path, trimmed_offset } => {
+                    velocut_log!("[audio] AudioPath arrived id={id} path={} trimmed_offset={trimmed_offset:.3}", path.display());
+                    state.set_audio_path(id, path, trimmed_offset);
                 }
 
                 MediaResult::Duration { id, seconds } => {

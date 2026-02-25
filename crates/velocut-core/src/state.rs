@@ -42,6 +42,14 @@ pub struct LibraryClip {
     pub video_size:      Option<(u32, u32)>,
     #[serde(default)]
     pub audio_path:      Option<PathBuf>,
+    /// The source-file offset (seconds) at which the current `audio_path` WAV
+    /// begins. 0.0 for full-file extractions (probe_clip path); equal to
+    /// `source_offset` for trimmed extractions (extract_audio_trimmed path).
+    ///
+    /// Used by AudioModule to avoid double-counting source_offset when seeking
+    /// into the WAV: `seek_t = elapsed + source_offset - audio_trimmed_offset`.
+    #[serde(default)]
+    pub audio_trimmed_offset: f64,
 }
 
 /// An instance of a LibraryClip placed on the timeline
@@ -217,7 +225,8 @@ impl ProjectState {
             duration_probed: false,
             waveform_peaks:  Vec::new(),
             video_size:      None,
-            audio_path:      None,
+            audio_path:           None,
+            audio_trimmed_offset: 0.0,
         });
         self.pending_probes.push((id, path));
         id
@@ -242,6 +251,18 @@ impl ProjectState {
     pub fn update_waveform(&mut self, id: Uuid, peaks: Vec<f32>) {
         if let Some(clip) = self.library.iter_mut().find(|c| c.id == id) {
             clip.waveform_peaks = peaks;
+        }
+    }
+
+    /// Set the extracted WAV path and the source offset at which it starts.
+    /// `trimmed_offset` is 0.0 for full-file extractions (probe_clip) and
+    /// equal to the clip's source_offset for trimmed extractions
+    /// (extract_audio_trimmed). AudioModule subtracts this from seek_t so
+    /// both code paths land at the correct position in the WAV.
+    pub fn set_audio_path(&mut self, id: Uuid, path: PathBuf, trimmed_offset: f64) {
+        if let Some(clip) = self.library.iter_mut().find(|c| c.id == id) {
+            clip.audio_path           = Some(path);
+            clip.audio_trimmed_offset = trimmed_offset;
         }
     }
 
