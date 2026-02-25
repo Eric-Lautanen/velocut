@@ -752,7 +752,7 @@ impl MediaWorker {
         cvar.notify_one();
     }
 
-    pub fn request_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64) {
+    pub fn request_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64, preview_size: Option<(u32, u32)>) {
         let tx  = self.scrub_tx.clone();
         let sd  = self.shutdown.clone();
         let sem = self.hq_sem.clone();
@@ -779,7 +779,7 @@ impl MediaWorker {
                 G(sem)
             };
             if sd.load(Ordering::Relaxed) { return; }
-            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx) {
+            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx, preview_size) {
                 eprintln!("[media] request_frame_hq: {e}");
             }
         });
@@ -926,7 +926,7 @@ impl MediaWorker {
         thread::spawn(move || {
             if sd.load(Ordering::Relaxed) { return; }
             if let Err(e) = decode_frame(
-                &path, id, timestamp, 0.0, true, Some(dest), &tx,
+                &path, id, timestamp, 0.0, true, Some(dest), &tx, None,
             ) {
                 eprintln!("[media] extract_frame_hq: {e}");
             }

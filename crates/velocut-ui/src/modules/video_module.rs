@@ -407,7 +407,7 @@ impl VideoModule {
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 // Use local_t (exact playhead position), not the quantised fine_bucket,
                 // so the HQ decode lands on the precise frame the user is looking at.
-                ctx.media_worker.request_frame_hq(lib.id, lib.path.clone(), local_t);
+                ctx.media_worker.request_frame_hq(lib.id, lib.path.clone(), local_t, preview_size);
                 ctx.playback.scrub_last_moved = None;
             }
         }

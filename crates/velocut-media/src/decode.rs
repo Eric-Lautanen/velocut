@@ -602,13 +602,14 @@ fn copy_frame_rgba(
 // ── One-shot frame decode (preview + PNG save) ────────────────────────────────
 
 pub fn decode_frame(
-    path:      &PathBuf,
-    id:        Uuid,
-    timestamp: f64,
-    aspect:    f32,        // 0.0 = use native resolution
-    save_png:  bool,       // true = write PNG to dest, false = send VideoFrame
-    dest:      Option<PathBuf>,
-    tx:        &Sender<MediaResult>,
+    path:         &PathBuf,
+    id:           Uuid,
+    timestamp:    f64,
+    aspect:       f32,               // 0.0 = use native resolution (or preview_size if set)
+    save_png:     bool,              // true = write PNG to dest, false = send VideoFrame
+    dest:         Option<PathBuf>,
+    tx:           &Sender<MediaResult>,
+    preview_size: Option<(u32, u32)>, // UI panel dims — decode at this size when aspect<=0; ignored for PNG
 ) -> Result<()> {
     let mut ictx = input(path)?;
 
@@ -675,12 +676,22 @@ pub fn decode_frame(
             if scaler.is_none() {
                 let frame_w = decoded.width();
                 let frame_h = decoded.height();
-                let (w, h) = if save_png || aspect <= 0.0 {
+                let (w, h) = if save_png {
+                    // PNG export: always native resolution regardless of preview_size.
                     (frame_w, frame_h)
-                } else {
+                } else if aspect > 0.0 {
+                    // Scrub mode: fixed 640px wide, source AR height.
                     let w: u32 = 640;
                     let h: u32 = ((w as f32 / aspect.max(0.01)) as u32).max(2) & !1;
                     (w, h)
+                } else if let Some((pw, ph)) = preview_size {
+                    // HQ scrub (L3 idle): decode at player panel dimensions.
+                    // Avoids decoding 4K only to display at e.g. 960×540.
+                    // Same resolution the playback path uses (preview_size in LiveDecoder::open).
+                    (pw, ph)
+                } else {
+                    // No panel size known yet — fall back to native source resolution.
+                    (frame_w, frame_h)
                 };
                 out_w = w;
                 out_h = h;
