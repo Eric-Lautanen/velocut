@@ -33,4 +33,3 @@ cpal              = "0.15"
 egui-desktop      = "0.2.2"
 winresource       = "0.1"
 rayon             = "1.11"
-mimalloc          = { version = "0.1.48", default-features = false, features = ["v3"] }

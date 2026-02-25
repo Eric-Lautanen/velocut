@@ -253,7 +253,7 @@ impl MediaWorker {
                                 None
                             };
 
-                            blend = Some(ActiveBlend { spec, aspect, decoder_b: recycled_decoder_b, preview_size });
+                            blend = Some(ActiveBlend { spec, aspect, decoder_b: recycled_decoder_b });
                             if !invert { held_blend = None; }
                             let t0 = std::time::Instant::now();
                             eprintln!("[pb] StartBlend received (active), ts={ts:.3}, recycled_decoder_b={invert}");
@@ -582,7 +582,7 @@ impl MediaWorker {
                                     eprintln!("[pb] bridge done: alpha_start updated to {:.3}, burn_ts={burn_ts:.3}, chan_filled={}", spec.alpha_start, pb_frame_tx.len());
                                 }
 
-                                blend = Some(ActiveBlend { spec, aspect, decoder_b: prebuilt_db, preview_size });
+                                blend = Some(ActiveBlend { spec, aspect, decoder_b: prebuilt_db });
                                 if !invert { held_blend = None; }
                                 let t0 = std::time::Instant::now();
                                 eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
@@ -967,10 +967,9 @@ impl MediaWorker {
 // ── Blend decoder helpers ─────────────────────────────────────────────────────
 
 struct ActiveBlend {
-    spec:         velocut_core::media_types::PlaybackTransitionSpec,
-    aspect:       f32,
-    decoder_b:    Option<LiveDecoder>,
-    preview_size: Option<(u32, u32)>,
+    spec:      velocut_core::media_types::PlaybackTransitionSpec,
+    aspect:    f32,
+    decoder_b: Option<LiveDecoder>,
 }
 
 // ── RGBA crop helper ──────────────────────────────────────────────────────────
