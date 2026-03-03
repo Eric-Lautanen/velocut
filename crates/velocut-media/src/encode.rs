@@ -1546,7 +1546,7 @@ fn run_encode(
                 fade_in_start_secs: 0.0,
                 fade_out_secs:      0.0,
                 fade_out_end_secs:  0.0,
-                filter: FilterParams::none(),
+                filter: clip.filter.clone(),   // inherit the outgoing clip's filter
             };
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
@@ -1558,7 +1558,7 @@ fn run_encode(
                 fade_in_start_secs: 0.0,
                 fade_out_secs:      0.0,
                 fade_out_end_secs:  0.0,
-                filter: FilterParams::none(),
+                filter: next_clip.filter.clone(),   // inherit the incoming clip's filter
             };
 
             if let Some(transition_impl) = transition_registry.get(&entry.kind.kind) {
@@ -2350,6 +2350,7 @@ fn decode_clip_frames(
             let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             sc.run(&decoded, &mut yuv)
                 .map_err(|e| format!("crossfade scale: {e}"))?;
+            apply_filter_to_yuv_frame(&mut yuv, &clip.filter, spec.width, spec.height);
 
             frames.push(extract_yuv(&yuv, w, h, uv_w, uv_h));
         }

@@ -33,6 +33,12 @@ pub struct TimelineModule {
     filter_popup: Option<(Uuid, Pos2)>,
     filter_popup_just_opened: bool,
 
+    /// Tracks (clip_id, target_row) during a cross-track drag for lane highlight.
+    /// One-frame latency is imperceptible and avoids a second pass over clips.
+    drag_target: Option<(Uuid, usize)>,
+
+    /// Last timeline position (seconds) for which a scrub decode was emitted.
+
     /// Whether the hotkey reference popup is currently visible.
     hotkeys_open: bool,
     /// True on the frame the hotkey popup is first opened — suppresses the
@@ -64,6 +70,7 @@ impl TimelineModule {
             last_scrub_emitted_time:      f64::NEG_INFINITY,
             filter_popup:                 None,
             filter_popup_just_opened:     false,
+            drag_target:                  None,
         }
     }
 }
@@ -547,7 +554,17 @@ impl EditorModule for TimelineModule {
                         }
                         s += step;
                     }
-
+                    let snap_secs = 8.0_f64 / state.timeline_zoom as f64;
+                    let video_clip_ends: Vec<f64> = state.timeline.iter()
+                        .filter(|c| c.track_row % 2 == 0)
+                        .map(|c| c.start_time + c.duration - (1.0 / 30.0))
+                        .collect();
+                    let snap_to_video_end = |t: f64| -> f64 {
+                        video_clip_ends.iter()
+                            .copied()
+                            .find(|&e| (t - e).abs() < snap_secs)
+                            .unwrap_or(t)
+                    };
                     // Ruler click/drag → seek
                     let ruler_rect = Rect::from_min_size(Pos2::new(time_origin_x, rect.min.y), egui::vec2(fill_w, header_height));
                     let ruler_resp = ui.interact(ruler_rect, Id::new("timeline_ruler"), Sense::click_and_drag());
@@ -556,17 +573,14 @@ impl EditorModule for TimelineModule {
                             let t         = ((ptr.x - time_origin_x) / state.timeline_zoom).max(0.0) as f64;
                             let t_clamped = t.min(state.total_duration().max(0.0));
                             if ruler_resp.drag_started() || ruler_resp.clicked() {
-                                // Click or drag-start: always emit so the user gets instant response.
+                                let snapped = snap_to_video_end(t_clamped);
                                 cmd.push(EditorCommand::Pause);
-                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
-                                self.last_scrub_emitted_time = t_clamped;
+                                cmd.push(EditorCommand::SetPlayhead(snapped));
+                                self.last_scrub_emitted_time = snapped;
                             } else if (t_clamped - self.last_scrub_emitted_time).abs() >= 1.0 / 30.0 {
-                                // Mid-drag: only emit when the cursor has moved at least one frame's
-                                // worth of time.  At low zoom many pixels map to the same 1/30 s bucket
-                                // — skipping them avoids flooding the decode thread with wakes that each
-                                // allocate a full RGBA buffer and thrash the bucket cache.
-                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
-                                self.last_scrub_emitted_time = t_clamped;
+                                let snapped = snap_to_video_end(t_clamped);
+                                cmd.push(EditorCommand::SetPlayhead(snapped));
+                                self.last_scrub_emitted_time = snapped;
                             }
                         }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -659,7 +673,22 @@ impl EditorModule for TimelineModule {
                             }
                         }
                     }
-
+                    // ── Target-row highlight during cross-track drag ──────────────
+                    // Uses self.drag_target set on the PREVIOUS frame (one-frame latency,
+                    // imperceptible) so the highlight renders under the clips.
+                    if let Some((_, target_row)) = self.drag_target {
+                        let hy = rect.min.y + header_height
+                            + target_row as f32 * (track_height + track_gap);
+                        let hr = Rect::from_min_size(
+                            Pos2::new(time_origin_x, hy),
+                            egui::vec2(fill_w, track_height),
+                        );
+                        painter.rect_filled(hr, 0.0,
+                            Color32::from_rgba_unmultiplied(100, 160, 255, 22));
+                        painter.rect_stroke(hr, 0.0,
+                            Stroke::new(1.0, ACCENT.linear_multiply(0.45)),
+                            egui::StrokeKind::Inside);
+                    }
                     // ── Timeline Clips ─────────────────────────────────────────────
                     let mut to_delete: Option<Uuid> = None;
 
@@ -893,27 +922,63 @@ impl EditorModule for TimelineModule {
                                 let delta_t = clip_interact.drag_delta().x as f64 / state.timeline_zoom as f64;
                                 let snap_px = 8.0_f64 / state.timeline_zoom as f64;
                                 let clip_id = clip.id;
-                                let clip_row = clip.track_row;
+
+                                // Compute target row from the pointer's current Y position so the
+                                // clip follows the cursor across tracks, not just horizontally.
+                                let target_row = clip_interact.interact_pointer_pos()
+                                    .map(|ptr| {
+                                        let rel_y = (ptr.y - (rect.min.y + header_height)).max(0.0);
+                                        let raw_row = ((rel_y / (track_height + track_gap)) as usize)
+                                            .min(num_tracks - 1);
+                                        // Enforce track-type constraints:
+                                        //   Video (incl. clips on V-rows) → even rows (V1=0, V2=2)
+                                        //   Audio (incl. extracted-audio)  → odd  rows (A1=1, A2=3)
+                                        match render_type {
+                                            ClipType::Video => {
+                                                let r = if raw_row % 2 == 0 { raw_row }
+                                                        else { raw_row.saturating_sub(1) };
+                                                r.min(2)
+                                            }
+                                            ClipType::Audio => {
+                                                let r = if raw_row % 2 == 1 { raw_row }
+                                                        else { (raw_row + 1).min(3) };
+                                                r.min(3)
+                                            }
+                                        }
+                                    })
+                                    .unwrap_or(clip.track_row);
+
+                                // Store for the lane highlight painted on the NEXT frame.
+                                self.drag_target = Some((clip_id, target_row));
+
+                                // Snap against neighbors in the TARGET row so edge-snapping
+                                // works correctly when moving between tracks.
                                 let neighbors: Vec<f64> = state.timeline.iter()
-                                    .filter(|c| c.id != clip_id && c.track_row == clip_row)
+                                    .filter(|c| c.id != clip_id && c.track_row == target_row)
                                     .flat_map(|c| [c.start_time, c.start_time + c.duration])
                                     .collect();
                                 let mut new_start = (clip.start_time + delta_t).max(0.0);
-                                if new_start < snap_px {
-                                    new_start = 0.0;
-                                } else {
-                                    for edge in &neighbors {
-                                        if (new_start - edge).abs() < snap_px {
-                                            new_start = *edge;
-                                            break;
-                                        }
+                            if new_start < snap_px {
+                                new_start = 0.0;
+                            } else {
+                                for edge in &neighbors {
+                                    if (new_start - edge).abs() < snap_px {
+                                        new_start = *edge;
+                                        break;
                                     }
                                 }
-                                cmd.push(EditorCommand::MoveTimelineClip { id: clip_id, new_start });
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                            } else if clip_interact.hovered() && !left_trim.hovered() && !right_trim.hovered() {
+                            }
+                            cmd.push(EditorCommand::MoveTimelineClip { id: clip_id, new_start, new_row: target_row });
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        } else {
+                            // Clear drag target when this clip is no longer being dragged.
+                            if self.drag_target.map(|(id, _)| id) == Some(clip.id) {
+                                self.drag_target = None;
+                            }
+                            if clip_interact.hovered() && !left_trim.hovered() && !right_trim.hovered() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                             }
+                        }
                         }
 
                         // Right-click context menu
@@ -1153,14 +1218,14 @@ impl EditorModule for TimelineModule {
                             let t         = ((ptr.x - time_origin_x) / state.timeline_zoom).max(0.0) as f64;
                             let t_clamped = t.min(state.total_duration().max(0.0));
                             if handle_resp.drag_started() {
-                                // Drag start: always emit so the handle feels immediately responsive.
+                                let snapped = snap_to_video_end(t_clamped);
                                 cmd.push(EditorCommand::Pause);
-                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
-                                self.last_scrub_emitted_time = t_clamped;
+                                cmd.push(EditorCommand::SetPlayhead(snapped));
+                                self.last_scrub_emitted_time = snapped;
                             } else if (t_clamped - self.last_scrub_emitted_time).abs() >= 1.0 / 30.0 {
-                                // Same dedup as ruler: skip sub-frame deltas during drag.
-                                cmd.push(EditorCommand::SetPlayhead(t_clamped));
-                                self.last_scrub_emitted_time = t_clamped;
+                                let snapped = snap_to_video_end(t_clamped);
+                                cmd.push(EditorCommand::SetPlayhead(snapped));
+                                self.last_scrub_emitted_time = snapped;
                             }
                         }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);

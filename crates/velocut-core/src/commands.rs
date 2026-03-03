@@ -29,7 +29,7 @@ pub enum EditorCommand {
     AddToTimeline { media_id: Uuid, at_time: f64, track_row: usize },
     DeleteTimelineClip(Uuid),
     SelectTimelineClip(Option<Uuid>),
-    MoveTimelineClip { id: Uuid, new_start: f64 },
+    MoveTimelineClip { id: Uuid, new_start: f64, new_row: usize },
     TrimClipStart  { id: Uuid, new_source_offset: f64, new_duration: f64 },
     TrimClipEnd    { id: Uuid, new_duration: f64 },
     SplitClipAt(f64),

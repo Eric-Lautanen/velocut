@@ -423,9 +423,10 @@ impl VeloCutApp {
             EditorCommand::SelectTimelineClip(id) => {
                 self.state.selected_timeline_clip = id;
             }
-            EditorCommand::MoveTimelineClip { id, new_start } => {
+            EditorCommand::MoveTimelineClip { id, new_start, new_row } => {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.start_time = new_start;
+                    tc.track_row  = new_row;
                 }
             }
             EditorCommand::SplitClipAt(t) => {
