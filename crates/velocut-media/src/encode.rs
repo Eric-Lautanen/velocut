@@ -103,10 +103,14 @@ pub struct ClipSpec {
     pub volume:        f32,
     /// When true, no audio is decoded or pushed to the FIFO for this clip.
     pub skip_audio:    bool,
-    /// Fade-in duration in seconds (0.0 = none). Ramp from 0→1 at clip start.
-    pub fade_in_secs:  f32,
-    /// Fade-out duration in seconds (0.0 = none). Ramp from 1→0 at clip end.
-    pub fade_out_secs: f32,
+    /// Fade-in ramp duration (0.0 = none). Ramp starts after `fade_in_start_secs` of silence.
+    pub fade_in_secs:       f32,
+    /// Silence before the fade-in ramp begins (0.0 = ramp starts at clip boundary).
+    pub fade_in_start_secs: f32,
+    /// Fade-out ramp duration (0.0 = none). After ramp, silence for `fade_out_end_secs`.
+    pub fade_out_secs:      f32,
+    /// Silence after fade-out ramp ends, before clip boundary (0.0 = ramp ends at boundary).
+    pub fade_out_end_secs:  f32,
 }
 
 /// A standalone audio clip that runs in parallel with the video timeline.
@@ -1474,8 +1478,10 @@ fn run_encode(
             duration:      (clip.duration - skip - transition_secs).max(0.0),
             volume:        clip.volume,
             skip_audio:    clip.skip_audio,
-            fade_in_secs:  clip.fade_in_secs,
-            fade_out_secs: clip.fade_out_secs,
+            fade_in_secs:       clip.fade_in_secs,
+            fade_in_start_secs: clip.fade_in_start_secs,
+            fade_out_secs:      clip.fade_out_secs,
+            fade_out_end_secs:  clip.fade_out_end_secs,
         };
 
         output_frame_idx = encode_clip(
@@ -1503,8 +1509,10 @@ fn run_encode(
                 duration:      transition_secs,
                 volume:        clip.volume,
                 skip_audio:    false,
-                fade_in_secs:  0.0,
-                fade_out_secs: 0.0,
+                fade_in_secs:       0.0,
+                fade_in_start_secs: 0.0,
+                fade_out_secs:      0.0,
+                fade_out_end_secs:  0.0,
             };
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
@@ -1512,8 +1520,10 @@ fn run_encode(
                 duration:      transition_secs,
                 volume:        next_clip.volume,
                 skip_audio:    false,
-                fade_in_secs:  0.0,
-                fade_out_secs: 0.0,
+                fade_in_secs:       0.0,
+                fade_in_start_secs: 0.0,
+                fade_out_secs:      0.0,
+                fade_out_end_secs:  0.0,
             };
 
             if let Some(transition_impl) = transition_registry.get(&entry.kind.kind) {
@@ -1764,24 +1774,28 @@ fn send_video_frame(
     }
 }
 
-/// Compute the fade envelope gain [0.0, 1.0] for an audio frame at `pts_secs`
-/// within a clip spanning [source_offset, source_offset + duration].
+/// Equal-power fade envelope with anchor support.
 ///
-/// Linear ramp: fade-in over the first `fade_in_secs` seconds, fade-out over
-/// the last `fade_out_secs` seconds. When both overlap (very short clips)
-/// fade-in takes priority so the result never goes below 0.
+/// Fade-in:  silence for `fade_in_start_secs`, then sqrt-ramp over `fade_in_secs`.
+/// Fade-out: sqrt-ramp over `fade_out_secs`, then silence for `fade_out_end_secs`.
 #[inline]
 fn fade_gain(
-    pts_secs:      f64,
-    source_offset: f64,
-    duration:      f64,
-    fade_in_secs:  f32,
-    fade_out_secs: f32,
+    pts_secs:           f64,
+    source_offset:      f64,
+    duration:           f64,
+    fade_in_secs:       f32,
+    fade_in_start_secs: f32,
+    fade_out_secs:      f32,
+    fade_out_end_secs:  f32,
 ) -> f32 {
-    let elapsed  = (pts_secs - source_offset).max(0.0) as f32;
-    let remain   = (duration as f32 - elapsed).max(0.0);
-    let in_gain  = if fade_in_secs  > 0.0 { (elapsed / fade_in_secs ).clamp(0.0, 1.0) } else { 1.0 };
-    let out_gain = if fade_out_secs > 0.0 { (remain  / fade_out_secs).clamp(0.0, 1.0) } else { 1.0 };
+    let elapsed = (pts_secs - source_offset).max(0.0) as f32;
+    let remain  = (duration as f32 - elapsed).max(0.0);
+    let in_gain = if elapsed < fade_in_start_secs { 0.0 }
+        else if fade_in_secs > 0.0 { ((elapsed - fade_in_start_secs) / fade_in_secs).clamp(0.0, 1.0).sqrt() }
+        else { 1.0 };
+    let out_gain = if remain < fade_out_end_secs { 0.0 }
+        else if fade_out_secs > 0.0 { ((remain - fade_out_end_secs) / fade_out_secs).clamp(0.0, 1.0).sqrt() }
+        else { 1.0 };
     in_gain.min(out_gain)
 }
 
@@ -2043,12 +2057,12 @@ fn encode_clip(
 
                         let mut resampled = AudioFrame::empty();
                         if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                            let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_out_secs);
+                            let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
                             audio_state.fifo.push_scaled_from(&resampled, clip.volume * fg, pre_roll);
                             audio_has_started = true;
                         }
                     } else {
-                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_out_secs);
+                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
                         audio_state.fifo.push_scaled_from(&raw, clip.volume * fg, pre_roll);
                         audio_has_started = true;
                     }
@@ -2165,12 +2179,12 @@ fn encode_clip(
                 if let Some(rs) = &mut audio_resampler {
                     let mut resampled = AudioFrame::empty();
                     if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_out_secs);
+                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
                         audio_state.fifo.push_scaled_from(&resampled, clip.volume * fg, pre_roll);
                     }
                 }
             } else {
-                let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_out_secs);
+                let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
                 audio_state.fifo.push_scaled_from(&raw, clip.volume * fg, pre_roll);
             }
         }

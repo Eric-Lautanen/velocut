@@ -720,7 +720,7 @@ impl EditorModule for TimelineModule {
                         // · Extracted audio clip (is_extracted_audio_clip): always show waveform.
                         // · Regular audio clip: always show waveform.
                         if !waveform.is_empty() && width > 10.0 && !clip.audio_muted {
-                            draw_waveform(&painter, clip_rect, waveform, render_type, clip.volume);
+                            draw_waveform(&painter, clip_rect, waveform, render_type, clip.volume, state.volume, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs, clip.duration as f32);
                         }
 
                         // Top stripe
@@ -1275,179 +1275,160 @@ impl EditorModule for TimelineModule {
                 self.transition_popup_just_opened = false;
             }
 
-            // ── Volume popup ───────────────────────────────────────────────────
-            // Floats above the speaker icon. Nearly transparent so the waveform
-            // on the clip is visible through it as volume changes.
-            // Closes when neither the icon nor this area is hovered.
+            // ── Volume / Fade popup ───────────────────────────────────────────────────
+            // Three-section floating panel: [Fade In | Volume | Fade Out].
             if let Some((vol_clip_id, anchor)) = self.vol_popup {
-                // Look up this clip's current volume and fade values from state.
-                let (current_vol, current_fade_in, current_fade_out) = state.timeline.iter()
+                let clip_data = state.timeline.iter()
                     .find(|c| c.id == vol_clip_id)
-                    .map(|c| (c.volume, c.fade_in_secs, c.fade_out_secs))
-                    .unwrap_or((1.0, 0.0, 0.0));
+                    .map(|c| (c.volume, c.fade_in_secs, c.fade_in_start_secs, c.fade_out_secs, c.fade_out_end_secs));
 
-                // Convert linear → dB for display and editing.
-                let vol_to_db = |v: f32| -> f32 {
-                    if v <= 0.0001 { -60.0 } else { 20.0 * v.log10() }
-                };
-                let db_to_vol = |db: f32| -> f32 { 10.0_f32.powf(db / 20.0) };
+                if let Some((cur_vol, cur_fi, cur_fi_start, cur_fo, cur_fo_end)) = clip_data {
+                    let vol_to_db = |v: f32| -> f32 {
+                        if v <= 0.0001 { -60.0 } else { 20.0 * v.log10() }
+                    };
+                    let db_to_vol = |db: f32| -> f32 { 10.0_f32.powf(db / 20.0) };
 
-                let mut vol_db       = vol_to_db(current_vol);
-                let mut fade_in_val  = current_fade_in;
-                let mut fade_out_val = current_fade_out;
+                    let mut vol_db   = vol_to_db(cur_vol);
+                    let mut fi_ramp  = cur_fi;
+                    let mut fi_delay = cur_fi_start;
+                    let mut fo_ramp  = cur_fo;
+                    let mut fo_tail  = cur_fo_end;
 
-                // Position popup centered above the speaker icon, above the clip.
-                let popup_w  = 140.0_f32;
-                let popup_h  = 180.0_f32;
-                let popup_pos = Pos2::new(
-                    anchor.x - popup_w * 0.5,
-                    anchor.y - popup_h - 14.0,
-                );
+                    let col_w   = 54.0_f32;
+                    let sep_w   =  6.0_f32;
+                    let margin  =  8.0_f32;
+                    let popup_w = col_w * 3.0 + sep_w * 2.0 + margin * 2.0;
+                    let popup_h = 210.0_f32;
+                    let popup_pos = Pos2::new(
+                        (anchor.x - popup_w * 0.5).max(4.0),
+                        anchor.y - popup_h - 14.0,
+                    );
 
-                let area_resp = egui::Area::new(Id::new("vol_popup_area"))
-                    .fixed_pos(popup_pos)
-                    .order(egui::Order::Foreground)
-                    .interactable(true)
-                    .show(ui.ctx(), |ui| {
-                        // Nearly-transparent dark frame — waveform shows through.
-                        egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(18, 18, 24, 185))
-                            .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
-                            .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin::same(8))
-                            .shadow(egui::Shadow {
-                                offset: [0, 4],
-                                blur: 10,
-                                spread: 0,
-                                color: Color32::from_black_alpha(100),
-                            })
-                            .show(ui, |ui| {
-                                let inner_w = popup_w - 16.0;
-                                ui.set_min_width(inner_w);
-                                ui.set_max_width(inner_w);
+                    let area_resp = egui::Area::new(Id::new("vol_popup_area"))
+                        .fixed_pos(popup_pos)
+                        .order(egui::Order::Foreground)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgba_unmultiplied(18, 18, 24, 215))
+                                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::same(margin as _))
+                                .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(120) })
+                                .show(ui, |ui| {
+                                    ui.set_min_width(popup_w - margin * 2.0);
 
-                                // ── Volume column + fade columns side by side ────
-                                ui.horizontal(|ui| {
-                                    // Volume
-                                    ui.vertical(|ui| {
-                                        let db_label = if vol_db <= -59.0 {
-                                            "-\u{221e} dB".to_string()
-                                        } else {
-                                            format!("{:+.1} dB", vol_db)
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("🔊  Clip Audio").size(11.0).strong().color(ACCENT));
+                                    });
+                                    ui.add_space(5.0);
+                                    ui.separator();
+                                    ui.add_space(5.0);
+
+                                    // Column headers
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                        let hdr = |ui: &mut egui::Ui, text: &str| {
+                                            ui.allocate_ui(Vec2::new(col_w, 14.0), |ui| {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.label(RichText::new(text).size(8.5).color(Color32::from_rgba_unmultiplied(100, 200, 255, 200)));
+                                                });
+                                            });
                                         };
-                                        ui.allocate_ui(Vec2::new(36.0, 13.0), |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.label(
-                                                    RichText::new(&db_label)
-                                                        .size(8.0)
-                                                        .monospace()
-                                                        .color(ACCENT),
-                                                );
-                                            });
-                                        });
-                                        ui.add_space(2.0);
-                                        let slider = egui::Slider::new(&mut vol_db, -60.0_f32..=6.0)
-                                            .vertical()
-                                            .show_value(false)
-                                            .step_by(0.1);
-                                        let sr = ui.add_sized([22.0, 110.0], slider);
-                                        if sr.changed() {
-                                            let new_vol = db_to_vol(vol_db).clamp(0.0, 2.0);
-                                            cmd.push(EditorCommand::SetClipVolume {
-                                                id: vol_clip_id, volume: new_vol,
-                                            });
-                                        }
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new("Vol")
-                                                .size(8.0)
-                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
-                                        );
+                                        hdr(ui, "FADE IN");
+                                        ui.add_space(sep_w);
+                                        hdr(ui, "VOLUME");
+                                        ui.add_space(sep_w);
+                                        hdr(ui, "FADE OUT");
                                     });
+                                    ui.add_space(3.0);
 
-                                    ui.add_space(4.0);
+                                    // Slider rows
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
 
-                                    // Fade In
-                                    ui.vertical(|ui| {
-                                        let fi_label = format!("{:.1}s", fade_in_val);
-                                        ui.allocate_ui(Vec2::new(32.0, 13.0), |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.label(
-                                                    RichText::new(&fi_label)
-                                                        .size(8.0)
-                                                        .monospace()
-                                                        .color(DARK_TEXT_DIM),
-                                                );
-                                            });
+                                        // ── Fade In column ──────────────────────
+                                        ui.vertical(|ui| {
+                                            ui.set_min_width(col_w);
+                                            ui.set_max_width(col_w);
+                                            // Ramp slider
+                                            ui.label(RichText::new("Ramp").size(8.0).color(Color32::from_gray(150)));
+                                            ui.allocate_ui(Vec2::new(col_w, 12.0), |ui| { ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new(format!("{:.1}s", fi_ramp)).size(9.0).monospace().color(ACCENT));
+                                            }); });
+                                            if ui.add_sized([22.0, 65.0], egui::Slider::new(&mut fi_ramp, 0.0_f32..=10.0).vertical().show_value(false).step_by(0.05)).changed() {
+                                                cmd.push(EditorCommand::SetClipFadeIn { id: vol_clip_id, secs: fi_ramp });
+                                            }
+                                            ui.add_space(5.0);
+                                            // Delay slider (silence before ramp)
+                                            ui.label(RichText::new("Delay").size(8.0).color(Color32::from_gray(150)));
+                                            ui.allocate_ui(Vec2::new(col_w, 12.0), |ui| { ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new(format!("{:.1}s", fi_delay)).size(9.0).monospace().color(Color32::from_rgba_unmultiplied(255, 190, 60, 220)));
+                                            }); });
+                                            if ui.add_sized([22.0, 65.0], egui::Slider::new(&mut fi_delay, 0.0_f32..=10.0).vertical().show_value(false).step_by(0.05)).changed() {
+                                                cmd.push(EditorCommand::SetClipFadeInStart { id: vol_clip_id, secs: fi_delay });
+                                            }
                                         });
-                                        ui.add_space(2.0);
-                                        let fi_slider = egui::Slider::new(&mut fade_in_val, 0.0_f32..=10.0)
-                                            .vertical()
-                                            .show_value(false)
-                                            .step_by(0.05);
-                                        let fi_resp = ui.add_sized([22.0, 110.0], fi_slider);
-                                        if fi_resp.changed() {
-                                            cmd.push(EditorCommand::SetClipFadeIn {
-                                                id: vol_clip_id, secs: fade_in_val,
-                                            });
-                                        }
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new("In")
-                                                .size(8.0)
-                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
-                                        );
-                                    });
 
-                                    ui.add_space(4.0);
+                                        ui.add_space(sep_w);
 
-                                    // Fade Out
-                                    ui.vertical(|ui| {
-                                        let fo_label = format!("{:.1}s", fade_out_val);
-                                        ui.allocate_ui(Vec2::new(32.0, 13.0), |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.label(
-                                                    RichText::new(&fo_label)
-                                                        .size(8.0)
-                                                        .monospace()
-                                                        .color(DARK_TEXT_DIM),
-                                                );
-                                            });
+                                        // ── Volume column ────────────────────────
+                                        ui.vertical(|ui| {
+                                            ui.set_min_width(col_w);
+                                            ui.set_max_width(col_w);
+                                            let db_label = if vol_db <= -59.0 { "-inf dB".to_string() } else { format!("{:+.1}dB", vol_db) };
+                                            ui.allocate_ui(Vec2::new(col_w, 12.0), |ui| { ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new(&db_label).size(9.0).monospace().color(ACCENT));
+                                            }); });
+                                            ui.add_space(4.0);
+                                            if ui.add_sized([22.0, 150.0], egui::Slider::new(&mut vol_db, -60.0_f32..=6.0).vertical().show_value(false).step_by(0.1)).changed() {
+                                                let new_vol = db_to_vol(vol_db).clamp(0.0, 2.0);
+                                                cmd.push(EditorCommand::SetClipVolume { id: vol_clip_id, volume: new_vol });
+                                            }
+                                            ui.add_space(2.0);
+                                            ui.label(RichText::new("0 dB").size(7.5).color(Color32::from_gray(90)));
                                         });
-                                        ui.add_space(2.0);
-                                        let fo_slider = egui::Slider::new(&mut fade_out_val, 0.0_f32..=10.0)
-                                            .vertical()
-                                            .show_value(false)
-                                            .step_by(0.05);
-                                        let fo_resp = ui.add_sized([22.0, 110.0], fo_slider);
-                                        if fo_resp.changed() {
-                                            cmd.push(EditorCommand::SetClipFadeOut {
-                                                id: vol_clip_id, secs: fade_out_val,
-                                            });
-                                        }
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new("Out")
-                                                .size(8.0)
-                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
-                                        );
+
+                                        ui.add_space(sep_w);
+
+                                        // ── Fade Out column ──────────────────────
+                                        ui.vertical(|ui| {
+                                            ui.set_min_width(col_w);
+                                            ui.set_max_width(col_w);
+                                            // Ramp slider
+                                            ui.label(RichText::new("Ramp").size(8.0).color(Color32::from_gray(150)));
+                                            ui.allocate_ui(Vec2::new(col_w, 12.0), |ui| { ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new(format!("{:.1}s", fo_ramp)).size(9.0).monospace().color(ACCENT));
+                                            }); });
+                                            if ui.add_sized([22.0, 65.0], egui::Slider::new(&mut fo_ramp, 0.0_f32..=10.0).vertical().show_value(false).step_by(0.05)).changed() {
+                                                cmd.push(EditorCommand::SetClipFadeOut { id: vol_clip_id, secs: fo_ramp });
+                                            }
+                                            ui.add_space(5.0);
+                                            // Tail slider (silence after ramp)
+                                            ui.label(RichText::new("Tail").size(8.0).color(Color32::from_gray(150)));
+                                            ui.allocate_ui(Vec2::new(col_w, 12.0), |ui| { ui.centered_and_justified(|ui| {
+                                                ui.label(RichText::new(format!("{:.1}s", fo_tail)).size(9.0).monospace().color(Color32::from_rgba_unmultiplied(255, 190, 60, 220)));
+                                            }); });
+                                            if ui.add_sized([22.0, 65.0], egui::Slider::new(&mut fo_tail, 0.0_f32..=10.0).vertical().show_value(false).step_by(0.05)).changed() {
+                                                cmd.push(EditorCommand::SetClipFadeOutEnd { id: vol_clip_id, secs: fo_tail });
+                                            }
+                                        });
                                     });
                                 });
-                            });
-                    });
+                        });
 
-                // Close on click outside — same guard as transition_popup.
-                if !self.vol_popup_just_opened {
-                    let clicked = ui.input(|i| i.pointer.any_click());
-                    if clicked {
-                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                            if !area_resp.response.rect.contains(pos) {
-                                self.vol_popup = None;
+                    if !self.vol_popup_just_opened {
+                        let clicked = ui.input(|i| i.pointer.any_click());
+                        if clicked {
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                if !area_resp.response.rect.contains(pos) {
+                                    self.vol_popup = None;
+                                }
                             }
                         }
                     }
-                }
-                self.vol_popup_just_opened = false;
+                    self.vol_popup_just_opened = false;
+                } // end if let Some(clip_data)
             } else {
                 self.vol_popup_just_opened = false;
             }
@@ -1496,29 +1477,130 @@ fn hotkey_section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
     ui.add_space(6.0);
 }
 
-fn draw_waveform(painter: &egui::Painter, clip_rect: Rect, peaks: &[f32], clip_type: ClipType, volume: f32) {
+fn draw_waveform(
+    painter:            &egui::Painter,
+    clip_rect:          Rect,
+    peaks:              &[f32],
+    clip_type:          ClipType,
+    clip_volume:        f32,
+    global_volume:      f32,
+    fade_in_secs:       f32,
+    fade_in_start_secs: f32,
+    fade_out_secs:      f32,
+    fade_out_end_secs:  f32,
+    duration:           f32,
+) {
     if peaks.is_empty() { return; }
-    let w    = clip_rect.width();
-    let h    = clip_rect.height();
+    let w     = clip_rect.width();
+    let h     = clip_rect.height();
     let mid_y = clip_rect.min.y + h * 0.5;
     let visible = (w as usize).min(peaks.len()).max(1);
     let step    = peaks.len() as f32 / visible as f32;
     let wave_color = if clip_type == ClipType::Audio {
-        Color32::from_rgba_unmultiplied(100, 240, 165, 220)  // vivid green, high alpha — waveform is the whole point
+        Color32::from_rgba_unmultiplied(100, 240, 165, 220)
     } else {
-        Color32::from_rgba_unmultiplied(160, 200, 255, 38)   // very faint blue hint — thumbnails should read first
+        Color32::from_rgba_unmultiplied(160, 200, 255, 38)
     };
+
+    // Equal-power 3-zone gain: silence → sqrt-ramp → full (fade-in)
+    //                          full → sqrt-ramp → silence (fade-out)
+    let fade_gain = |i: usize| -> f32 {
+        if duration <= 0.0 { return 1.0; }
+        let t = (i as f32 / visible as f32) * duration;
+        let r = duration - t;
+        let in_gain = if t < fade_in_start_secs { 0.0 }
+            else if fade_in_secs > 0.0 { ((t - fade_in_start_secs) / fade_in_secs).clamp(0.0, 1.0).sqrt() }
+            else { 1.0 };
+        let out_gain = if r < fade_out_end_secs { 0.0 }
+            else if fade_out_secs > 0.0 { ((r - fade_out_end_secs) / fade_out_secs).clamp(0.0, 1.0).sqrt() }
+            else { 1.0 };
+        in_gain.min(out_gain)
+    };
+
+    let vol = (global_volume * clip_volume).clamp(0.0, 2.0);
+
+    // Draw waveform bars scaled by volume * fade envelope.
     for i in 0..visible {
         let idx  = ((i as f32 * step) as usize).min(peaks.len() - 1);
         let peak = peaks[idx];
-        let half = peak * volume * (h * 0.44);
+        let half = peak * vol * fade_gain(i) * (h * 0.44);
         let x    = clip_rect.min.x + i as f32;
         painter.line_segment(
             [Pos2::new(x, mid_y - half), Pos2::new(x, mid_y + half)],
             Stroke::new(1.0, wave_color));
     }
-}
 
+    // Amber envelope lines showing the 3-zone shape.
+    // Blue tint = silence zones; amber = ramp zones.
+    let silence_color = Color32::from_rgba_unmultiplied(80, 140, 255, 100);
+    let ramp_color    = Color32::from_rgba_unmultiplied(255, 190, 60, 200);
+
+    // Helper: draw a filled silence strip from col `a` to col `b`.
+    let draw_silence = |a: usize, b: usize| {
+        if a >= b { return; }
+        let x0 = clip_rect.min.x + a as f32;
+        let x1 = clip_rect.min.x + b as f32;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x0, mid_y - 2.0),
+                Pos2::new(x1, mid_y + 2.0),
+            ),
+            0.0,
+            silence_color,
+        );
+    };
+
+    if duration > 0.0 {
+        // ── Fade-in envelope ──────────────────────────────────────────────
+        if fade_in_start_secs > 0.0 || fade_in_secs > 0.0 {
+            // Silence zone: col 0 → fade_in_start end
+            let silence_end_col = ((fade_in_start_secs / duration) * visible as f32).ceil() as usize;
+            let silence_end_col = silence_end_col.min(visible);
+            draw_silence(0, silence_end_col);
+
+            // Ramp zone: silence_end_col → silence_end_col + ramp_cols
+            let ramp_end_col = (((fade_in_start_secs + fade_in_secs) / duration) * visible as f32).ceil() as usize;
+            let ramp_end_col = ramp_end_col.min(visible);
+            if ramp_end_col > silence_end_col {
+                let ramp_cols = ramp_end_col - silence_end_col;
+                let mut prev: Option<Pos2> = None;
+                for i in silence_end_col..=ramp_end_col {
+                    let progress = ((i - silence_end_col) as f32 / ramp_cols.max(1) as f32).clamp(0.0, 1.0).sqrt();
+                    let half = vol * progress * (h * 0.44);
+                    let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
+                    if let Some(p) = prev {
+                        painter.line_segment([p, pt], Stroke::new(1.5, ramp_color));
+                    }
+                    prev = Some(pt);
+                }
+            }
+        }
+
+        // ── Fade-out envelope ─────────────────────────────────────────────
+        if fade_out_end_secs > 0.0 || fade_out_secs > 0.0 {
+            // Silence zone: last fade_out_end_secs → clip end
+            let silence_start_col = (((duration - fade_out_end_secs).max(0.0) / duration) * visible as f32) as usize;
+            draw_silence(silence_start_col, visible);
+
+            // Ramp zone: (duration - fade_out_end - fade_out_secs) → silence_start_col
+            let ramp_start_t  = (duration - fade_out_end_secs - fade_out_secs).max(0.0);
+            let ramp_start_col = ((ramp_start_t / duration) * visible as f32) as usize;
+            if silence_start_col > ramp_start_col {
+                let ramp_cols = silence_start_col - ramp_start_col;
+                let mut prev: Option<Pos2> = None;
+                for i in ramp_start_col..=silence_start_col {
+                    let remain_progress = ((silence_start_col - i) as f32 / ramp_cols.max(1) as f32).clamp(0.0, 1.0).sqrt();
+                    let half = vol * remain_progress * (h * 0.44);
+                    let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
+                    if let Some(p) = prev {
+                        painter.line_segment([p, pt], Stroke::new(1.5, ramp_color));
+                    }
+                    prev = Some(pt);
+                }
+            }
+        }
+    }
+}
 fn ruler_step(zoom: f32) -> f64 {
     if      zoom >= 1200.0 { 0.0333 }
     else if zoom >= 600.0  { 0.05   }

@@ -38,9 +38,13 @@ pub enum EditorCommand {
     /// Set per-clip gain (0.0–2.0). Applied multiplicatively with global volume.
     SetClipVolume { id: Uuid, volume: f32 },
     /// Set per-clip audio fade-in duration (seconds, 0.0 = none).
-    SetClipFadeIn  { id: Uuid, secs: f32 },
-    /// Set per-clip audio fade-out duration (seconds, 0.0 = none).
-    SetClipFadeOut { id: Uuid, secs: f32 },
+    SetClipFadeIn      { id: Uuid, secs: f32 },
+    /// Set silence before the fade-in ramp (0 = ramp at clip start).
+    SetClipFadeInStart { id: Uuid, secs: f32 },
+    /// Set per-clip audio fade-out ramp duration (seconds, 0.0 = none).
+    SetClipFadeOut     { id: Uuid, secs: f32 },
+    /// Set silence after fade-out ramp ends, before clip end (0 = ramp ends at clip boundary).
+    SetClipFadeOutEnd  { id: Uuid, secs: f32 },
 
     // ── Undo / Redo ───────────────────────────────────────────────────────────
     /// Snapshot the current ProjectState onto the undo stack and clear redo.

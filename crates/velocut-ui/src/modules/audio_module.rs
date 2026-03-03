@@ -470,12 +470,14 @@ impl AudioModule {
                     // guard above — they multiply together so neither is cancelled out.
                     let elapsed = state.current_time - clip.start_time;
                     let clip_fade = {
-                        let in_gain = if clip.fade_in_secs > 0.0 {
-                            ((elapsed / clip.fade_in_secs as f64) as f32).clamp(0.0, 1.0)
-                        } else { 1.0 };
-                        let out_gain = if clip.fade_out_secs > 0.0 {
-                            ((time_remaining / clip.fade_out_secs as f64) as f32).clamp(0.0, 1.0)
-                        } else { 1.0 };
+                        let e = elapsed as f32;
+                        let r = time_remaining as f32;
+                        let in_gain = if e < clip.fade_in_start_secs { 0.0 }
+                            else if clip.fade_in_secs > 0.0 { ((e - clip.fade_in_start_secs) / clip.fade_in_secs).clamp(0.0, 1.0).sqrt() }
+                            else { 1.0 };
+                        let out_gain = if r < clip.fade_out_end_secs { 0.0 }
+                            else if clip.fade_out_secs > 0.0 { ((r - clip.fade_out_end_secs) / clip.fade_out_secs).clamp(0.0, 1.0).sqrt() }
+                            else { 1.0 };
                         in_gain.min(out_gain)
                     };
                     if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
@@ -616,12 +618,14 @@ impl AudioModule {
                 };
                 let elapsed = state.current_time - clip.start_time;
                 let clip_fade = {
-                    let in_gain = if clip.fade_in_secs > 0.0 {
-                        ((elapsed / clip.fade_in_secs as f64) as f32).clamp(0.0, 1.0)
-                    } else { 1.0 };
-                    let out_gain = if clip.fade_out_secs > 0.0 {
-                        ((time_remaining / clip.fade_out_secs as f64) as f32).clamp(0.0, 1.0)
-                    } else { 1.0 };
+                    let e = elapsed as f32;
+                    let r = time_remaining as f32;
+                    let in_gain = if e < clip.fade_in_start_secs { 0.0 }
+                        else if clip.fade_in_secs > 0.0 { ((e - clip.fade_in_start_secs) / clip.fade_in_secs).clamp(0.0, 1.0).sqrt() }
+                        else { 1.0 };
+                    let out_gain = if r < clip.fade_out_end_secs { 0.0 }
+                        else if clip.fade_out_secs > 0.0 { ((r - clip.fade_out_end_secs) / clip.fade_out_secs).clamp(0.0, 1.0).sqrt() }
+                        else { 1.0 };
                     in_gain.min(out_gain)
                 };
                 let vol = if state.muted { 0.0 } else { state.volume * clip.volume * fade_out * clip_fade * mix_factor };
