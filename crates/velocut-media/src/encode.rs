@@ -124,6 +124,10 @@ pub struct AudioOverlay {
     pub timeline_start: f64,
     pub duration:       f64,
     pub volume:         f32,
+    pub fade_in_secs:       f32,
+    pub fade_in_start_secs: f32,
+    pub fade_out_secs:      f32,
+    pub fade_out_end_secs:  f32,
 }
 
 /// Complete description of an encode job.
@@ -1243,10 +1247,22 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
                 });
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                    push_frame(&resampled, &mut left, &mut right, overlay.volume);
+                    let fg = fade_gain(
+                        pts_secs,
+                        overlay.source_offset,
+                        overlay.duration,
+                        overlay.fade_in_secs,
+                        overlay.fade_in_start_secs,
+                        overlay.fade_out_secs,
+                        overlay.fade_out_end_secs,
+                    );
+                    push_frame(&resampled, &mut left, &mut right, overlay.volume * fg);
                 }
             } else {
-                push_frame(&raw, &mut left, &mut right, overlay.volume);
+                let fg = fade_gain(pts_secs, overlay.source_offset, overlay.duration,
+                    overlay.fade_in_secs, overlay.fade_in_start_secs,
+                    overlay.fade_out_secs, overlay.fade_out_end_secs);
+                push_frame(&raw, &mut left, &mut right, overlay.volume * fg);
             }
         }
     }
@@ -1268,11 +1284,23 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
             if let Some(rs) = &mut resampler {
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                    push_frame(&resampled, &mut left, &mut right, overlay.volume);
+                    let fg = fade_gain(
+                        pts_secs,
+                        overlay.source_offset,
+                        overlay.duration,
+                        overlay.fade_in_secs,
+                        overlay.fade_in_start_secs,
+                        overlay.fade_out_secs,
+                        overlay.fade_out_end_secs,
+                    );
+                    push_frame(&resampled, &mut left, &mut right, overlay.volume * fg);
                 }
             }
         } else {
-            push_frame(&raw, &mut left, &mut right, overlay.volume);
+            let fg = fade_gain(pts_secs, overlay.source_offset, overlay.duration,
+                overlay.fade_in_secs, overlay.fade_in_start_secs,
+                overlay.fade_out_secs, overlay.fade_out_end_secs);
+            push_frame(&raw, &mut left, &mut right, overlay.volume * fg);
         }
     }
 

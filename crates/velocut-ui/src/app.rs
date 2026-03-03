@@ -101,7 +101,7 @@ impl VeloCutApp {
 
         // fix_taskbar_icon() is intentionally NOT called here.
         // new() is the app factory — it runs before the OS window is created,
-        // so EnumThreadWindows would find nothing to patch. The call is deferred
+        // so EnumThreadWindows would find nothing to patch there. The call is deferred
         // to the first update() frame via the taskbar_icon_fixed flag.
 
         let state = cc.storage
@@ -251,6 +251,7 @@ impl VeloCutApp {
                 self.context.audio_overlay_sinks.clear();
                 self.context.playback.audio_was_playing = false;
                 self.context.cache.pending_pb_frame = None;
+                ctx.request_repaint();
             }
             EditorCommand::SetVolume(v) => {
                 self.state.volume = v;
@@ -408,7 +409,6 @@ impl VeloCutApp {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.filter = filter;
                 }
-                // Evict stale (unfiltered) cached frames for this clip's media_id.
                 if let Some(mid) = self.state.timeline.iter()
                     .find(|c| c.id == id)
                     .map(|c| c.media_id)
@@ -417,8 +417,8 @@ impl VeloCutApp {
                     self.context.cache.frame_bucket_cache
                         .retain(|(bid, _), _| *bid != mid);
                 }
-                // Force video_module::tick() to re-issue a scrub decode request next frame.
                 self.context.playback.last_frame_req = None;
+                ctx.request_repaint();
             }
             EditorCommand::SelectTimelineClip(id) => {
                 self.state.selected_timeline_clip = id;
@@ -716,6 +716,11 @@ impl VeloCutApp {
 
         // ── Dispatch all queued MediaWorker results into caches / state ───────
         self.context.ingest_media_results(&mut self.state, ctx);
+        if self.context.cache.pending_pb_frame.is_some()
+            || self.context.playback.last_frame_req.is_some()
+        {
+            ctx.request_repaint();
+        }
     }
 
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
@@ -875,25 +880,45 @@ fn build_encode_plan(
             state.library.iter()
                 .find(|lc| lc.id == tc.media_id)
                 .map(|lc| {
-                    // If audio was extracted to an A-row partner, use that partner's
-                    // volume so independent A-row adjustments are reflected in export.
-                    let effective_volume = if tc.audio_muted {
+                    // When audio was extracted to an A-row partner (audio_muted=true),
+                    // use that partner's volume AND fade envelope so adjustments made
+                    // via the 🔊 badge on the A-row clip are reflected in the export.
+                    // For plain clips (audio_muted=false) fall back to the V-row values.
+                    let linked_audio = if tc.audio_muted {
                         clip_query::linked_audio_clip(state, tc)
-                            .map(|ac| ac.volume)
-                            .unwrap_or(tc.volume)
                     } else {
-                        tc.volume
+                        None
                     };
+
+                    let effective_volume = linked_audio
+                        .map(|ac| ac.volume)
+                        .unwrap_or(tc.volume);
+
+                    let (effective_fi, effective_fi_start, effective_fo, effective_fo_end) =
+                        linked_audio
+                            .map(|ac| (
+                                ac.fade_in_secs,
+                                ac.fade_in_start_secs,
+                                ac.fade_out_secs,
+                                ac.fade_out_end_secs,
+                            ))
+                            .unwrap_or((
+                                tc.fade_in_secs,
+                                tc.fade_in_start_secs,
+                                tc.fade_out_secs,
+                                tc.fade_out_end_secs,
+                            ));
+
                     ClipSpec {
-                        path:          lc.path.clone(),
-                        source_offset: tc.source_offset,
-                        duration:      tc.duration,
-                        volume:        effective_volume,
-                        skip_audio:    false,
-                        fade_in_secs:       tc.fade_in_secs,
-                        fade_in_start_secs: tc.fade_in_start_secs,
-                        fade_out_secs:      tc.fade_out_secs,
-                        fade_out_end_secs:  tc.fade_out_end_secs,
+                        path:               lc.path.clone(),
+                        source_offset:      tc.source_offset,
+                        duration:           tc.duration,
+                        volume:             effective_volume,
+                        skip_audio:         false,
+                        fade_in_secs:       effective_fi,
+                        fade_in_start_secs: effective_fi_start,
+                        fade_out_secs:      effective_fo,
+                        fade_out_end_secs:  effective_fo_end,
                         filter:             tc.filter.clone(),
                     }
                 })
@@ -941,6 +966,10 @@ fn build_encode_plan(
                     timeline_start: tc.start_time,
                     duration:       tc.duration,
                     volume:         tc.volume,
+                    fade_in_secs:       tc.fade_in_secs,
+                    fade_in_start_secs: tc.fade_in_start_secs,
+                    fade_out_secs:      tc.fade_out_secs,
+                    fade_out_end_secs:  tc.fade_out_end_secs,
                 })
         })
         .collect();

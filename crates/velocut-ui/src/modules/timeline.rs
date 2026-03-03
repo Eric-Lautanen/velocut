@@ -1514,7 +1514,7 @@ impl EditorModule for TimelineModule {
                                         ui.label(RichText::new("🎨  Color Filter").size(11.0).strong().color(ACCENT));
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if !cur_filter.is_identity() {
-                                                if ui.small_button(RichText::new("✕ Reset").size(9.0).color(Color32::from_gray(130))).clicked() {
+                                                if ui.small_button(RichText::new("Reset").size(9.0).color(Color32::from_gray(130))).clicked() {
                                                     cmd.push(EditorCommand::SetClipFilter {
                                                         id: filter_clip_id,
                                                         filter: FilterParams::none(),
