@@ -356,7 +356,7 @@ impl EditorModule for TimelineModule {
 
                 let area_resp = egui::Area::new(egui::Id::new("hotkeys_popup"))
                     .fixed_pos(popup_pos)
-                    .order(egui::Order::Foreground)
+                    .order(egui::Order::Tooltip)
                     .interactable(true)
                     .show(ui.ctx(), |ui| {
                         egui::Frame::new()
@@ -1306,7 +1306,7 @@ impl EditorModule for TimelineModule {
 
                     let area_resp = egui::Area::new(Id::new("vol_popup_area"))
                         .fixed_pos(popup_pos)
-                        .order(egui::Order::Foreground)
+                        .order(egui::Order::Tooltip)
                         .interactable(true)
                         .show(ui.ctx(), |ui| {
                             egui::Frame::new()
