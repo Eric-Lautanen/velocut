@@ -3,6 +3,7 @@ rustflags = [
   "-L", "/c/github/ffmpeg-src/lib",
   "-L", "/mingw64/lib",
   "-L", "/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0",
+  "-l", "static=z",
 ]
 
 [env]
