@@ -10,6 +10,7 @@ use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, ACTION_BTN_FILL, ACTION_BTN_STROKE, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, PLAYHEAD_BTN_FILL, PLAYHEAD_BTN_STROKE};
 use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};
 use uuid::Uuid;
+use velocut_core::filters::{FilterKind, FilterParams};
 
 pub struct TimelineModule {
     /// Which clip ID's outgoing transition popup is open, and where to show it.
@@ -27,6 +28,10 @@ pub struct TimelineModule {
     /// click-outside-to-close check so the opening click doesn't immediately
     /// close the popup it just spawned.
     vol_popup_just_opened: bool,
+
+    /// Filter popup: which clip's palette badge was clicked, and anchor pos.
+    filter_popup: Option<(Uuid, Pos2)>,
+    filter_popup_just_opened: bool,
 
     /// Whether the hotkey reference popup is currently visible.
     hotkeys_open: bool,
@@ -57,6 +62,8 @@ impl TimelineModule {
             hotkeys_open:                 false,
             hotkeys_just_opened:          false,
             last_scrub_emitted_time:      f64::NEG_INFINITY,
+            filter_popup:                 None,
+            filter_popup_just_opened:     false,
         }
     }
 }
@@ -766,7 +773,7 @@ impl EditorModule for TimelineModule {
                         // would overlap the waveform or clip label.
                         let vol_badge_geo: Option<(Rect, Pos2, bool)> = if width > 40.0 && track_height > 40.0 {
                             let badge_center = Pos2::new(
-                                clip_rect.center().x,
+                                clip_rect.center().x - 12.0,
                                 clip_rect.max.y - 10.0,
                             );
                             let vol_is_open = self.vol_popup
@@ -792,6 +799,22 @@ impl EditorModule for TimelineModule {
                         } else {
                             None
                         };
+                        // ── Filter / color badge ───────────────────────────────
+                        let filter_badge_geo: Option<(Rect, Pos2, bool)> =
+                            if width > 60.0 && track_height > 40.0 && render_type == ClipType::Video
+                        {
+                            let fc = Pos2::new(clip_rect.center().x + 12.0, clip_rect.max.y - 10.0);
+                            let fopen   = self.filter_popup.map(|(id,_)| id == clip.id).unwrap_or(false);
+                            let factive = !clip.filter.is_identity();
+                            let fcol = if fopen { ACCENT }
+                                else if factive { Color32::from_rgb(120, 210, 130) }
+                                else { Color32::from_gray(165) };
+                            let fr = Rect::from_center_size(fc, egui::vec2(18.0, 14.0));
+                            painter.rect_filled(fr, 4.0, fcol.linear_multiply(if fopen { 0.35 } else { 0.30 }));
+                            painter.rect_stroke(fr, 4.0, Stroke::new(1.0, fcol), egui::StrokeKind::Outside);
+                            painter.text(fc, Align2::CENTER_CENTER, "🎨", FontId::proportional(9.0), fcol);
+                            Some((fr, fc, fopen))
+                        } else { None };
 
                         // ── Trim handles ──────────────────────────────────────
                         // 7px interactive strips at each clip edge. Dragging the
@@ -907,6 +930,31 @@ impl EditorModule for TimelineModule {
                             ui.label(RichText::new(format!("Duration: {:.2}s", clip.duration))
                                 .size(10.0).color(egui::Color32::from_gray(100)));
                         });
+
+                        // ── Filter badge interact ──────────────────────────────
+                        if let Some((fr, _, fopen)) = filter_badge_geo {
+                            let clip_id = clip.id;
+                            let cur_filter = clip.filter.clone();
+                            let fr_resp = ui.interact(fr, Id::new(("filter_badge", clip_id)), Sense::click());
+                            let fr_resp = fr_resp.on_hover_ui(|ui| {
+                                let lbl = if cur_filter.is_identity() {
+                                    "No filter — click to add".to_string()
+                                } else {
+                                    format!("Filter: {}  (click to edit)", cur_filter.kind.label())
+                                };
+                                ui.label(RichText::new(lbl).size(11.0));
+                            });
+                            if fr_resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                            if fr_resp.clicked() {
+                                if fopen {
+                                    self.filter_popup = None;
+                                } else {
+                                    cmd.push(EditorCommand::PushUndoSnapshot);
+                                    self.filter_popup             = Some((clip_id, fr.center_bottom()));
+                                    self.filter_popup_just_opened = true;
+                                }
+                            }
+                        }
 
                         // ── Vol badge interact (registered after clip_interact so it wins) ──
                         if let Some((badge_rect, badge_center, vol_is_open)) = vol_badge_geo {
@@ -1431,6 +1479,183 @@ impl EditorModule for TimelineModule {
                 } // end if let Some(clip_data)
             } else {
                 self.vol_popup_just_opened = false;
+            }
+
+            // ── Filter / Color popup ──────────────────────────────────────────
+            if let Some((filter_clip_id, anchor)) = self.filter_popup {
+                let clip_data = state.timeline.iter()
+                    .find(|c| c.id == filter_clip_id)
+                    .map(|c| c.filter.clone());
+
+                if let Some(cur_filter) = clip_data {
+                    let popup_w = 160.0_f32;
+                    let popup_pos = Pos2::new(
+                        (anchor.x - popup_w * 0.5).max(4.0),
+                        anchor.y - 14.0 - 360.0,  // popup height approx
+                    );
+
+                    let farea_resp = egui::Area::new(Id::new("filter_popup_area"))
+                        .fixed_pos(popup_pos)
+                        .order(egui::Order::Tooltip)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgba_unmultiplied(18, 18, 24, 215))
+                                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::same(10))
+                                .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(120) })
+                                .show(ui, |ui| {
+                                    ui.set_min_width(popup_w - 20.0);
+                                    ui.set_max_width(popup_w - 20.0);
+
+                                    // ── Header ────────────────────────────────────────
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("🎨  Color Filter").size(11.0).strong().color(ACCENT));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if !cur_filter.is_identity() {
+                                                if ui.small_button(RichText::new("✕ Reset").size(9.0).color(Color32::from_gray(130))).clicked() {
+                                                    cmd.push(EditorCommand::SetClipFilter {
+                                                        id: filter_clip_id,
+                                                        filter: FilterParams::none(),
+                                                    });
+                                                }
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(5.0);
+
+                                    // ── Preset grid — 3 columns so labels never clip ──
+                                    ui.label(RichText::new("PRESET").size(8.5).monospace()
+                                        .color(Color32::from_rgba_unmultiplied(0, 180, 210, 130)));
+                                    ui.add_space(3.0);
+                                    // Manual rows of 3 — Grid auto-sizes columns to the widest
+                                    // label, breaking uniformity. chunks(3) + add_sized gives
+                                    // every button exactly the same pixel width.
+                                    let kinds: Vec<_> = FilterKind::all().to_vec();
+                                    for row in kinds.chunks(3) {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            for kind in row {
+                                                let selected = cur_filter.kind == *kind;
+                                                let btn = egui::Button::new(
+                                                    RichText::new(kind.label())
+                                                        .size(10.0)
+                                                        .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
+                                                )
+                                                .fill(if selected { ACCENT } else { DARK_BG_2 })
+                                                .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }));
+                                                if ui.add_sized([57.0, 24.0], btn).clicked() {
+                                                    let mut p = FilterParams::from_preset(*kind);
+                                                    p.strength = cur_filter.strength;
+                                                    cmd.push(EditorCommand::SetClipFilter { id: filter_clip_id, filter: p });
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+
+                                    // ── Strength — inline label + slider + value ───────
+                                    if cur_filter.kind != FilterKind::None {
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("STRENGTH").size(8.5).monospace()
+                                                .color(Color32::from_rgba_unmultiplied(0, 180, 210, 130)));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(format!("{:.0}%", cur_filter.strength * 100.0))
+                                                    .size(9.0).monospace().color(ACCENT));
+                                            });
+                                        });
+                                        let mut strength = cur_filter.strength;
+                                        if ui.add(
+                                            egui::Slider::new(&mut strength, 0.0_f32..=1.0)
+                                                .step_by(0.01)
+                                                .show_value(false)
+                                        ).changed() {
+                                            let mut p = cur_filter.clone();
+                                            p.strength = strength;
+                                            cmd.push(EditorCommand::SetClipFilter { id: filter_clip_id, filter: p });
+                                        }
+                                    }
+
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+
+                                    // ── Manual sliders ────────────────────────────────
+                                    ui.label(RichText::new("MANUAL").size(8.5).monospace()
+                                        .color(Color32::from_rgba_unmultiplied(0, 180, 210, 130)));
+                                    ui.add_space(4.0);
+
+                                    // label(50) | slider(fills to ~80px) | value(38)
+                                    let slider_row = |ui: &mut egui::Ui,
+                                                      label: &str,
+                                                      val: &mut f32,
+                                                      range: std::ops::RangeInclusive<f32>,
+                                                      step: f64,
+                                                      fmt: &str| -> bool
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui(egui::vec2(50.0, 16.0), |ui| {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.label(RichText::new(label).size(9.0)
+                                                            .color(Color32::from_gray(160)));
+                                                    });
+                                            });
+                                            ui.add_space(3.0);
+                                            let changed = ui.add_sized(
+                                                [80.0, 14.0],
+                                                egui::Slider::new(val, range)
+                                                    .step_by(step)
+                                                    .show_value(false)
+                                            ).changed();
+                                            ui.add_space(3.0);
+                                            ui.allocate_ui(egui::vec2(38.0, 16.0), |ui| {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.label(RichText::new(
+                                                            format!("{}", fmt.replace("{}", &format!("{:.2}", val)))
+                                                        ).size(9.0).monospace().color(ACCENT));
+                                                    });
+                                            });
+                                            changed
+                                        }).inner
+                                    };
+
+                                    let mut p = cur_filter.clone();
+                                    let mut changed = false;
+                                    changed |= slider_row(ui, "Brightness", &mut p.brightness, -1.0..=1.0,  0.01, "{}");
+                                    changed |= slider_row(ui, "Contrast",   &mut p.contrast,   0.0..=3.0,   0.01, "{}");
+                                    changed |= slider_row(ui, "Saturation", &mut p.saturation, 0.0..=3.0,   0.01, "{}");
+                                    changed |= slider_row(ui, "Gamma",      &mut p.gamma,      0.1..=4.0,   0.01, "{}");
+                                    changed |= slider_row(ui, "Hue",        &mut p.hue,        -180.0..=180.0, 1.0, "{}°");
+                                    changed |= slider_row(ui, "Temp",       &mut p.temperature, -1.0..=1.0, 0.01, "{}");
+                                    if changed {
+                                        p.kind     = FilterKind::None;
+                                        p.strength = 1.0;
+                                        cmd.push(EditorCommand::SetClipFilter { id: filter_clip_id, filter: p });
+                                    }
+                                });
+                        });
+
+                    if !self.filter_popup_just_opened {
+                        if ui.input(|i| i.pointer.any_click()) {
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                if !farea_resp.response.rect.contains(pos) {
+                                    self.filter_popup = None;
+                                }
+                            }
+                        }
+                    }
+                    self.filter_popup_just_opened = false;
+                }
+            } else {
+                self.filter_popup_just_opened = false;
             }
         });
     }

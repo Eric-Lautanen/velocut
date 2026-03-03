@@ -87,7 +87,7 @@ pub struct TimelineClip {
     #[serde(default)]
     pub fade_out_end_secs:  f32,
     #[serde(default)]
-    pub filter: velocut_core::filters::FilterParams,
+    pub filter: crate::filters::FilterParams,
 }
 
 fn default_clip_volume() -> f32 { 1.0 }
@@ -342,6 +342,7 @@ impl ProjectState {
             fade_in_start_secs: 0.0,
             fade_out_secs:      0.0,
             fade_out_end_secs:  0.0,
+            filter: crate::filters::FilterParams::none(),
         });
     }
 
@@ -376,6 +377,7 @@ impl ProjectState {
             fade_in_start_secs: clip.fade_in_start_secs,
             fade_out_secs:      clip.fade_out_secs,
             fade_out_end_secs:  clip.fade_out_end_secs,
+            filter: crate::filters::FilterParams::none(),
         };
 
         // Mute audio on the video clip and link it to the new audio clip.

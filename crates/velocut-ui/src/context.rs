@@ -375,11 +375,28 @@ impl AppContext {
         id:            Uuid,
         width:         u32,
         height:        u32,
-        data:          Vec<u8>,
+        mut data:          Vec<u8>,
         state:         &mut ProjectState,
         needs_repaint: &mut bool,
         ctx:           &egui::Context,
     ) {
+
+
+        {
+            let active_filter = state.timeline.iter()
+                .find(|c| {
+                    c.track_row % 2 == 0
+                        && state.current_time >= c.start_time
+                        && state.current_time < c.start_time + c.duration
+                })
+                .map(|c| c.filter.clone())
+                .unwrap_or_default();
+
+            if !active_filter.is_identity() {
+                use velocut_core::filters::helpers::apply_filter_rgba;
+                apply_filter_rgba(&mut data, &active_filter);
+            }
+        }
         // ── Zero-copy ColorImage ───────────────────────────────────────────────
         // `data` is an owned Vec<u8> of tightly packed RGBA bytes produced by
         // copy_frame_rgba() in decode.rs.  egui's ColorImage stores Vec<Color32>,

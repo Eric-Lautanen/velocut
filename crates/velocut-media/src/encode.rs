@@ -85,6 +85,8 @@ use ffmpeg::Packet;
 
 use velocut_core::media_types::MediaResult;
 use velocut_core::transitions::{ClipTransition, TransitionKind, VideoTransition, registry};
+use velocut_core::filters::FilterParams;
+use velocut_core::filters::helpers::apply_filter_yuv;
 use crate::helpers::yuv::{extract_yuv, write_yuv};
 use crate::helpers::seek::seek_to_secs;
 
@@ -111,6 +113,7 @@ pub struct ClipSpec {
     pub fade_out_secs:      f32,
     /// Silence after fade-out ramp ends, before clip boundary (0.0 = ramp ends at boundary).
     pub fade_out_end_secs:  f32,
+    pub filter: FilterParams,
 }
 
 /// A standalone audio clip that runs in parallel with the video timeline.
@@ -895,6 +898,7 @@ impl CropScaler {
             if ret <= 0 {
                 return Err(format!("CropScaler::run sws_scale returned {ret}"));
             }
+
         }
         Ok(())
     }
@@ -1482,6 +1486,7 @@ fn run_encode(
             fade_in_start_secs: clip.fade_in_start_secs,
             fade_out_secs:      clip.fade_out_secs,
             fade_out_end_secs:  clip.fade_out_end_secs,
+            filter: clip.filter.clone(),
         };
 
         output_frame_idx = encode_clip(
@@ -1513,6 +1518,7 @@ fn run_encode(
                 fade_in_start_secs: 0.0,
                 fade_out_secs:      0.0,
                 fade_out_end_secs:  0.0,
+                filter: FilterParams::none(),
             };
             let head_spec = ClipSpec {
                 path:          next_clip.path.clone(),
@@ -1524,6 +1530,7 @@ fn run_encode(
                 fade_in_start_secs: 0.0,
                 fade_out_secs:      0.0,
                 fade_out_end_secs:  0.0,
+                filter: FilterParams::none(),
             };
 
             if let Some(transition_impl) = transition_registry.get(&entry.kind.kind) {
@@ -1774,6 +1781,19 @@ fn send_video_frame(
     }
 }
 
+fn apply_filter_to_yuv_frame(yuv: &mut VideoFrame, filter: &FilterParams, w: u32, h: u32) {
+    if filter.is_identity() { return; }
+    unsafe {
+        let ptr = yuv.as_mut_ptr();
+        let y_size = (w * h) as usize;
+        let uv_size = ((w / 2) * (h / 2)) as usize;
+        let y_plane = std::slice::from_raw_parts_mut((*ptr).data[0], y_size);
+        let u_plane = std::slice::from_raw_parts_mut((*ptr).data[1], uv_size);
+        let v_plane = std::slice::from_raw_parts_mut((*ptr).data[2], uv_size);
+        apply_filter_yuv(y_plane, u_plane, v_plane, filter);
+    }
+}
+
 /// Equal-power fade envelope with anchor support.
 ///
 /// Fade-in:  silence for `fade_in_start_secs`, then sqrt-ramp over `fade_in_secs`.
@@ -1934,6 +1954,7 @@ fn encode_clip(
 
                 let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
                 sc.run(&decoded, &mut yuv)?;
+                apply_filter_to_yuv_frame(&mut yuv, &clip.filter, spec.width, spec.height);
 
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
@@ -2097,6 +2118,7 @@ fn encode_clip(
         if let Some(sc) = &mut video_scaler {
             let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             if sc.run(&decoded, &mut yuv).is_ok() {
+                apply_filter_to_yuv_frame(&mut yuv, &clip.filter, spec.width, spec.height);
                 unsafe {
                     (*yuv.as_mut_ptr()).sample_aspect_ratio =
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };

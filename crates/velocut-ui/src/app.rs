@@ -404,6 +404,22 @@ impl VeloCutApp {
                     tc.fade_out_end_secs = secs.max(0.0);
                 }
             }
+            EditorCommand::SetClipFilter { id, filter } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.filter = filter;
+                }
+                // Evict stale (unfiltered) cached frames for this clip's media_id.
+                if let Some(mid) = self.state.timeline.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.media_id)
+                {
+                    self.context.cache.frame_cache.remove(&mid);
+                    self.context.cache.frame_bucket_cache
+                        .retain(|(bid, _), _| *bid != mid);
+                }
+                // Force video_module::tick() to re-issue a scrub decode request next frame.
+                self.context.playback.last_frame_req = None;
+            }
             EditorCommand::SelectTimelineClip(id) => {
                 self.state.selected_timeline_clip = id;
             }
@@ -446,6 +462,7 @@ impl VeloCutApp {
                         fade_in_start_secs: 0.0,
                         fade_out_secs:      clip.fade_out_secs,
                         fade_out_end_secs:  clip.fade_out_end_secs,
+                        filter: Default::default(),
                     });
                     // Any transition keyed on clip.id (original → its successor)
                     // remains valid — the badge system renders from clip positions,
@@ -877,6 +894,7 @@ fn build_encode_plan(
                         fade_in_start_secs: tc.fade_in_start_secs,
                         fade_out_secs:      tc.fade_out_secs,
                         fade_out_end_secs:  tc.fade_out_end_secs,
+                        filter:             tc.filter.clone(),
                     }
                 })
         })

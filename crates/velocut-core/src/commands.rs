@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use crate::state::AspectRatio;
 use crate::transitions::TransitionType;
+use crate::filters::FilterParams;
 
 #[derive(Debug, Clone)]
 pub enum EditorCommand {

@@ -11,7 +11,7 @@
 // 1. Add a variant to `declare_filters!` below.
 // 2. Add its parameter values to `FilterParams::from_preset()`.
 // That's it — no other files need changing.
-
+pub mod helpers;
 use serde::{Deserialize, Serialize};
 
 // ── Preset registry macro ─────────────────────────────────────────────────────
@@ -69,6 +69,11 @@ declare_filters! {
     GoldenHour,
     NightBlue,
     Punchy,
+    FalseColor,
+    Infrared,
+    Mist,
+    Noir,
+    TealOrange,
 }
 
 // ── FilterParams ──────────────────────────────────────────────────────────────
@@ -245,6 +250,74 @@ impl FilterParams {
                 gamma:       0.88,
                 hue:         3.0,
                 temperature: 0.12,
+                strength:    1.0,
+            },
+            // 180° hue rotation flips warm skin tones (orange ≈ +20°) into
+            // blue/cyan — the "BGR channel swap" aesthetic without needing a
+            // true channel-swap operation.  High saturation amplifies the
+            // effect so blues read vividly even on darker skin.
+            FilterKind::FalseColor => Self {
+                kind,
+                brightness:  0.0,
+                contrast:    1.10,
+                saturation:  1.60,
+                gamma:       1.0,
+                hue:         180.0,
+                temperature: -0.20,
+                strength:    1.0,
+            },
+
+            // Blown highlights, heavy warm push, lifted midtones — simulates
+            // long-exposure infrared film where foliage goes white and skies
+            // go nearly black.
+            FilterKind::Infrared => Self {
+                kind,
+                brightness:  0.12,
+                contrast:    1.40,
+                saturation:  0.30,
+                gamma:       0.80,
+                hue:         12.0,
+                temperature: 0.50,
+                strength:    1.0,
+            },
+
+            // Dreamy overexposed haze — low contrast, lifted blacks, slight
+            // desaturation.  Works well on portraits and slow-motion footage.
+            FilterKind::Mist => Self {
+                kind,
+                brightness:  0.18,
+                contrast:    0.65,
+                saturation:  0.80,
+                gamma:       1.15,
+                hue:         0.0,
+                temperature: 0.10,
+                strength:    1.0,
+            },
+
+            // Hard B&W with crushed shadows — classic detective / neo-noir look.
+            // Deeper blacks than BlackAndWhite and more aggressive contrast.
+            FilterKind::Noir => Self {
+                kind,
+                brightness:  -0.06,
+                contrast:    1.55,
+                saturation:  0.0,
+                gamma:       0.85,
+                hue:         0.0,
+                temperature: 0.0,
+                strength:    1.0,
+            },
+
+            // Hollywood split-tone: push shadows toward teal and highlights
+            // toward orange.  Achieved here via hue nudge + warm temperature
+            // (the orange pull) balanced against a cool-blue contrast base.
+            FilterKind::TealOrange => Self {
+                kind,
+                brightness:  0.02,
+                contrast:    1.25,
+                saturation:  1.20,
+                gamma:       0.93,
+                hue:         -6.0,
+                temperature: 0.22,
                 strength:    1.0,
             },
         }

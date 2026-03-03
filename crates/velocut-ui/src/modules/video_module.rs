@@ -158,8 +158,24 @@ impl VideoModule {
             }).unwrap_or(true)
         }).unwrap_or(false);
 
+
         if frame_due {
-            if let Some(f) = ctx.cache.pending_pb_frame.take() {
+            if let Some(mut f) = ctx.cache.pending_pb_frame.take() {
+                // Look up the filter for the clip currently under the playhead (V-row only).
+                let active_filter = state.timeline.iter()
+                    .find(|c| {
+                        c.track_row % 2 == 0
+                            && state.current_time >= c.start_time
+                            && state.current_time < c.start_time + c.duration
+                    })
+                    .map(|c| c.filter.clone())
+                    .unwrap_or_default();
+
+                if !active_filter.is_identity() {
+                    use velocut_core::filters::helpers::apply_filter_rgba;
+                    apply_filter_rgba(&mut f.data, &active_filter);
+                }
+
                 let tex = egui_ctx.load_texture(
                     format!("pb-{}", f.id),
                     egui::ColorImage::from_rgba_unmultiplied(
@@ -168,13 +184,7 @@ impl VideoModule {
                     egui::TextureOptions::LINEAR,
                 );
                 ctx.cache.frame_cache.insert(f.id, tex);
-                // request_repaint() here is correct and non-redundant: playback
-                // frames arrive from a background thread, not from a user input
-                // event, so egui's automatic input-driven repaint does not fire.
-                // Without this call the promoted frame would sit in frame_cache
-                // but the display wouldn't refresh until the next input event.
                 egui_ctx.request_repaint();
-                // Pre-pull next frame so it's ready for the next tick.
                 if let Ok(next) = ctx.media_worker.pb_rx.try_recv() {
                     ctx.cache.pending_pb_frame = Some(next);
                 }

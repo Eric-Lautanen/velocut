@@ -14,6 +14,9 @@ use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
 use ffmpeg::ffi;
 
+use velocut_core::filters::FilterParams;
+use velocut_core::filters::helpers::apply_filter_rgba;
+
 use velocut_core::media_types::MediaResult;
 
 // ── Stateful per-clip decoder ─────────────────────────────────────────────────
@@ -53,6 +56,7 @@ pub struct LiveDecoder {
     /// Kept alive for the lifetime of the decoder — FFmpeg ref-counts it internally.
     #[allow(dead_code)]
     hw_device_ctx: Option<HwDeviceCtx>,
+    pub filter: Option<FilterParams>,
 }
 
 // ── D3D11VA hardware device context ──────────────────────────────────────────
@@ -547,6 +551,7 @@ impl LiveDecoder {
             skip_until_pts: 0,
             frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
             hw_device_ctx,
+            filter: None,
         })
     }
 
@@ -627,7 +632,10 @@ impl LiveDecoder {
                         self.scaler.run(&cpu, &mut out).ok()?;
                         Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
                     });
-                if let Some(data) = data_opt {
+                if let Some(mut data) = data_opt {
+                    if let Some(ref params) = self.filter {
+                        apply_filter_rgba(&mut data, params);
+                    }
                     return Some((data, self.out_w, self.out_h, ts_secs));
                 }
                 // Both paths failed (e.g. GPU→CPU transfer error, scaler mismatch):
@@ -699,7 +707,10 @@ impl LiveDecoder {
                         self.scaler.run(&cpu, &mut out).ok()?;
                         Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
                     });
-                if let Some(data) = data_opt {
+                if let Some(mut data) = data_opt {
+                    if let Some(ref params) = self.filter {
+                        apply_filter_rgba(&mut data, params);
+                    }
                     return Some((data, self.out_w, self.out_h));
                 }
                 // Both paths failed: skip this frame, try the next.
