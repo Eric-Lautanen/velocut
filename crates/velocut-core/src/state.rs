@@ -74,6 +74,14 @@ pub struct TimelineClip {
     /// audio track. audio_module skips these clips for audio playback.
     #[serde(default)]
     pub audio_muted:    bool,
+    /// Duration of audio fade-in at the start of this clip (seconds, 0.0 = none).
+    /// Applied multiplicatively with `volume` in both preview and render.
+    #[serde(default)]
+    pub fade_in_secs:   f32,
+    /// Duration of audio fade-out at the end of this clip (seconds, 0.0 = none).
+    /// Applied multiplicatively with `volume` in both preview and render.
+    #[serde(default)]
+    pub fade_out_secs:  f32,
 }
 
 fn default_clip_volume() -> f32 { 1.0 }
@@ -324,6 +332,8 @@ impl ProjectState {
             volume:         1.0,
             linked_clip_id: None,
             audio_muted:    false,
+            fade_in_secs:   0.0,
+            fade_out_secs:  0.0,
         });
     }
 
@@ -354,6 +364,8 @@ impl ProjectState {
             volume:         1.0,
             linked_clip_id: Some(clip_id),
             audio_muted:    false,
+            fade_in_secs:   clip.fade_in_secs,
+            fade_out_secs:  clip.fade_out_secs,
         };
 
         // Mute audio on the video clip and link it to the new audio clip.

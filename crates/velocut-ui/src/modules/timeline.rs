@@ -1280,11 +1280,11 @@ impl EditorModule for TimelineModule {
             // on the clip is visible through it as volume changes.
             // Closes when neither the icon nor this area is hovered.
             if let Some((vol_clip_id, anchor)) = self.vol_popup {
-                // Look up this clip's current volume from state.
-                let current_vol = state.timeline.iter()
+                // Look up this clip's current volume and fade values from state.
+                let (current_vol, current_fade_in, current_fade_out) = state.timeline.iter()
                     .find(|c| c.id == vol_clip_id)
-                    .map(|c| c.volume)
-                    .unwrap_or(1.0);
+                    .map(|c| (c.volume, c.fade_in_secs, c.fade_out_secs))
+                    .unwrap_or((1.0, 0.0, 0.0));
 
                 // Convert linear → dB for display and editing.
                 let vol_to_db = |v: f32| -> f32 {
@@ -1292,11 +1292,13 @@ impl EditorModule for TimelineModule {
                 };
                 let db_to_vol = |db: f32| -> f32 { 10.0_f32.powf(db / 20.0) };
 
-                let mut vol_db = vol_to_db(current_vol);
+                let mut vol_db       = vol_to_db(current_vol);
+                let mut fade_in_val  = current_fade_in;
+                let mut fade_out_val = current_fade_out;
 
                 // Position popup centered above the speaker icon, above the clip.
-                let popup_w  = 64.0_f32;
-                let popup_h  = 150.0_f32;
+                let popup_w  = 140.0_f32;
+                let popup_h  = 180.0_f32;
                 let popup_pos = Pos2::new(
                     anchor.x - popup_w * 0.5,
                     anchor.y - popup_h - 14.0,
@@ -1320,52 +1322,117 @@ impl EditorModule for TimelineModule {
                                 color: Color32::from_black_alpha(100),
                             })
                             .show(ui, |ui| {
-                                // Fix the inner width so the popup never resizes as the dB
-                                // label text changes length (which causes the box to jitter).
-                                let inner_w = popup_w - 16.0; // 16 = inner_margin * 2
+                                let inner_w = popup_w - 16.0;
                                 ui.set_min_width(inner_w);
                                 ui.set_max_width(inner_w);
 
-                                // dB readout at top — rendered in a fixed-size slot so its
-                                // varying text width can't push the container around.
-                                let db_label = if vol_db <= -59.0 {
-                                    "-∞ dB".to_string()
-                                } else {
-                                    format!("{:+.1} dB", vol_db)
-                                };
-                                ui.allocate_ui(Vec2::new(inner_w, 13.0), |ui| {
-                                    ui.centered_and_justified(|ui| {
+                                // ── Volume column + fade columns side by side ────
+                                ui.horizontal(|ui| {
+                                    // Volume
+                                    ui.vertical(|ui| {
+                                        let db_label = if vol_db <= -59.0 {
+                                            "-\u{221e} dB".to_string()
+                                        } else {
+                                            format!("{:+.1} dB", vol_db)
+                                        };
+                                        ui.allocate_ui(Vec2::new(36.0, 13.0), |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(&db_label)
+                                                        .size(8.0)
+                                                        .monospace()
+                                                        .color(ACCENT),
+                                                );
+                                            });
+                                        });
+                                        ui.add_space(2.0);
+                                        let slider = egui::Slider::new(&mut vol_db, -60.0_f32..=6.0)
+                                            .vertical()
+                                            .show_value(false)
+                                            .step_by(0.1);
+                                        let sr = ui.add_sized([22.0, 110.0], slider);
+                                        if sr.changed() {
+                                            let new_vol = db_to_vol(vol_db).clamp(0.0, 2.0);
+                                            cmd.push(EditorCommand::SetClipVolume {
+                                                id: vol_clip_id, volume: new_vol,
+                                            });
+                                        }
+                                        ui.add_space(2.0);
                                         ui.label(
-                                            RichText::new(&db_label)
-                                                .size(9.0)
-                                                .monospace()
-                                                .color(ACCENT),
+                                            RichText::new("Vol")
+                                                .size(8.0)
+                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
+                                        );
+                                    });
+
+                                    ui.add_space(4.0);
+
+                                    // Fade In
+                                    ui.vertical(|ui| {
+                                        let fi_label = format!("{:.1}s", fade_in_val);
+                                        ui.allocate_ui(Vec2::new(32.0, 13.0), |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(&fi_label)
+                                                        .size(8.0)
+                                                        .monospace()
+                                                        .color(DARK_TEXT_DIM),
+                                                );
+                                            });
+                                        });
+                                        ui.add_space(2.0);
+                                        let fi_slider = egui::Slider::new(&mut fade_in_val, 0.0_f32..=10.0)
+                                            .vertical()
+                                            .show_value(false)
+                                            .step_by(0.05);
+                                        let fi_resp = ui.add_sized([22.0, 110.0], fi_slider);
+                                        if fi_resp.changed() {
+                                            cmd.push(EditorCommand::SetClipFadeIn {
+                                                id: vol_clip_id, secs: fade_in_val,
+                                            });
+                                        }
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            RichText::new("In")
+                                                .size(8.0)
+                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
+                                        );
+                                    });
+
+                                    ui.add_space(4.0);
+
+                                    // Fade Out
+                                    ui.vertical(|ui| {
+                                        let fo_label = format!("{:.1}s", fade_out_val);
+                                        ui.allocate_ui(Vec2::new(32.0, 13.0), |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(&fo_label)
+                                                        .size(8.0)
+                                                        .monospace()
+                                                        .color(DARK_TEXT_DIM),
+                                                );
+                                            });
+                                        });
+                                        ui.add_space(2.0);
+                                        let fo_slider = egui::Slider::new(&mut fade_out_val, 0.0_f32..=10.0)
+                                            .vertical()
+                                            .show_value(false)
+                                            .step_by(0.05);
+                                        let fo_resp = ui.add_sized([22.0, 110.0], fo_slider);
+                                        if fo_resp.changed() {
+                                            cmd.push(EditorCommand::SetClipFadeOut {
+                                                id: vol_clip_id, secs: fade_out_val,
+                                            });
+                                        }
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            RichText::new("Out")
+                                                .size(8.0)
+                                                .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
                                         );
                                     });
                                 });
-                                ui.add_space(4.0);
-
-                                // Vertical slider in dB space.
-                                // Nearly transparent bg so waveform bleeds through.
-                                let slider = egui::Slider::new(&mut vol_db, -60.0_f32..=6.0)
-                                    .vertical()
-                                    .show_value(false)
-                                    .step_by(0.1);
-                                let slider_resp = ui.add_sized([22.0, 110.0], slider);
-                                if slider_resp.changed() {
-                                    let new_vol = db_to_vol(vol_db).clamp(0.0, 2.0);
-                                    cmd.push(EditorCommand::SetClipVolume {
-                                        id: vol_clip_id, volume: new_vol,
-                                    });
-                                }
-
-                                // 0 dB reference tick labels
-                                ui.add_space(2.0);
-                                ui.label(
-                                    RichText::new("0 dB")
-                                        .size(8.0)
-                                        .color(Color32::from_rgba_unmultiplied(180, 180, 180, 120)),
-                                );
                             });
                     });
 

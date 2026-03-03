@@ -384,6 +384,16 @@ impl VeloCutApp {
                     tc.volume = volume.clamp(0.0, 2.0);
                 }
             }
+            EditorCommand::SetClipFadeIn { id, secs } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.fade_in_secs = secs.max(0.0);
+                }
+            }
+            EditorCommand::SetClipFadeOut { id, secs } => {
+                if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
+                    tc.fade_out_secs = secs.max(0.0);
+                }
+            }
             EditorCommand::SelectTimelineClip(id) => {
                 self.state.selected_timeline_clip = id;
             }
@@ -404,8 +414,10 @@ impl VeloCutApp {
                     let split_offset = t - clip.start_time; // seconds into clip
 
                     // Shorten the original clip to become the first half.
+                    // Clear its fade_out — that belongs to the new tail segment now.
                     if let Some(c) = self.state.timeline.iter_mut().find(|c| c.id == clip.id) {
-                        c.duration = split_offset;
+                        c.duration      = split_offset;
+                        c.fade_out_secs = 0.0;
                     }
 
                     // Push the second half as a new clip immediately after.
@@ -419,6 +431,8 @@ impl VeloCutApp {
                         volume:         clip.volume,
                         linked_clip_id: None,
                         audio_muted:    clip.audio_muted,
+                        fade_in_secs:   0.0,
+                        fade_out_secs:  clip.fade_out_secs,
                     });
                     // Any transition keyed on clip.id (original → its successor)
                     // remains valid — the badge system renders from clip positions,
@@ -846,6 +860,8 @@ fn build_encode_plan(
                         duration:      tc.duration,
                         volume:        effective_volume,
                         skip_audio:    false,
+                        fade_in_secs:  tc.fade_in_secs,
+                        fade_out_secs: tc.fade_out_secs,
                     }
                 })
         })

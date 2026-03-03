@@ -37,6 +37,10 @@ pub enum EditorCommand {
     ExtractAudioTrack(Uuid),
     /// Set per-clip gain (0.0–2.0). Applied multiplicatively with global volume.
     SetClipVolume { id: Uuid, volume: f32 },
+    /// Set per-clip audio fade-in duration (seconds, 0.0 = none).
+    SetClipFadeIn  { id: Uuid, secs: f32 },
+    /// Set per-clip audio fade-out duration (seconds, 0.0 = none).
+    SetClipFadeOut { id: Uuid, secs: f32 },
 
     // ── Undo / Redo ───────────────────────────────────────────────────────────
     /// Snapshot the current ProjectState onto the undo stack and clear redo.
