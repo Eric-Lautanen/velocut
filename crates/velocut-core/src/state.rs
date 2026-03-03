@@ -86,6 +86,8 @@ pub struct TimelineClip {
     /// Seconds of silence after fade-out ramp, before clip end (0 = ramp ends at clip boundary).
     #[serde(default)]
     pub fade_out_end_secs:  f32,
+    #[serde(default)]
+    pub filter: velocut_core::filters::FilterParams,
 }
 
 fn default_clip_volume() -> f32 { 1.0 }

@@ -77,6 +77,8 @@ pub enum EditorCommand {
     /// Remove the transition after a specific clip, reverting it to a hard cut.
     RemoveTransition(Uuid),
 
+    SetClipFilter { id: Uuid, filter: FilterParams },
+
     // ── View / UI ────────────────────────────────────────────────────────────
     SetAspectRatio(AspectRatio),
     SetTimelineZoom(f32),
