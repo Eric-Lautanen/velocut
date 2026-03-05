@@ -4,6 +4,7 @@ target/
 [Rr]elease/
 bin/
 obj/
+.claude/
 
 # Compiled outputs
 *.dll
@@ -36,3 +37,5 @@ desktop.ini
 *.tmp
 *.bak
 *~
+
+.claudeignore

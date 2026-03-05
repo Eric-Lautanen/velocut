@@ -57,6 +57,34 @@ pub struct LiveDecoder {
     #[allow(dead_code)]
     hw_device_ctx: Option<HwDeviceCtx>,
     pub filter: Option<FilterParams>,
+
+    /// Cached raw SwsContext pointer for center_crop_and_scale.
+    /// Avoids sws_getContext + sws_freeContext on every frame when the crop
+    /// region and output dimensions are unchanged (steady-state playback).
+    /// Key: (crop_w, crop_h, src_pixel_format_i32, dst_w, dst_h).
+    crop_sws: CachedCropSws,
+    /// Reusable output buffer for the center_crop_and_scale path.
+    crop_buf: Vec<u8>,
+}
+
+/// Send-safe wrapper for a raw `*mut SwsContext` (FFmpeg scaler context).
+/// SwsContext is thread-safe for independent use on a single thread.
+struct RawSwsCtx(*mut ffi::SwsContext);
+unsafe impl Send for RawSwsCtx {}
+
+/// RAII wrapper for the cached crop SwsContext.  Owns the raw pointer and frees
+/// it on drop, so LiveDecoder itself doesn't need a Drop impl (which would
+/// prevent partial moves of fields like `scaler` in the scrub thread).
+struct CachedCropSws(Option<(u32, u32, i32, u32, u32, RawSwsCtx)>);
+
+impl Drop for CachedCropSws {
+    fn drop(&mut self) {
+        if let Some((_, _, _, _, _, ctx)) = self.0.take() {
+            if !ctx.0.is_null() {
+                unsafe { ffi::sws_freeContext(ctx.0); }
+            }
+        }
+    }
 }
 
 // ── D3D11VA hardware device context ──────────────────────────────────────────
@@ -552,6 +580,8 @@ impl LiveDecoder {
             frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
             hw_device_ctx,
             filter: None,
+            crop_sws: CachedCropSws(None),
+            crop_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
         })
     }
 
@@ -605,33 +635,32 @@ impl LiveDecoder {
                 let cpu = ensure_cpu_frame(decoded);
                 decoded = ffmpeg::util::frame::video::Video::empty();
 
-                // Primary path: center-crop source to canvas AR, scale to (out_w × out_h).
-                // Handles NV12 and YUV420P/YUVJ420P.  Falls back to the cached stretch-
-                // scaler for other formats.  If both fail, skip this frame — the while loop
-                // naturally retries with the re-initialised `decoded` above; no freeze.
-                let data_opt = unsafe { center_crop_and_scale(&cpu, self.out_w, self.out_h) }
-                    .or_else(|| {
-                        // Fallback: rebuild SwsContext if format/dims changed, then stretch.
-                        let af = cpu.format();
-                        let aw = cpu.width();
-                        let ah = cpu.height();
-                        if af != self.decoder_fmt
-                            || aw != self.decoder_w
-                            || ah != self.decoder_h
-                        {
-                            if let Ok(sws) = SwsContext::get(
-                                af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
-                            ) {
-                                self.scaler      = sws;
-                                self.decoder_fmt = af;
-                                self.decoder_w   = aw;
-                                self.decoder_h   = ah;
-                            }
+                // Inline scale: try cached crop path, fallback to stretch scaler.
+                let mut data_opt = unsafe {
+                    center_crop_and_scale_cached(
+                        &mut self.crop_sws, &mut self.crop_buf,
+                        self.out_w, self.out_h, &cpu,
+                    )
+                };
+                if data_opt.is_none() {
+                    let af = cpu.format();
+                    let aw = cpu.width();
+                    let ah = cpu.height();
+                    if af != self.decoder_fmt || aw != self.decoder_w || ah != self.decoder_h {
+                        if let Ok(sws) = SwsContext::get(
+                            af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                        ) {
+                            self.scaler      = sws;
+                            self.decoder_fmt = af;
+                            self.decoder_w   = aw;
+                            self.decoder_h   = ah;
                         }
-                        let mut out = ffmpeg::util::frame::video::Video::empty();
-                        self.scaler.run(&cpu, &mut out).ok()?;
-                        Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
-                    });
+                    }
+                    let mut out = ffmpeg::util::frame::video::Video::empty();
+                    if self.scaler.run(&cpu, &mut out).is_ok() {
+                        data_opt = Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h));
+                    }
+                }
                 if let Some(mut data) = data_opt {
                     if let Some(ref params) = self.filter {
                         apply_filter_rgba(&mut data, params);
@@ -685,28 +714,32 @@ impl LiveDecoder {
                 let cpu = ensure_cpu_frame(decoded);
                 decoded = ffmpeg::util::frame::video::Video::empty();
 
-                let data_opt = unsafe { center_crop_and_scale(&cpu, self.out_w, self.out_h) }
-                    .or_else(|| {
-                        let af = cpu.format();
-                        let aw = cpu.width();
-                        let ah = cpu.height();
-                        if af != self.decoder_fmt
-                            || aw != self.decoder_w
-                            || ah != self.decoder_h
-                        {
-                            if let Ok(sws) = SwsContext::get(
-                                af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
-                            ) {
-                                self.scaler      = sws;
-                                self.decoder_fmt = af;
-                                self.decoder_w   = aw;
-                                self.decoder_h   = ah;
-                            }
+                // Inline scale: try cached crop path, fallback to stretch scaler.
+                let mut data_opt = unsafe {
+                    center_crop_and_scale_cached(
+                        &mut self.crop_sws, &mut self.crop_buf,
+                        self.out_w, self.out_h, &cpu,
+                    )
+                };
+                if data_opt.is_none() {
+                    let af = cpu.format();
+                    let aw = cpu.width();
+                    let ah = cpu.height();
+                    if af != self.decoder_fmt || aw != self.decoder_w || ah != self.decoder_h {
+                        if let Ok(sws) = SwsContext::get(
+                            af, aw, ah, Pixel::RGBA, self.out_w, self.out_h, Flags::BILINEAR,
+                        ) {
+                            self.scaler      = sws;
+                            self.decoder_fmt = af;
+                            self.decoder_w   = aw;
+                            self.decoder_h   = ah;
                         }
-                        let mut out = ffmpeg::util::frame::video::Video::empty();
-                        self.scaler.run(&cpu, &mut out).ok()?;
-                        Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h))
-                    });
+                    }
+                    let mut out = ffmpeg::util::frame::video::Video::empty();
+                    if self.scaler.run(&cpu, &mut out).is_ok() {
+                        data_opt = Some(copy_frame_rgba(&mut self.frame_buf, &out, self.out_w, self.out_h));
+                    }
+                }
                 if let Some(mut data) = data_opt {
                     if let Some(ref params) = self.filter {
                         apply_filter_rgba(&mut data, params);
@@ -742,6 +775,124 @@ impl LiveDecoder {
             }
         }
     }
+
+}
+
+/// Center-crop and scale a decoded frame using a cached raw SwsContext.
+///
+/// Free function (not a method) so it can be called inside a loop that borrows
+/// `LiveDecoder::ictx` without conflicting with `&mut self`.
+///
+/// # Safety
+/// Uses raw FFmpeg API: `sws_getContext`, `sws_scale`, `sws_freeContext`.
+unsafe fn center_crop_and_scale_cached(
+    crop_sws: &mut CachedCropSws,
+    crop_buf: &mut Vec<u8>,
+    out_w: u32,
+    out_h: u32,
+    frame: &ffmpeg::util::frame::video::Video,
+) -> Option<Vec<u8>> {
+    let dst_w = out_w;
+    let dst_h = out_h;
+    if dst_w == 0 || dst_h == 0 { return None; }
+    let src_w = frame.width()  as u32;
+    let src_h = frame.height() as u32;
+    if src_w == 0 || src_h == 0 { return None; }
+
+    let src_ar = src_w as f32 / src_h as f32;
+    let dst_ar = dst_w as f32 / dst_h as f32;
+
+    let (crop_x, crop_y, crop_w, crop_h) = if (src_ar - dst_ar).abs() < 0.02 {
+        (0u32, 0u32, src_w, src_h)
+    } else if src_ar > dst_ar {
+        let w = ((src_h as f32 * dst_ar) as u32 & !1).max(2).min(src_w);
+        ((src_w - w) / 2, 0, w, src_h)
+    } else {
+        let h = ((src_w as f32 / dst_ar) as u32 & !1).max(2).min(src_h);
+        (0, (src_h - h) / 2, src_w, h)
+    };
+
+    let raw   = frame.as_ptr();
+    let fmt_i = (*raw).format;
+    let nv12     = ffi::AVPixelFormat::AV_PIX_FMT_NV12     as i32;
+    let yuv420p  = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P  as i32;
+    let yuvj420p = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
+    let p010le   = ffi::AVPixelFormat::AV_PIX_FMT_P010LE   as i32;
+
+    if fmt_i != nv12 && fmt_i != yuv420p && fmt_i != yuvj420p && fmt_i != p010le {
+        return None;
+    }
+
+    let s0 = (*raw).linesize[0] as usize;
+    let s1 = (*raw).linesize[1] as usize;
+    let s2 = (*raw).linesize[2] as usize;
+    let d0 = (*raw).data[0];
+    let d1 = (*raw).data[1];
+    let d2 = (*raw).data[2];
+
+    let (src_ptrs, src_strides): ([*const u8; 4], [i32; 4]) = if fmt_i == nv12 {
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize);
+        ([p0, p1, std::ptr::null(), std::ptr::null()],
+         [s0 as i32, s1 as i32, 0, 0])
+    } else if fmt_i == p010le {
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize * 2);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize * 2);
+        ([p0, p1, std::ptr::null(), std::ptr::null()],
+         [s0 as i32, s1 as i32, 0, 0])
+    } else {
+        let p0 = d0.add(crop_y as usize * s0 + crop_x as usize);
+        let p1 = d1.add((crop_y as usize / 2) * s1 + crop_x as usize / 2);
+        let p2 = d2.add((crop_y as usize / 2) * s2 + crop_x as usize / 2);
+        ([p0, p1, p2, std::ptr::null()],
+         [s0 as i32, s1 as i32, s2 as i32, 0])
+    };
+
+    // Reuse cached SwsContext if key matches, else create and cache a new one.
+    let cache_hit = crop_sws.0.as_ref().map_or(false, |(cw, ch, cf, dw, dh, _)| {
+        *cw == crop_w && *ch == crop_h && *cf == fmt_i && *dw == dst_w && *dh == dst_h
+    });
+    if !cache_hit {
+        // Free the old context if any.
+        if let Some((_, _, _, _, _, old)) = crop_sws.0.take() {
+            if !old.0.is_null() { ffi::sws_freeContext(old.0); }
+        }
+        let pixel_fmt = if fmt_i == nv12 { ffi::AVPixelFormat::AV_PIX_FMT_NV12 }
+                        else if fmt_i == p010le { ffi::AVPixelFormat::AV_PIX_FMT_P010LE }
+                        else if fmt_i == yuv420p { ffi::AVPixelFormat::AV_PIX_FMT_YUV420P }
+                        else { ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P };
+        let ctx = ffi::sws_getContext(
+            crop_w as i32, crop_h as i32, pixel_fmt,
+            dst_w  as i32, dst_h  as i32, ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+            2, // SWS_BILINEAR
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+        );
+        if ctx.is_null() { return None; }
+        crop_sws.0 = Some((crop_w, crop_h, fmt_i, dst_w, dst_h, RawSwsCtx(ctx)));
+    }
+    let sws = crop_sws.0.as_ref().unwrap().5 .0;
+
+    // Reuse output buffer — resize only when dimensions change.
+    let row_bytes = dst_w as usize * 4;
+    let needed = row_bytes * dst_h as usize;
+    crop_buf.resize(needed, 0);
+
+    let dst_stride = row_bytes as i32;
+    let mut dst_ptrs: [*mut u8; 4] = [
+        crop_buf.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+    ];
+    let mut dst_strides = [dst_stride, 0i32, 0i32, 0i32];
+
+    let rows = ffi::sws_scale(
+        sws,
+        src_ptrs.as_ptr(),
+        src_strides.as_ptr(),
+        0, crop_h as i32,
+        dst_ptrs.as_mut_ptr(),
+        dst_strides.as_mut_ptr(),
+    );
+
+    if rows > 0 { Some(crop_buf.clone()) } else { None }
 }
 
 // ── Frame copy helper ─────────────────────────────────────────────────────────
