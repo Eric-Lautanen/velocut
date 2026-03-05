@@ -24,8 +24,9 @@
 // Hardware capability probe:
 //   `probe_hw_encode_capabilities()` runs a lightweight dry-run at startup
 //   (no actual encode) and returns `HwEncodeCapabilities`. The UI uses this
-//   to enable/disable 2K and 4K resolution options — SW-only machines are
-//   capped at 1080p to prevent lockups on high-resolution encodes.
+//   to annotate resolution options — SW-only machines see an informational
+//   note at all resolutions since the encode thread is throttled (priority +
+//   thread cap + per-frame yield) to stay responsive on any hardware.
 //
 // PTS strategy:
 //   Video: monotonically increasing frame counter (output_frame_idx) in 1/fps.
@@ -146,10 +147,10 @@ pub struct EncodeSpec {
 
 /// Result of the startup hardware encoder probe.
 ///
-/// The UI reads this to decide which resolution options to annotate.
+/// The UI reads this to annotate resolution options.
 /// SW-only machines can encode at any resolution — higher resolutions
 /// will be slower but the encode thread is throttled (priority + thread
-/// cap) so the system stays responsive throughout.
+/// cap + per-frame yield) so the system stays responsive throughout.
 #[derive(Debug, Clone)]
 pub struct HwEncodeCapabilities {
     /// True when no HW encoder is available and libx264 will be used.
@@ -167,8 +168,7 @@ pub struct HwEncodeCapabilities {
 /// encoded. The probe typically completes in < 100 ms.
 ///
 /// Call once at app startup and cache the result. Pass it to the export UI
-/// so it can enable or disable 2K/4K options before the user wastes time
-/// building a high-res timeline on an unsupported machine.
+/// so it can annotate resolution options before the user starts a render.
 pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     eprintln!("[encode] probing HW encode capabilities...");
 
@@ -208,7 +208,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
         return HwEncodeCapabilities { sw_only: false, backend_name: "VideoToolbox" };
     }
 
-    eprintln!("[encode] probe: no HW encoder available — SW only, 2K/4K throttled (not disabled)");
+    eprintln!("[encode] probe: no HW encoder available — SW only, throttled at all resolutions");
     HwEncodeCapabilities { sw_only: true, backend_name: "Software (libx264)" }
 }
 
@@ -798,10 +798,11 @@ fn open_software_encoder(
     }
 
     // Cap libx264 to half the logical CPU count so the encoder never saturates
-    // every core.  The OS schedules UI, audio, and scrub-decode threads on the
-    // remaining cores; the encode runs at a reduced but consistent pace without
-    // making the system unresponsive.  Minimum 1 thread; falls back to 2 if
-    // available_parallelism() fails (e.g. inside a restricted sandbox).
+    // every core at any resolution (480p through 4K). The OS schedules UI,
+    // audio, and scrub-decode threads on the remaining cores; the encode runs
+    // at a reduced but consistent pace without making the system unresponsive.
+    // Minimum 1 thread; falls back to 2 if available_parallelism() fails
+    // (e.g. inside a restricted sandbox).
     let thread_cap = std::thread::available_parallelism()
         .map(|n| (n.get() / 2).max(1))
         .unwrap_or(2);
@@ -810,8 +811,8 @@ fn open_software_encoder(
     opts.set("crf",     "18");
     // "medium" is more CPU-efficient per thread than "fast" — it does more work
     // per encode pass, so the total core-seconds consumed for equivalent quality
-    // is lower.  Combined with the thread cap above, this keeps peak CPU usage
-    // manageable at 2K/4K on a laptop without a hardware encoder.
+    // is lower.  Combined with the thread cap and per-frame yield_now() below,
+    // this keeps peak CPU usage manageable at any resolution on any hardware.
     opts.set("preset",  "medium");
     opts.set("threads", &thread_cap.to_string());
     opts.set("g",       &fps.to_string());
@@ -1669,10 +1670,15 @@ fn run_encode(
                 }
 
                 output_frame_idx += 1;
-                // Yield to the OS scheduler after each blank frame on HW paths.
-                if hw_backend != HwBackend::Software {
-                    std::thread::yield_now();
-                }
+
+                // Yield to the OS scheduler after every encoded frame.
+                // SW encodes: combined with the n_cores/2 thread cap and
+                // BELOW_NORMAL priority this keeps the system responsive at
+                // all resolutions (480p through 4K), not just at 2K/4K.
+                // HW encodes: the CPU decode+scale loop feeding the GPU runs
+                // flat-out; yield_now() lets UI, audio, and scrub threads
+                // preempt it whenever they need a core.
+                std::thread::yield_now();
 
                 // Pad silence into the FIFO so drain_fifo can mix the overlay tail.
                 let expected = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
@@ -2022,15 +2028,15 @@ fn encode_clip(
                         }
 
                         out_frame_idx += 1;
-                        // Yield to the OS scheduler after each frame on HW paths.
-                        // SW encoding is already throttled structurally (thread cap
-                        // at n_cores/2).  HW encoders offload to dedicated silicon
-                        // but the CPU decode+scale loop feeding them runs flat-out —
-                        // yield_now() lets UI, audio, and scrub threads run whenever
-                        // they're waiting, at zero cost when the system is idle.
-                        if hw_backend != HwBackend::Software {
-                            std::thread::yield_now();
-                        }
+
+                        // Yield to the OS scheduler after every encoded frame.
+                        // SW encodes: combined with the n_cores/2 thread cap and
+                        // BELOW_NORMAL priority this keeps the system responsive at
+                        // all resolutions (480p through 4K), not just at 2K/4K.
+                        // HW encodes: the CPU decode+scale loop feeding the GPU runs
+                        // flat-out; yield_now() lets UI, audio, and scrub threads
+                        // preempt it whenever they need a core.
+                        std::thread::yield_now();
 
                         // Keep audio timeline in sync with video when this clip
                         // has no audio stream, or after the clip's audio has been
@@ -2180,15 +2186,10 @@ fn encode_clip(
                                 .map_err(|e| format!("decoder-flush write video packet: {e}"))?;
                         }
                         out_frame_idx += 1;
-                        // Yield to the OS scheduler after each frame on HW paths.
-                        // SW encoding is already throttled structurally (thread cap
-                        // at n_cores/2).  HW encoders offload to dedicated silicon
-                        // but the CPU decode+scale loop feeding them runs flat-out —
-                        // yield_now() lets UI, audio, and scrub threads run whenever
-                        // they're waiting, at zero cost when the system is idle.
-                        if hw_backend != HwBackend::Software {
-                            std::thread::yield_now();
-                        }
+                        // Yield to the OS scheduler after every encoded frame.
+                        // SW: thread cap + priority + yield = responsive at all res.
+                        // HW: yield lets UI/audio preempt the decode+scale hot loop.
+                        std::thread::yield_now();
                         // Same silence-padding logic as the main packet loop.
                         if audio_decoder.is_none() || audio_has_started {
                             let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
@@ -2620,10 +2621,11 @@ fn apply_transition(
         audio_state.drain_fifo(octx, false)?;
 
         out_frame_idx += 1;
-        // Yield to the OS scheduler after each transition frame on HW paths.
-        if hw_backend != HwBackend::Software {
-            std::thread::yield_now();
-        }
+
+        // Yield to the OS scheduler after every transition frame.
+        // SW: thread cap + priority + yield = responsive at all resolutions.
+        // HW: yield lets UI/audio preempt the decode+scale hot loop.
+        std::thread::yield_now();
 
         if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
             let _ = tx.send(MediaResult::EncodeProgress {

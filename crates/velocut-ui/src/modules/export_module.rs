@@ -110,6 +110,11 @@ impl QualityPreset {
         // Round each dimension up to the nearest even number.
         ((w + 1) & !1, (h + 1) & !1)
     }
+
+    /// Returns true for resolutions that are noticeably slower on CPU.
+    fn is_high_res(self) -> bool {
+        matches!(self, QualityPreset::QHD1440 | QualityPreset::UHD4K)
+    }
 }
 
 // ── Aspect ratio constants ────────────────────────────────────────────────────
@@ -615,38 +620,53 @@ impl ExportModule {
                         QualityPreset::QHD1440,
                         QualityPreset::UHD4K,
                     ] {
-                        let high_res_sw = sw_only
-                            && matches!(q, QualityPreset::QHD1440 | QualityPreset::UHD4K);
                         let (w, h) = q.dimensions(effective_ratio);
-                        let label  = if high_res_sw {
+
+                        // On SW-only machines annotate each preset so users
+                        // know what to expect before starting a render.
+                        // High-res (2K/4K) gets ⚠ — noticeably slower.
+                        // Lower res gets ℹ — runs fine, just no GPU boost.
+                        let label = if sw_only && q.is_high_res() {
                             format!("{}  — {w}×{h}  ⚠", q.label())
+                        } else if sw_only {
+                            format!("{}  — {w}×{h}  ℹ", q.label())
                         } else {
                             format!("{}  — {w}×{h}", q.label())
                         };
+
                         let resp = ui.add(egui::Button::selectable(self.quality == q, &label));
                         if resp.clicked() {
                             self.quality = q;
                         }
-                        if high_res_sw {
+
+                        // Hover tooltip for SW-only machines — same text for all
+                        // presets since throttling applies at every resolution.
+                        if sw_only {
+                            let speed_note = if q.is_high_res() {
+                                "Expect a slower encode at this resolution."
+                            } else {
+                                "Encode speed is fine; no GPU boost available."
+                            };
                             resp.on_hover_text(format!(
-                                "CPU encode at this resolution will be slow.\n\
+                                "{speed_note}\n\
                                  Encoder: {backend_name}\n\
-                                 The encode thread is throttled (priority + thread cap)\n\
-                                 so the system stays responsive — it will complete,\n\
-                                 just at a reduced pace."
+                                 The encode thread is throttled at all resolutions\n\
+                                 (BELOW_NORMAL priority · ½-core thread cap · per-frame yield)\n\
+                                 so the system stays responsive throughout."
                             ));
                         }
                     }
                 });
         });
 
-        // Show an informational note when SW encoding so users know 2K/4K
-        // will be slow but won't freeze the system.
+        // Informational note for SW-only machines.
+        // Shown at all resolutions — throttling applies universally, not just 2K/4K.
         if sw_only {
             ui.add_space(2.0);
             ui.label(
                 RichText::new(format!(
-                    "ℹ CPU encode ({backend_name}) — 2K/4K available, runs slower"
+                    "ℹ CPU encode ({backend_name}) — throttled at all resolutions, \
+                     system stays responsive"
                 ))
                 .size(10.0)
                 .color(Color32::from_rgb(140, 180, 220)),
