@@ -197,7 +197,7 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     }
 
     // VAAPI — Linux (AMD/Intel)
-    if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(11920, 1080) {
+    if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(1920, 1080) {
         eprintln!("[encode] probe: VAAPI available");
         return HwEncodeCapabilities { sw_only: false, backend_name: "VAAPI" };
     }
