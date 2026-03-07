@@ -37,6 +37,12 @@ enum PlaybackCmd {
     /// decoder for clip_b and blend frames during the transition zone.
     StartBlend { id: Uuid, path: PathBuf, ts: f64, aspect: f32, blend: PlaybackTransitionSpec, preview_size: Option<(u32, u32)> },
     Stop,
+    /// Pre-open and start burning a decoder for the next clip so the transition
+    /// at the clip boundary is instant.  Sent ~500 ms before the current clip
+    /// ends.  The pb thread opens the decoder, sets skip_until_pts, and advances
+    /// the burn incrementally (10 packets per primary frame) so the decoder is
+    /// ready by the time Start / StartBlend arrives.
+    PreBuffer { id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)> },
 }
 
 // ── MediaWorker ───────────────────────────────────────────────────────────────
@@ -277,14 +283,32 @@ impl MediaWorker {
             // reached blend_start_ts — previously cloned every frame in the blend zone
             // even before the visual transition started, wasting ~1.2 MB/frame.
             let mut coast_last_primary: Option<Vec<u8>> = None;
+            // [P0-3] Pre-buffered decoder for the next clip.
+            // Opened by PreBuffer, consumed by Start/StartBlend.
+            // Burn is advanced incrementally between primary frames.
+            let mut prebuffered: Option<(Uuid, LiveDecoder)> = None;
             loop {
                 if let Some((id, ref mut d)) = decoder {
                     match pb_cmd_rx.try_recv() {
                         Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect, preview_size }) => {
-                            blend            = None; // clear any pending transition
+                            blend            = None;
                             held_blend       = None;
                             last_blend_alpha = 0.0;
                             coast_last_alpha = 0.5;
+                            // [P0-3] Try prebuffered decoder first.
+                            if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
+                                if pb_id == new_id {
+                                    let t0 = std::time::Instant::now();
+                                    let tpts = pb_dec.ts_to_pts(ts);
+                                    if tpts > pb_dec.last_pts {
+                                        pb_dec.burn_to_pts(tpts);
+                                    }
+                                    eprintln!("[pb] Start (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                    decoder = Some((new_id, pb_dec));
+                                    continue;
+                                }
+                                // Wrong id — drop it and open fresh.
+                            }
                             let t0 = std::time::Instant::now();
                             eprintln!("[pb] Start received (active), ts={ts:.3}");
                             match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
@@ -324,42 +348,68 @@ impl MediaWorker {
                                 blend.as_ref().map(|b| b.spec.alpha_start as f64).unwrap_or(0.0),
                             );
                             held_streak = 0; blend_frame_count = 0;
-                            match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
-                                Ok(mut nd) => {
-                                    let tpts = nd.ts_to_pts(ts);
-                                    nd.burn_to_pts(tpts);
-                                    eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
-                                    decoder = Some((new_id, nd));
-
-                                    if !invert {
-                                        let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
-                                        if let Some(ref mut b) = blend {
-                                            let db_path   = b.spec.clip_b_path.clone();
-                                            let db_start  = b.spec.clip_b_source_start;
-                                            let db_aspect = b.aspect;
-                                            let t_db = std::time::Instant::now();
-                                            eprintln!("[pb] pre-opening decoder_b for outgoing blend: clip_b_start={db_start:.3}");
-                                            match LiveDecoder::open(&db_path, db_start, db_aspect, None, primary_size) {
-                                                Ok(mut db) => {
-                                                    db.skip_until_pts = db.ts_to_pts(db_start);
-                                                    eprintln!("[pb] decoder_b pre-opened in {}ms, lazy burn started (skip_until_pts={})",
-                                                        t_db.elapsed().as_millis(), db.skip_until_pts);
-                                                    b.decoder_b = Some(db);
-                                                }
-                                                Err(e) => eprintln!("[pb] decoder_b pre-open (outgoing): {e}"),
-                                            }
-                                        }
+                            // [P0-3] Try prebuffered decoder for the primary.
+                            if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
+                                if pb_id == new_id {
+                                    let tpts = pb_dec.ts_to_pts(ts);
+                                    if tpts > pb_dec.last_pts {
+                                        pb_dec.burn_to_pts(tpts);
+                                    }
+                                    eprintln!("[pb] StartBlend (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                    decoder = Some((new_id, pb_dec));
+                                }
+                                // Wrong id — drop and fall through to open fresh.
+                            }
+                            if decoder.is_none() {
+                                match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
+                                    Ok(mut nd) => {
+                                        let tpts = nd.ts_to_pts(ts);
+                                        nd.burn_to_pts(tpts);
+                                        eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                        decoder = Some((new_id, nd));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[pb] open (blend): {e}");
+                                        decoder = None;
+                                        blend   = None;
                                     }
                                 }
-                                Err(e) => {
-                                    eprintln!("[pb] open (blend): {e}");
-                                    decoder = None;
-                                    blend   = None;
+                            }
+                            if !invert {
+                                let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
+                                if let Some(ref mut b) = blend {
+                                    let db_path   = b.spec.clip_b_path.clone();
+                                    let db_start  = b.spec.clip_b_source_start;
+                                    let db_aspect = b.aspect;
+                                    let t_db = std::time::Instant::now();
+                                    eprintln!("[pb] pre-opening decoder_b for outgoing blend: clip_b_start={db_start:.3}");
+                                    match LiveDecoder::open(&db_path, db_start, db_aspect, None, primary_size) {
+                                        Ok(mut db) => {
+                                            db.skip_until_pts = db.ts_to_pts(db_start);
+                                            eprintln!("[pb] decoder_b pre-opened in {}ms, lazy burn started (skip_until_pts={})",
+                                                t_db.elapsed().as_millis(), db.skip_until_pts);
+                                            b.decoder_b = Some(db);
+                                        }
+                                        Err(e) => eprintln!("[pb] decoder_b pre-open (outgoing): {e}"),
+                                    }
                                 }
                             }
                             continue;
                         }
-                        Ok(PlaybackCmd::Stop) => { decoder = None; blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; continue; }
+                        Ok(PlaybackCmd::Stop) => { decoder = None; blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; prebuffered = None; continue; }
+                        Ok(PlaybackCmd::PreBuffer { id: pb_id, path: pb_path, ts: pb_ts, aspect: pb_aspect, preview_size: pb_ps }) => {
+                            // [P0-3] Open decoder for the next clip and start lazy burn.
+                            let t0 = std::time::Instant::now();
+                            match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
+                                Ok(mut d) => {
+                                    d.skip_until_pts = d.ts_to_pts(pb_ts);
+                                    eprintln!("[pb] prebuffer opened for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
+                                    prebuffered = Some((pb_id, d));
+                                }
+                                Err(e) => eprintln!("[pb] prebuffer open: {e}"),
+                            }
+                            // Fall through to decode next primary frame — don't continue.
+                        }
                         Err(TryRecvError::Disconnected) => return,
                         Err(TryRecvError::Empty) => {}
                     }
@@ -430,6 +480,26 @@ impl MediaWorker {
                                             }
                                         }
                                         if let Some(db) = b.decoder_b.as_mut() {
+                                            // [P0-2] Non-blocking burn: advance decoder_b
+                                            // incrementally (~10 packets ≈ 5ms) instead of
+                                            // letting next_frame() block for 60 packets (~30ms).
+                                            // This keeps primary frame production smooth during
+                                            // decoder_b's GOP burn after lazy/pre-open.
+                                            if db.skip_until_pts > 0 {
+                                                let done = db.try_advance_burn(10);
+                                                if !done {
+                                                    // Still burning — produce a held frame instead.
+                                                    let invert = b.spec.invert_ab;
+                                                    if invert {
+                                                        if let Some(hb) = held_blend.as_ref() {
+                                                            if hb.len() == data.len() {
+                                                                return Some(blend_rgba_transition(hb, &data, w, h, alpha, kind));
+                                                            }
+                                                        }
+                                                    }
+                                                    return None;
+                                                }
+                                            }
                                             if let Some((data_b, wb, hb, _)) = db.next_frame() {
                                                 if data_b.len() != data.len() || wb != w || hb != h {
                                                     eprintln!(
@@ -502,12 +572,26 @@ impl MediaWorker {
                             coast_w  = w;
                             coast_h  = h;
                             coast_ts = ts_secs;
+                            // Save last frame for hard-cut coast when prebuffered is ready.
+                            // At EOF, this lets coast mode re-send the last frame of clip_a
+                            // to keep the channel fed while waiting for Start.
+                            if prebuffered.is_some() && blend.is_none() {
+                                held_blend = Some(send_data.clone());
+                            }
                             let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data: send_data };
                             frame_count += 1;
                             if frame_count % 60 == 0 {
                                 eprintln!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
                             }
                             if pb_frame_tx.send(f).is_err() { return; }
+                            // [P0-3] Interleave prebuffer burn between primary frames.
+                            // Advance by 10 packets (~5ms) per frame so the prebuffered
+                            // decoder is ready by the time Start arrives (~15 frames later).
+                            if let Some((_, ref mut pb_dec)) = prebuffered {
+                                if pb_dec.skip_until_pts > 0 {
+                                    pb_dec.try_advance_burn(10);
+                                }
+                            }
                         }
                         None => {
                             let outgoing_blend = blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false);
@@ -517,13 +601,28 @@ impl MediaWorker {
                                            (ts={coast_ts:.3}, alpha={coast_last_alpha:.3}, \
                                            decoder_b preserved for animated coast)");
                                 coasting = true;
+                                decoder = None;
+                            } else if prebuffered.is_some() && held_blend.is_some() {
+                                // Hard-cut coast: prebuffered decoder is ready for the next
+                                // clip.  Enter coast mode to keep the channel fed with the
+                                // last frame of clip_a (via held_blend) while waiting for
+                                // the Start command from tick().  Coast uses try_recv() so
+                                // the Start is picked up immediately — no blocking recv()
+                                // delay.  The prebuffered decoder is consumed instantly by
+                                // the Start handler.
+                                blend             = None;
+                                coast_last_primary = None;
+                                coasting = true;
+                                decoder  = None;
+                                eprintln!("[pb] primary EOF → hard-cut coast (prebuffered ready, \
+                                           held last frame for bridge)");
                             } else {
                                 eprintln!("[pb] primary decoder EOF, clearing decoder + blend");
                                 held_blend        = None;
                                 coast_last_primary = None;
                                 blend             = None;
+                                decoder = None;
                             }
-                            decoder = None;
                         }
                     }
                 } else {
@@ -550,6 +649,19 @@ impl MediaWorker {
                                 held_blend       = None;
                                 last_blend_alpha = 0.0;
                                 coast_last_alpha = 0.5;
+                                // [P0-3] Try prebuffered decoder first.
+                                if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
+                                    if pb_id == id {
+                                        let t0 = std::time::Instant::now();
+                                        let tpts = pb_dec.ts_to_pts(ts);
+                                        if tpts > pb_dec.last_pts {
+                                            pb_dec.burn_to_pts(tpts);
+                                        }
+                                        eprintln!("[pb] Start (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        decoder = Some((id, pb_dec));
+                                        continue;
+                                    }
+                                }
                                 let t0 = std::time::Instant::now();
                                 eprintln!("[pb] Start received (idle), ts={ts:.3}");
                                 match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
@@ -645,22 +757,54 @@ impl MediaWorker {
 
                                 blend = Some(ActiveBlend { spec, aspect, decoder_b: prebuilt_db });
                                 if !invert { held_blend = None; }
-                                let t0 = std::time::Instant::now();
-                                eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
-                                match LiveDecoder::open(&path, burn_ts, aspect, None, preview_size) {
-                                    Ok(mut d) => {
-                                        let tpts = d.ts_to_pts(burn_ts);
-                                        d.burn_to_pts(tpts);
-                                        eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
-                                        decoder = Some((id, d));
+                                // [P0-3] Try prebuffered decoder for the primary.
+                                if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
+                                    if pb_id == id {
+                                        let t0 = std::time::Instant::now();
+                                        let tpts = pb_dec.ts_to_pts(burn_ts);
+                                        if tpts > pb_dec.last_pts {
+                                            pb_dec.burn_to_pts(tpts);
+                                        }
+                                        eprintln!("[pb] StartBlend (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        decoder = Some((id, pb_dec));
+                                    } else {
+                                        // Wrong id — drop and open fresh below.
+                                        prebuffered = None;
                                     }
-                                    Err(e) => {
-                                        eprintln!("[pb] open (blend, idle): {e}");
-                                        blend = None;
+                                }
+                                if decoder.is_none() {
+                                    let t0 = std::time::Instant::now();
+                                    eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
+                                    match LiveDecoder::open(&path, burn_ts, aspect, None, preview_size) {
+                                        Ok(mut d) => {
+                                            let tpts = d.ts_to_pts(burn_ts);
+                                            d.burn_to_pts(tpts);
+                                            eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                            decoder = Some((id, d));
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[pb] open (blend, idle): {e}");
+                                            blend = None;
+                                        }
                                     }
                                 }
                             }
-                            PlaybackCmd::Stop => { blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; }
+                            PlaybackCmd::Stop => { blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; prebuffered = None; }
+                            PlaybackCmd::PreBuffer { id: pb_id, path: pb_path, ts: pb_ts, aspect: pb_aspect, preview_size: pb_ps } => {
+                                // [P0-3] Open decoder for the next clip and start lazy burn.
+                                let t0 = std::time::Instant::now();
+                                match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
+                                    Ok(mut d) => {
+                                        d.skip_until_pts = d.ts_to_pts(pb_ts);
+                                        eprintln!("[pb] prebuffer opened (idle) for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
+                                        prebuffered = Some((pb_id, d));
+                                    }
+                                    Err(e) => eprintln!("[pb] prebuffer open (idle): {e}"),
+                                }
+                                // Restore coast state — PreBuffer is a side-effect-only
+                                // command that should not interrupt coast frame production.
+                                coasting = was_coasting;
+                            }
                         }
                     } else {
                         // Coast mode, no command yet.
@@ -945,6 +1089,14 @@ impl MediaWorker {
             eprintln!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
+    }
+
+    /// [P0-3] Pre-open a decoder for the next clip so Start/StartBlend can
+    /// reuse it instead of opening fresh.  Best-effort: if the command channel
+    /// is full the request is silently dropped — the Start handler falls back
+    /// to its normal open+burn path.
+    pub fn prebuffer(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)>) {
+        let _ = self.pb_tx.try_send(PlaybackCmd::PreBuffer { id, path, ts, aspect, preview_size });
     }
 
     pub fn stop_playback(&self) {

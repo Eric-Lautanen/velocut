@@ -145,15 +145,15 @@ video: setpts = (1.0 / speed) * PTS
 audio: atempo = speed   (chain two if outside 0.5–2.0 range)
 ```
 
-For speeds outside atempo's 0.5–2.0 range, chain filters:
-- 4× speed: `atempo=2.0,atempo=2.0`
-- 0.25× speed: `atempo=0.5,atempo=0.5`
+Modern FFmpeg (4.x+) accepts `atempo` values in the range [0.5, 100.0], so a single filter stage handles 4× speed. However, **values above 2.0 skip samples rather than blending them**, which degrades audio quality at high speeds. For quality-preserving speed changes above 2×, chain multiple stages each ≤ 2.0:
+- 4× (quality): `atempo=2.0,atempo=2.0`
+- 0.25× (quality): `atempo=0.5,atempo=0.5`
+- 4× (fast, lower quality): `atempo=4.0` (single stage, accepted by modern FFmpeg but skips samples)
 
-Helper function:
+Helper function (quality mode):
 ```rust
 fn atempo_chain(speed: f64) -> String {
-    // Build a comma-separated atempo chain
-    // Each stage is clamped to [0.5, 2.0]
+    // Chain stages ≤ 2.0 to avoid sample-skipping above 2×
     let mut remaining = speed;
     let mut stages = Vec::new();
     while (remaining - 1.0).abs() > 0.001 {
@@ -669,7 +669,7 @@ git commit -m "chore: remove target/ from tracking"
 
 ### 8. Project File Format (`.vcp`)
 
-Currently `ProjectState` is saved via eframe's built-in storage (a key-value store backed by a platform config file). This works for session restore but has three problems: projects can't be named or shared between machines, there's only one "slot", and the storage location isn't user-visible.
+Currently `ProjectState` is saved via eframe's built-in storage — a RON (Rusty Object Notation) key-value file stored in the platform config directory. This works for session restore but has three problems: projects can't be named or shared between machines, there's only one slot (`APP_KEY`), and the storage location isn't user-visible.
 
 **Proposed:** A simple `.vcp` (VeloCut Project) file — just `serde_json::to_string_pretty(&project_state)` written to a user-chosen path via `rfd`.
 

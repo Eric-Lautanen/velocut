@@ -68,7 +68,14 @@ impl VideoModule {
                 if let Some(id) = current_media_id {
                     ctx.cache.frame_cache.remove(&id);
                 }
-                ctx.cache.pending_pb_frame = None;
+                // Only clear pending if it belongs to the wrong clip.
+                // Correct new-clip frames may already be in flight.
+                if ctx.cache.pending_pb_frame.as_ref()
+                    .map(|f| current_media_id.map_or(true, |id| f.id != id))
+                    .unwrap_or(false)
+                {
+                    ctx.cache.pending_pb_frame = None;
+                }
             }
         }
 
@@ -217,7 +224,12 @@ impl VideoModule {
                     ctx.playback.playback_media_id = Some(clip.media_id);
                     // Drop stale scrub frame so preview doesn't freeze on wrong pos.
                     ctx.cache.frame_cache.remove(&clip.media_id);
-                    ctx.cache.pending_pb_frame = None;
+                    // Only clear pending if it belongs to a different clip.
+                    // The pb thread may already have sent a correct frame for the
+                    // new clip — clearing it would cause a one-frame blank.
+                    if ctx.cache.pending_pb_frame.as_ref().map(|f| f.id != clip.media_id).unwrap_or(false) {
+                        ctx.cache.pending_pb_frame = None;
+                    }
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         // Pass aspect=0.0 → LiveDecoder opens at native source resolution.
@@ -233,6 +245,28 @@ impl VideoModule {
                             ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, 0.0, preview_size);
                         }
                     }
+                    ctx.playback.prebuffer_sent_for = None; // reset on clip change
+                }
+
+                // [P0-3] Look-ahead: pre-buffer the next clip's decoder when the
+                // playhead is within 500ms of the current clip's end.  The pb thread
+                // opens the decoder and incrementally burns its GOP so it is ready
+                // (or nearly so) by the time Start/StartBlend arrives at clip_changed.
+                let time_remaining = (clip.start_time + clip.duration) - state.current_time;
+                if time_remaining > 0.0 && time_remaining < 0.5
+                    && ctx.playback.prebuffer_sent_for != Some(clip.id)
+                {
+                    let clip_end = clip.start_time + clip.duration;
+                    let next_clip = state.timeline.iter()
+                        .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
+                        .find(|c| (c.start_time - clip_end).abs() < 0.05);
+                    if let Some(nc) = next_clip {
+                        if let Some(lib) = clip_query::library_entry_for(state, nc) {
+                            ctx.playback.prebuffer_sent_for = Some(clip.id);
+                            ctx.media_worker.prebuffer(lib.id, lib.path.clone(), nc.source_offset, 0.0, preview_size);
+                            eprintln!("[tick] prebuffer sent for next clip id={} remaining={time_remaining:.3}s", lib.id);
+                        }
+                    }
                 }
             }
             return;
@@ -241,11 +275,12 @@ impl VideoModule {
         // ── Transition: playing → stopped ─────────────────────────────────────
         if just_stopped {
             ctx.media_worker.stop_playback();
-            ctx.playback.playback_media_id = None;
-            ctx.playback.last_frame_req    = None;
-            ctx.playback.scrub_last_moved  = None;
-            ctx.playback.scrub_coarse_req  = None;
-            ctx.cache.pending_pb_frame     = None;
+            ctx.playback.playback_media_id  = None;
+            ctx.playback.last_frame_req     = None;
+            ctx.playback.scrub_last_moved   = None;
+            ctx.playback.scrub_coarse_req   = None;
+            ctx.playback.prebuffer_sent_for = None;
+            ctx.cache.pending_pb_frame      = None;
             // Bucket cache is no longer needed after playback stops — clear it
             // so TextureHandles are released and GPU memory returns to baseline.
             ctx.cache.frame_bucket_cache.clear();
@@ -308,17 +343,34 @@ impl VideoModule {
             ctx.playback.last_frame_req = Some((clip.media_id, local_t));
 
             // Layer 1 (0ms): show nearest cached frame immediately.
-            // Skipped when inside a transition zone: the bucket cache holds unblended
-            // single-clip frames. Inserting one here would flash a raw clip_b frame
-            // for the 1–3 ticks it takes the async blend decode (L2) to arrive.
-            if zone.is_none() {
-                let found_nearby = (0..=8u32).find_map(|delta| {
+            // In transition zones, L2 stores blended frames in the bucket cache
+            // (L2b prefetch is disabled there, so no unblended frames sneak in).
+            // Use a narrower search window (2 buckets ≈ 500ms) in zones so the
+            // displayed alpha is close to correct; outside zones use the full
+            // 8-bucket (2s) window.  Showing a slightly-wrong-alpha cached frame
+            // for the 1–3 ticks until L2's exact decode arrives is far better than
+            // showing nothing (which caused the visible flicker at zone entry).
+            {
+                let search_range = if zone.is_some() { 2u32 } else { 8u32 };
+                let found_nearby = (0..=search_range).find_map(|delta| {
                     let b = fine_bucket.saturating_sub(delta);
                     ctx.cache.frame_bucket_cache.get(&(clip.media_id, b))
                         .map(|(tex, _)| tex.clone())
                 });
                 if let Some(cached) = found_nearby {
                     ctx.cache.frame_cache.insert(clip.media_id, cached);
+                }
+            }
+
+            // Thumbnail fallback: if L1 missed (no bucket-cached frame for the
+            // new clip — typical right after a clip boundary crossing), insert the
+            // library thumbnail as an immediate low-res placeholder.  The async L2
+            // decode will overwrite it within a few ms, but this prevents the blank
+            // flash that occurred when frame_cache was empty between L1 miss and L2
+            // arrival.
+            if !ctx.cache.frame_cache.contains_key(&clip.media_id) {
+                if let Some(thumb) = ctx.cache.thumbnail_cache.get(&clip.media_id) {
+                    ctx.cache.frame_cache.insert(clip.media_id, thumb.clone());
                 }
             }
 

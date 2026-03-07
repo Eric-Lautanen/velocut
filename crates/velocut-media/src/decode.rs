@@ -776,6 +776,38 @@ impl LiveDecoder {
         }
     }
 
+    /// Advance the skip_until_pts burn by at most `max_packets` video packets.
+    ///
+    /// Returns `true` when the burn is complete (skip_until_pts cleared) or was
+    /// already inactive.  Returns `false` when more packets remain — the caller
+    /// should try again next iteration.
+    ///
+    /// Used by the playback thread to interleave decoder_b's GOP burn with
+    /// primary frame production.  Each call processes ~5-10 ms of work instead
+    /// of the 30-60 ms that next_frame()'s internal burn loop would block for,
+    /// keeping primary frame output smooth during transition decoder warm-up.
+    pub fn try_advance_burn(&mut self, max_packets: usize) -> bool {
+        if self.skip_until_pts <= 0 { return true; }
+        let mut count = 0usize;
+        for (stream, packet) in self.ictx.packets().flatten() {
+            if stream.index() != self.video_idx { continue; }
+            if self.decoder.send_packet(&packet).is_err() { continue; }
+            let mut decoded = ffmpeg::util::frame::video::Video::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+                self.last_pts = pts;
+                if pts >= self.skip_until_pts {
+                    self.skip_until_pts = 0;
+                    return true;
+                }
+            }
+            count += 1;
+            if count >= max_packets { return false; }
+        }
+        // EOF before reaching target — treat as complete.
+        self.skip_until_pts = 0;
+        true
+    }
 }
 
 /// Center-crop and scale a decoded frame using a cached raw SwsContext.

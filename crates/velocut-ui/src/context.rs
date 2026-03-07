@@ -174,17 +174,23 @@ pub struct PlaybackContext {
     /// Was audio running before the last scrub or seek?
     /// Lets audio_module restart the sink after a scrub without double-starting.
     pub audio_was_playing: bool,
+
+    /// Which clip_id we last sent a PreBuffer command for.
+    /// Prevents spamming PreBuffer on every tick during the look-ahead window.
+    /// Reset on clip change, playback stop, or when the prebuffered clip starts.
+    pub prebuffer_sent_for: Option<Uuid>,
 }
 
 impl PlaybackContext {
     fn new() -> Self {
         Self {
-            last_frame_req:    None,
-            scrub_coarse_req:  None,
-            scrub_last_moved:  None,
-            playback_media_id: None,
-            prev_playing:      false,
-            audio_was_playing: false,
+            last_frame_req:      None,
+            scrub_coarse_req:    None,
+            scrub_last_moved:    None,
+            playback_media_id:   None,
+            prev_playing:        false,
+            audio_was_playing:   false,
+            prebuffer_sent_for:  None,
         }
     }
 
@@ -193,12 +199,13 @@ impl PlaybackContext {
     /// Called by the `ClearProject` handler so the scrub / playback pipeline
     /// starts clean after a wipe without needing to reconstruct the struct.
     pub fn reset(&mut self) {
-        self.last_frame_req    = None;
-        self.scrub_coarse_req  = None;
-        self.scrub_last_moved  = None;
-        self.playback_media_id = None;
-        self.prev_playing      = false;
-        self.audio_was_playing = false;
+        self.last_frame_req      = None;
+        self.scrub_coarse_req    = None;
+        self.scrub_last_moved    = None;
+        self.playback_media_id   = None;
+        self.prev_playing        = false;
+        self.audio_was_playing   = false;
+        self.prebuffer_sent_for  = None;
     }
 }
 
