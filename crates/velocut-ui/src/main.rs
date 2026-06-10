@@ -17,7 +17,7 @@ fn main() -> eframe::Result {
             .with_title("VeloCut")
             .with_inner_size([1465.0, 965.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_decorations(false)
+            .with_decorations(true)
             .with_resizable(true)
             .with_icon(icon),
         ..Default::default()
@@ -59,18 +59,13 @@ fn load_icon() -> egui::IconData {
     }
 }
 
-/// On Windows, borderless windows (`with_decorations(false)`) are created with
-/// `WS_POPUP` style which does NOT receive `WS_EX_APPWINDOW` automatically.
-/// Without it the shell either omits the taskbar button or shows it without
-/// the app icon.
+/// Safety net: propagates the class icon to the window instance so the taskbar
+/// and alt-tab switcher always display the correct icon on Windows.
 ///
-/// This function enumerates all windows on the calling thread (the UI/main
-/// thread) and ORs WS_EX_APPWINDOW into each one's extended style. Because
-/// eframe creates exactly one window on the UI thread, this always hits the
-/// right window with zero ambiguity.
+/// Also ensures WS_EX_APPWINDOW is set for borderless compatibility.
 ///
 /// No extra crate dependency — user32.dll and kernel32.dll are always linked
-/// on Windows builds. No raw_window_handle import needed at all.
+/// on Windows builds.
 #[cfg(target_os = "windows")]
 pub fn fix_taskbar_icon() {
     const GWL_EXSTYLE:     i32   = -20;

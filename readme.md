@@ -44,7 +44,7 @@ The UI is built with [egui](https://github.com/emilk/egui) / [eframe](https://gi
 - **Session persistence** — Project state saved and restored between launches via eframe storage
 - **Project reset** — Two-stage ⊘ Reset button with 5-second confirmation window and ordered 8-step teardown
 - **Proactive memory management** — Two-stage idle memory manager: Stage 1 (2s scrub idle) evicts frame buckets outside ±5s of the playhead; Stage 2 (30s deep idle) flushes all decoded frames, scrub textures, and egui Memory
-- **Custom chrome** — Frameless window with custom title bar, software resize handles, accent-colored branding, and WS_EX_APPWINDOW taskbar icon fix for borderless Windows windows
+- **Cross-platform windowing** — Native OS window decorations with taskbar icon fix for Windows borderless compatibility
 
 ---
 
