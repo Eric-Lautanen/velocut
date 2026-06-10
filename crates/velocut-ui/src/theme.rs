@@ -80,9 +80,9 @@ pub fn configure_style(ctx: &Context) {
     v.override_text_color = Some(DARK_TEXT);
 
     ctx.set_visuals(v);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 
-    ctx.style_mut(|s| {
+    ctx.global_style_mut(|s| {
         s.visuals.window_corner_radius = cr;
         s.visuals.menu_corner_radius   = cr;
     });

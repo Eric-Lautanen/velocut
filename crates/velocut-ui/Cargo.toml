@@ -25,7 +25,6 @@ crossbeam-channel = { workspace = true }
 parking_lot       = { workspace = true }
 rodio             = { workspace = true }
 png               = { workspace = true }
-egui-desktop      = { workspace = true }
 
 [build-dependencies]
 winresource = { workspace = true }

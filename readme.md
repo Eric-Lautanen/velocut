@@ -4,10 +4,10 @@
 
 **A fast, native desktop video editor written in Rust.**
 
-![Rust](https://img.shields.io/badge/Rust-1.93+-orange?style=flat-square&logo=rust)
+![Rust](https://img.shields.io/badge/Rust-1.96+-orange?style=flat-square&logo=rust)
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
-![egui](https://img.shields.io/badge/UI-egui%200.33-purple?style=flat-square)
+![egui](https://img.shields.io/badge/UI-egui%200.34-purple?style=flat-square)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-static-red?style=flat-square)
 <img src="assets/screenshot.png" alt="Velocut" width="80%">
 
@@ -154,16 +154,17 @@ The egui application and binary entry point (~10K lines, 4-panel layout).
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `eframe` / `egui` | 0.33 | UI framework |
+| `eframe` / `egui` | 0.34 | UI framework |
 | `ffmpeg-the-third` | forked | FFmpeg bindings (static) |
 | `crossbeam-channel` | 0.5 | Worker thread channels |
-| `rayon` | latest | Parallel row processing in transition `apply_rgba` |
-| `rodio` | 0.21.1 | Audio playback |
-| `rfd` | 0.14 | Native file dialogs |
+| `rayon` | 1.12 | Parallel row processing in transition `apply_rgba` |
+| `rodio` | 0.22 | Audio playback |
+| `rfd` | 0.17 | Native file dialogs |
 | `serde` | 1.0 | Project serialization |
-| `uuid` | 1.10 | Clip identity |
-| `egui-desktop` | 0.2.2 | Custom title bar + resize handles |
-| `png` | 0.18.1 | Icon loading, frame export |
+| `uuid` | 1.23 | Clip identity |
+| `png` | 0.18 | Icon loading, frame export |
+| `tempfile` | 3.27 | Temp file management |
+| `parking_lot` | 0.12 | Fast primitives |
 
 ### FFmpeg Fork
 
@@ -177,7 +178,7 @@ The static FFmpeg build includes D3D11VA compiled in (`--enable-d3d11va`, `--ena
 
 ### Prerequisites
 
-- Rust 1.93+
+- Rust 1.96+
 - MSYS2 / MINGW64 (Windows)
 - The forked FFmpeg static libraries (linked via the `ffmpeg-the-third` fork — see its README for build instructions)
 

@@ -18,7 +18,7 @@ use velocut_core::state::ProjectState;
 use crate::modules::ThumbnailCache;
 use crate::velocut_log;
 use eframe::egui;
-use rodio::{OutputStream, Sink};
+use rodio::{MixerDeviceSink, Player};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -221,12 +221,12 @@ pub struct AppContext {
     // ── Scrub / playback decode tracking ─────────────────────────────────────
     pub playback: PlaybackContext,
 
-    // ── Audio (rodio 0.21) ───────────────────────────────────────────────────
-    // OutputStream MUST stay alive for the entire app lifetime — dropping it
+    // ── Audio (rodio 0.22) ───────────────────────────────────────────────────
+    // MixerDeviceSink MUST stay alive for the entire app lifetime — dropping it
     // stops all audio.  audio_module borrows it each tick via .mixer().
-    pub audio_stream: Option<OutputStream>,
-    pub audio_sinks:  HashMap<Uuid, Sink>,
-    pub audio_overlay_sinks: HashMap<Uuid, rodio::Sink>,
+    pub audio_stream: Option<MixerDeviceSink>,
+    pub audio_sinks:  HashMap<Uuid, Player>,
+    pub audio_overlay_sinks: HashMap<Uuid, rodio::Player>,
 }
 
 impl AppContext {

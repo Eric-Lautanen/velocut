@@ -98,7 +98,7 @@ pub struct AudioModule {
     ///   2. Move it here.
     ///   3. Drop it after FADE_OUT_HOLD_SECS so the OS buffer has time to
     ///      flush the now-silent samples before the rodio thread releases it.
-    draining_sinks: Vec<(rodio::Sink, Instant)>,
+    draining_sinks: Vec<(rodio::Player, Instant)>,
 
     /// Last volume value passed to set_volume() for each primary sink.
     /// set_volume() is only called when the new value differs by more than
@@ -192,7 +192,7 @@ impl AudioModule {
     /// large enough to absorb all f32 rounding noise at 60 fps.
     const VOLUME_EPSILON: f32 = 0.002;
 
-    fn set_primary_volume(&mut self, id: Uuid, sink: &rodio::Sink, vol: f32) {
+    fn set_primary_volume(&mut self, id: Uuid, sink: &rodio::Player, vol: f32) {
         let last = self.sink_last_volume.get(&id).copied().unwrap_or(-1.0);
         if (vol - last).abs() > Self::VOLUME_EPSILON {
             sink.set_volume(vol);
@@ -200,7 +200,7 @@ impl AudioModule {
         }
     }
 
-    fn set_overlay_volume(&mut self, id: Uuid, sink: &rodio::Sink, vol: f32) {
+    fn set_overlay_volume(&mut self, id: Uuid, sink: &rodio::Player, vol: f32) {
         let last = self.overlay_last_volume.get(&id).copied().unwrap_or(-1.0);
         if (vol - last).abs() > Self::VOLUME_EPSILON {
             sink.set_volume(vol);
@@ -220,7 +220,7 @@ impl AudioModule {
         // AppContext::new() time. In Windows GUI-subsystem mode (double-click),
         // WASAPI requires the Win32 message loop to be running first.
         if ctx.audio_stream.is_none() {
-            match rodio::OutputStreamBuilder::open_default_stream() {
+            match rodio::DeviceSinkBuilder::open_default_sink() {
                 Ok(stream) => {
                     audio_log("stream ready — starting warmup");
                     ctx.audio_stream = Some(stream);
@@ -429,10 +429,7 @@ impl AudioModule {
                                     // Per rodio 0.21 docs: connect_new takes &Mixer
                                     // obtained from OutputStream::mixer().
                                     // stream lives in AppContext so the device stays alive.
-                                    let sink = rodio::Sink::connect_new(&mixer);
-                                    // fade_in ramps 0→1 over FADE_SECS from the seek position.
-                                    // This masks any DC offset at the seek point and prevents
-                                    // the click on play-start and clip transitions.
+                                    let sink = rodio::Player::connect_new(&mixer);
                                     sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
                                     let _ = sink.try_seek(
                                         std::time::Duration::from_secs_f64(seek_t));
@@ -587,7 +584,7 @@ impl AudioModule {
                     Ok(file) => {
                         match Decoder::new(BufReader::new(file)) {
                             Ok(decoder) => {
-                                let sink = rodio::Sink::connect_new(&mixer);
+                                let sink = rodio::Player::connect_new(&mixer);
                                 sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
                                 let _ = sink.try_seek(
                                     std::time::Duration::from_secs_f64(seek_t));

@@ -18,7 +18,6 @@ use crate::modules::{
     video_module::VideoModule,
 };
 use eframe::egui;
-use egui_desktop::{TitleBar, TitleBarOptions, render_resize_handles};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::collections::HashSet;
@@ -762,7 +761,7 @@ impl eframe::App for VeloCutApp {
         eframe::set_value(storage, eframe::APP_KEY, &AppStorage { project });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.context.media_worker.shutdown();
         self.context.audio_sinks.clear();
         self.context.audio_overlay_sinks.clear();
@@ -780,9 +779,9 @@ impl eframe::App for VeloCutApp {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Taskbar icon fix (Windows only, fires once) ───────────────────────
-        // Must run from update(), not new() — the OS window doesn't exist yet
+        // Must run from logic(), not new() — the OS window doesn't exist yet
         // when new() is called, so EnumThreadWindows finds nothing to patch there.
         if !self.taskbar_icon_fixed {
             crate::fix_taskbar_icon();
@@ -808,18 +807,12 @@ impl eframe::App for VeloCutApp {
             let screen = ctx.viewport_rect();
             const TARGET_W: f32 = 1465.0;
             const TARGET_H: f32 = 965.0;
-            const SETTLE_MIN_H: f32 = 900.0; // raise this — must match your actual target
+            const SETTLE_MIN_H: f32 = 900.0;
 
-            // Always fire the resize command on frame 1 unconditionally.
-            // Don't wait to "check" — just assert the correct size every frame
-            // until the viewport reports it's actually there.
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                 egui::vec2(TARGET_W, TARGET_H),
             ));
 
-            // Only write panel heights once the OS has actually applied the resize.
-            // This prevents the race where we write a 340px timeline into a
-            // 200px-tall viewport and egui clamps + persists the clamped value.
             if screen.height() >= SETTLE_MIN_H {
                 self.startup_size_checked = true;
 
@@ -831,12 +824,10 @@ impl eframe::App for VeloCutApp {
             }
 
             ctx.request_repaint();
-            return; // skip the rest of update() until the window is properly sized
+            return;
         }
         self.handle_drag_and_drop(ctx);
         self.poll_media(ctx);
-
-        self.render_panels(ctx);
 
         // ── Process commands emitted by modules this frame ────────────────────
         let cmds: Vec<EditorCommand> = self.pending_cmds.drain(..).collect();
@@ -845,6 +836,10 @@ impl eframe::App for VeloCutApp {
         }
 
         self.tick_modules(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render_panels(ui);
     }
 }
 
@@ -988,52 +983,36 @@ fn build_encode_plan(
 // ── Sub-frame helpers (called from update) ────────────────────────────────────
 
 impl VeloCutApp {
-    /// Render the title bar, all panels, and the encode modal overlay.
-    /// Called from `update()` after pre-frame housekeeping.
-    fn render_panels(&mut self, ctx: &egui::Context) {
-        const APP_ICON: &[u8] = include_bytes!("../../../assets/linux/icon-32.png");
-        TitleBar::new(
-            TitleBarOptions::new()
-                .with_title("")
-                .with_background_color(crate::theme::DARK_BG_1)
-                .with_hover_color(crate::theme::DARK_BG_4)
-                .with_close_hover_color(egui::Color32::from_rgb(232, 17, 35))
-                .with_title_color(crate::theme::ACCENT)
-                .with_title_font_size(15.0)
-                .with_app_icon(APP_ICON, "icon-32.png"),
-        )
-        .show(ctx);
+    /// Render all panels and the encode modal overlay.
+    /// Called from `ui()` after pre-frame housekeeping.
+    fn render_panels(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
 
-        render_resize_handles(ctx);
-
-        egui::TopBottomPanel::bottom("timeline_panel")
+        egui::Panel::bottom("timeline_panel")
             .resizable(true)
-            .min_height(340.0)
-            .default_height(340.0)
-            .show(ctx, |ui| {
+            .min_size(340.0)
+            .default_size(340.0)
+            .show_inside(ui, |ui| {
                 self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
-        egui::SidePanel::left("library_panel")
+        egui::Panel::left("library_panel")
             .resizable(true)
-            .min_width(240.0)
-            .default_width(240.0)
-            .show(ctx, |ui| {
+            .min_size(240.0)
+            .default_size(240.0)
+            .show_inside(ui, |ui| {
                 self.library.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
-        egui::SidePanel::right("export_panel")
+        egui::Panel::right("export_panel")
             .resizable(true)
-            .default_width(220.0)
-            .min_width(220.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .min_size(220.0)
+            .show_inside(ui, |ui| {
                 self.export.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Give PreviewModule the current live frame (if any) so it can render
-            // it directly. No thumbnail_cache mutation needed — the cache stays
-            // pure thumbnails and PreviewModule owns its frame reference.
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let active_id = VideoModule::active_media_id(&self.state);
             self.preview.current_frame = active_id
                 .and_then(|id| self.context.cache.frame_cache.get(&id).cloned());
@@ -1041,10 +1020,8 @@ impl VeloCutApp {
             self.preview.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
         });
 
-        // Must be called after all panels so the scrim paints above the full UI.
-        // No-op while encode_job is None.
-        self.export.show_render_modal(ctx, &self.state, &mut self.pending_cmds);
-        crate::helpers::reset::show_uninstall_modal(ctx, &mut self.export.show_reset_complete);
+        self.export.show_render_modal(&ctx, &self.state, &mut self.pending_cmds);
+        crate::helpers::reset::show_uninstall_modal(&ctx, &mut self.export.show_reset_complete);
     }
 
     /// Tick non-rendering modules and advance the playback clock.

@@ -1,0 +1,9 @@
+[env]
+FFMPEG_DIR = "C:\\ffmpeg-velocut"
+PKG_CONFIG_PATH = "C:\\ffmpeg-velocut\\lib\\pkgconfig;C:\\msys64\\mingw64\\lib\\pkgconfig"
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+  "-L", "/mingw64/lib",
+  "-L", "/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0",
+]
