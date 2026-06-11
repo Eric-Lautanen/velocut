@@ -158,28 +158,10 @@ impl MediaWorker {
                     return;
                 }
 
-                // Reset (re-open + seek to keyframe) when:
-                //   a) different file
-                //   b) any backward movement — advance_to() can only go forward
-                //   c) forward jump > 2 s — advance_to() would decode 60+ frames
-                //      (~300-800 ms), blocking the thread. Re-open is instant and
-                //      Layer 3 (150 ms debounce) fires the exact frame once idle.
-                let needs_reset = live
-                    .as_ref()
-                    .map(|d| {
-                        let tpts = d.ts_to_pts(req.timestamp);
-                        let two_secs = d.ts_to_pts(2.0);
-                        d.path != req.path
-                        || tpts < d.last_pts                // any backward seek
-                        || tpts > d.last_pts + two_secs // large forward jump
-                    })
-                    .unwrap_or(true);
+                let needs_open = live.as_ref().map(|d| d.path != req.path).unwrap_or(true);
 
-                if needs_reset {
-                    // [Opt #1] Move the old decoder's SwsContext out before dropping it.
-                    // If the new clip has the same source format/dimensions the context
-                    // is reused instead of calling SwsContext::get (which re-runs
-                    // internal lookup-table init — measurable cost on the scrub path).
+                if needs_open {
+                    // Different file or first request — open a fresh decoder.
                     let cached_sws = live
                         .take()
                         .map(|d| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
@@ -187,10 +169,6 @@ impl MediaWorker {
                     {
                         Ok(mut d) => {
                             let target_pts = d.ts_to_pts(req.timestamp);
-                            // advance_to burns through the GOP (decode-only, no scale/alloc)
-                            // and returns the frame at exactly req.timestamp. Unlike next_frame
-                            // it has no per-call packet limit, so it always reaches the target
-                            // in one call without advancing last_pts past it.
                             if let Some((data, w, h)) = d.advance_to(target_pts) {
                                 let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                                     id: req.id,
@@ -205,6 +183,16 @@ impl MediaWorker {
                     }
                 } else if let Some(d) = &mut live {
                     let tpts = d.ts_to_pts(req.timestamp);
+                    // Seek within the existing decoder instead of reopening when:
+                    //   a) backward movement — advance_to can only go forward
+                    //   b) large forward jump > 2 s — avoid decoding hundreds of frames
+                    let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
+                    if needs_seek {
+                        if let Err(e) = d.seek_to(req.timestamp) {
+                            eprintln!("[media] seek_to failed: {e}");
+                            continue;
+                        }
+                    }
                     if let Some((data, w, h)) = d.advance_to(tpts) {
                         let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                             id: req.id,
@@ -1529,16 +1517,9 @@ fn decode_transition_scrub_frame(
     path: &PathBuf,
     ts: f64,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let needs_reset = live
-        .as_ref()
-        .map(|(p, d)| {
-            let tpts = d.ts_to_pts(ts);
-            let two_secs = d.ts_to_pts(2.0);
-            p != path || tpts < d.last_pts || tpts > d.last_pts + two_secs
-        })
-        .unwrap_or(true);
+    let needs_open = live.as_ref().map(|(p, _)| p != path).unwrap_or(true);
 
-    if needs_reset {
+    if needs_open {
         let cached_sws = live
             .take()
             .map(|(_, d)| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
@@ -1554,10 +1535,18 @@ fn decode_transition_scrub_frame(
                 None
             }
         }
-    } else {
-        let (_, d) = live.as_mut().unwrap();
+    } else if let Some((_, d)) = live.as_mut() {
         let tpts = d.ts_to_pts(ts);
+        let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
+        if needs_seek {
+            if let Err(e) = d.seek_to(ts) {
+                eprintln!("[transition_scrub] seek_to failed: {e}");
+                return None;
+            }
+        }
         d.advance_to(tpts)
+    } else {
+        None
     }
 }
 

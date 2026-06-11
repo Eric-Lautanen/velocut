@@ -500,6 +500,21 @@ impl LiveDecoder {
         (t * self.tb_den as f64 / self.tb_num as f64) as i64
     }
 
+    /// Seek within the already-open decoder — avoids a full decoder reopen for
+    /// backward or large-forward jumps during scrubbing. Seeks the demuxer to
+    /// the keyframe nearest `timestamp`, flushes the decoder, and sets
+    /// `skip_until_pts` so the next `advance_to` call burns through the GOP.
+    pub fn seek_to(&mut self, timestamp: f64) -> Result<()> {
+        let seek_pts = self.ts_to_pts(timestamp);
+        self.ictx
+            .seek(seek_pts, ..=seek_pts)
+            .map_err(|e| anyhow::anyhow!("seek failed: {e}"))?;
+        self.decoder.flush();
+        self.last_pts = seek_pts.saturating_sub(1);
+        self.skip_until_pts = seek_pts;
+        Ok(())
+    }
+
     pub fn pts_to_secs(&self, pts: i64) -> f64 {
         pts as f64 * self.tb_num as f64 / self.tb_den as f64
     }
