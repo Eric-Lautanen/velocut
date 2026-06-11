@@ -334,14 +334,18 @@ impl MediaWorker {
                             // [P0-3] Try prebuffered decoder first.
                             if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                 if pb_id == new_id {
-                                    let t0 = std::time::Instant::now();
-                                    let tpts = pb_dec.ts_to_pts(ts);
-                                    if tpts > pb_dec.last_pts {
-                                        pb_dec.burn_to_pts(tpts);
+                                    if pb_dec.skip_until_pts > 0 {
+                                        eprintln!("[pb] Start: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                    } else {
+                                        let t0 = std::time::Instant::now();
+                                        let tpts = pb_dec.ts_to_pts(ts);
+                                        if tpts > pb_dec.last_pts {
+                                            pb_dec.burn_to_pts(tpts);
+                                        }
+                                        eprintln!("[pb] Start (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        decoder = Some((new_id, pb_dec));
+                                        continue;
                                     }
-                                    eprintln!("[pb] Start (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
-                                    decoder = Some((new_id, pb_dec));
-                                    continue;
                                 }
                                 // Wrong id — drop it and open fresh.
                             }
@@ -407,12 +411,22 @@ impl MediaWorker {
                             // [P0-3] Try prebuffered decoder for the primary.
                             if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                 if pb_id == new_id {
-                                    let tpts = pb_dec.ts_to_pts(ts);
-                                    if tpts > pb_dec.last_pts {
-                                        pb_dec.burn_to_pts(tpts);
+                                    if pb_dec.skip_until_pts > 0 {
+                                        // Burn never reached the target — prebuffer was
+                                        // advanced past EOF by interleaved try_advance_burn
+                                        // calls during clip_a playback.  Using it as primary
+                                        // would make next_frame() return None immediately,
+                                        // causing the None handler to clear blend + decoder
+                                        // and freeze the preview for clip_b's entire duration.
+                                        eprintln!("[pb] StartBlend: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                    } else {
+                                        let tpts = pb_dec.ts_to_pts(ts);
+                                        if tpts > pb_dec.last_pts {
+                                            pb_dec.burn_to_pts(tpts);
+                                        }
+                                        eprintln!("[pb] StartBlend (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        decoder = Some((new_id, pb_dec));
                                     }
-                                    eprintln!("[pb] StartBlend (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
-                                    decoder = Some((new_id, pb_dec));
                                 }
                                 // Wrong id — drop and fall through to open fresh.
                             }
@@ -717,9 +731,7 @@ impl MediaWorker {
                             // is full the UI is overloaded; skip this frame rather than
                             // stalling the decode loop (which would prevent processing
                             // Stop/Start/StartBlend commands).
-                            if pb_frame_tx.try_send(f).is_err()
-                                && frame_count.is_multiple_of(60)
-                            {
+                            if pb_frame_tx.try_send(f).is_err() && frame_count.is_multiple_of(60) {
                                 eprintln!("[pb] channel full — dropping frame ts={ts_secs:.3}");
                             }
                             // [P0-3] Interleave prebuffer burn between primary frames.
@@ -801,14 +813,18 @@ impl MediaWorker {
                                 // [P0-3] Try prebuffered decoder first.
                                 if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                     if pb_id == id {
-                                        let t0 = std::time::Instant::now();
-                                        let tpts = pb_dec.ts_to_pts(ts);
-                                        if tpts > pb_dec.last_pts {
-                                            pb_dec.burn_to_pts(tpts);
+                                        if pb_dec.skip_until_pts > 0 {
+                                            eprintln!("[pb] Start (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                        } else {
+                                            let t0 = std::time::Instant::now();
+                                            let tpts = pb_dec.ts_to_pts(ts);
+                                            if tpts > pb_dec.last_pts {
+                                                pb_dec.burn_to_pts(tpts);
+                                            }
+                                            eprintln!("[pb] Start (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                            decoder = Some((id, pb_dec));
+                                            continue;
                                         }
-                                        eprintln!("[pb] Start (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
-                                        decoder = Some((id, pb_dec));
-                                        continue;
                                     }
                                 }
                                 let t0 = std::time::Instant::now();
@@ -950,13 +966,17 @@ impl MediaWorker {
                                 // [P0-3] Try prebuffered decoder for the primary.
                                 if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                     if pb_id == id {
-                                        let t0 = std::time::Instant::now();
-                                        let tpts = pb_dec.ts_to_pts(burn_ts);
-                                        if tpts > pb_dec.last_pts {
-                                            pb_dec.burn_to_pts(tpts);
+                                        if pb_dec.skip_until_pts > 0 {
+                                            eprintln!("[pb] StartBlend (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                        } else {
+                                            let t0 = std::time::Instant::now();
+                                            let tpts = pb_dec.ts_to_pts(burn_ts);
+                                            if tpts > pb_dec.last_pts {
+                                                pb_dec.burn_to_pts(tpts);
+                                            }
+                                            eprintln!("[pb] StartBlend (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                            decoder = Some((id, pb_dec));
                                         }
-                                        eprintln!("[pb] StartBlend (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
-                                        decoder = Some((id, pb_dec));
                                     } else {
                                         // Wrong id — drop and open fresh below.
                                         prebuffered = None;
