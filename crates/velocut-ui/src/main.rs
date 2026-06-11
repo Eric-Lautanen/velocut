@@ -8,6 +8,7 @@ mod theme;
 
 fn main() -> eframe::Result {
     ffmpeg_the_third::init().expect("FFmpeg init failed");
+    ffmpeg_the_third::log::set_level(ffmpeg_the_third::log::Level::Warning);
 
     let icon = load_icon();
 
