@@ -268,8 +268,8 @@ impl MediaWorker {
         // channel at all times during playback. burn_to_pts runs synchronously
         // before the send loop starts so the extra headroom was never consumed;
         // 6 frames (~200ms at 30fps) is sufficient for smooth playback.
-        let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(4);
-        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(3); // was 6; preview-res frames ~0.5MB each so 3 = ~1.5MB vs old 48MB
+        let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(8);
+        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(16);
 
         thread::spawn(move || {
             let mut decoder: Option<(Uuid, LiveDecoder)> = None;
@@ -713,8 +713,14 @@ impl MediaWorker {
                             if frame_count.is_multiple_of(60) {
                                 eprintln!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
                             }
-                            if pb_frame_tx.send(f).is_err() {
-                                return;
+                            // try_send so the pb thread never blocks — if the channel
+                            // is full the UI is overloaded; skip this frame rather than
+                            // stalling the decode loop (which would prevent processing
+                            // Stop/Start/StartBlend commands).
+                            if pb_frame_tx.try_send(f).is_err()
+                                && frame_count.is_multiple_of(60)
+                            {
+                                eprintln!("[pb] channel full — dropping frame ts={ts_secs:.3}");
                             }
                             // [P0-3] Interleave prebuffer burn between primary frames.
                             // Advance by 10 packets (~5ms) per frame so the prebuffered
@@ -1056,7 +1062,7 @@ impl MediaWorker {
                                     height: coast_h,
                                     data,
                                 };
-                                if pb_frame_tx.send(f).is_err() {
+                                if pb_frame_tx.try_send(f).is_err() {
                                     return;
                                 }
                             } else {
