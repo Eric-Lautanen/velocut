@@ -2,5 +2,5 @@
 pub mod clip_query;
 pub mod format;
 pub mod log;
-pub mod reset;
 pub mod memory_manager;
+pub mod reset;

@@ -109,7 +109,9 @@ pub fn ease_in_bounce(t: f32) -> f32 {
 #[inline]
 pub fn ease_out_elastic(t: f32) -> f32 {
     let t = clamp01(t);
-    if t == 0.0 || t == 1.0 { return t; }
+    if t == 0.0 || t == 1.0 {
+        return t;
+    }
     let c4 = std::f32::consts::TAU / 3.0;
     2.0_f32.powf(-10.0 * t) * ((t * 10.0 - 0.75) * c4).sin() + 1.0
 }
@@ -204,9 +206,13 @@ pub fn split_planes(buf: &[u8], w: u32, h: u32) -> (&[u8], &[u8], &[u8]) {
     let yl = y_len(w, h);
     let cl = uv_len(w, h);
     debug_assert_eq!(
-        buf.len(), yl + cl * 2,
+        buf.len(),
+        yl + cl * 2,
         "split_planes: buffer length {} ≠ expected {} for {}×{}",
-        buf.len(), yl + cl * 2, w, h
+        buf.len(),
+        yl + cl * 2,
+        w,
+        h
     );
     (&buf[..yl], &buf[yl..yl + cl], &buf[yl + cl..])
 }
@@ -379,8 +385,11 @@ pub fn alloc_frame(w: u32, h: u32) -> Vec<u8> {
 /// Panics in debug builds if `rgba.len() != w * h * 4`.
 pub fn rgba_to_yuv420p(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     debug_assert_eq!(
-        rgba.len(), (w * h * 4) as usize,
-        "rgba_to_yuv420p: expected {} bytes, got {}", w * h * 4, rgba.len()
+        rgba.len(),
+        (w * h * 4) as usize,
+        "rgba_to_yuv420p: expected {} bytes, got {}",
+        w * h * 4,
+        rgba.len()
     );
     let yw = w as usize;
     let yh = h as usize;
@@ -394,11 +403,11 @@ pub fn rgba_to_yuv420p(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     for py in 0..yh {
         for px in 0..yw {
             let s = (py * yw + px) * 4;
-            let r = rgba[s]     as f32;
+            let r = rgba[s] as f32;
             let g = rgba[s + 1] as f32;
             let b = rgba[s + 2] as f32;
             // BT.601 full-range luma
-            y_plane[py * yw + px] = ( 0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+            y_plane[py * yw + px] = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
         }
     }
 
@@ -410,11 +419,11 @@ pub fn rgba_to_yuv420p(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
             for dy in 0..2usize {
                 for dx in 0..2usize {
                     let s = ((cy * 2 + dy) * yw + (cx * 2 + dx)) * 4;
-                    let r = rgba[s]     as f32;
+                    let r = rgba[s] as f32;
                     let g = rgba[s + 1] as f32;
                     let b = rgba[s + 2] as f32;
                     sum_u += -0.168736 * r - 0.331264 * g + 0.500000 * b + 128.0;
-                    sum_v +=  0.500000 * r - 0.418688 * g - 0.081312 * b + 128.0;
+                    sum_v += 0.500000 * r - 0.418688 * g - 0.081312 * b + 128.0;
                 }
             }
             u_plane[cy * uw + cx] = (sum_u * 0.25).round().clamp(0.0, 255.0) as u8;
@@ -434,12 +443,14 @@ pub fn rgba_to_yuv420p(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
 ///
 /// Panics in debug builds if `yuv.len() != w*h + (w/2)*(h/2)*2`.
 pub fn yuv420p_to_rgba(yuv: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let yw  = w as usize;
-    let yh  = h as usize;
-    let uw  = yw / 2;
+    let yw = w as usize;
+    let yh = h as usize;
+    let uw = yw / 2;
     debug_assert_eq!(
-        yuv.len(), yw * yh + uw * (yh / 2) * 2,
-        "yuv420p_to_rgba: unexpected buffer length {}", yuv.len()
+        yuv.len(),
+        yw * yh + uw * (yh / 2) * 2,
+        "yuv420p_to_rgba: unexpected buffer length {}",
+        yuv.len()
     );
 
     let y_plane = &yuv[..yw * yh];
@@ -454,12 +465,12 @@ pub fn yuv420p_to_rgba(yuv: &[u8], w: u32, h: u32) -> Vec<u8> {
             let u = u_plane[(py / 2) * uw + px / 2] as f32 - 128.0;
             let v = v_plane[(py / 2) * uw + px / 2] as f32 - 128.0;
 
-            let r = (y + 1.402000 * v).round().clamp(0.0, 255.0) as u8;
+            let r = (y + 1.402 * v).round().clamp(0.0, 255.0) as u8;
             let g = (y - 0.344136 * u - 0.714136 * v).round().clamp(0.0, 255.0) as u8;
-            let b = (y + 1.772000 * u).round().clamp(0.0, 255.0) as u8;
+            let b = (y + 1.772 * u).round().clamp(0.0, 255.0) as u8;
 
             let d = (py * yw + px) * 4;
-            rgba[d]     = r;
+            rgba[d] = r;
             rgba[d + 1] = g;
             rgba[d + 2] = b;
             // rgba[d + 3] already 255
@@ -480,7 +491,10 @@ pub fn yuv420p_to_rgba(yuv: &[u8], w: u32, h: u32) -> Vec<u8> {
 #[inline]
 pub fn blend_buffers(a: &[u8], b: &[u8], alpha: f32) -> Vec<u8> {
     debug_assert_eq!(a.len(), b.len(), "blend_buffers: slice length mismatch");
-    a.iter().zip(b.iter()).map(|(&av, &bv)| blend_byte(av, bv, alpha)).collect()
+    a.iter()
+        .zip(b.iter())
+        .map(|(&av, &bv)| blend_byte(av, bv, alpha))
+        .collect()
 }
 
 #[cfg(test)]
@@ -511,7 +525,10 @@ mod tests {
         let n = 5;
         for i in 0..n {
             let a = frame_alpha(i, n);
-            assert!(a > 0.0 && a < 1.0, "alpha {a} out of exclusive range for i={i}");
+            assert!(
+                a > 0.0 && a < 1.0,
+                "alpha {a} out of exclusive range for i={i}"
+            );
         }
     }
 
@@ -525,8 +542,8 @@ mod tests {
     #[test]
     fn plane_layout_1080p() {
         let (w, h) = (1920_u32, 1080_u32);
-        assert_eq!(y_len(w, h),   1920 * 1080);
-        assert_eq!(uv_len(w, h),  960 * 540);
+        assert_eq!(y_len(w, h), 1920 * 1080);
+        assert_eq!(uv_len(w, h), 960 * 540);
         assert_eq!(u_offset(w, h), 1920 * 1080);
         assert_eq!(v_offset(w, h), 1920 * 1080 + 960 * 540);
     }
@@ -583,9 +600,12 @@ mod tests {
     fn ease_in_out_sine_softer_than_smoothstep() {
         // At t=0.1 the sine ease should be greater than smooth-step
         // (it rises faster early, characteristic of the softer curve).
-        let sine  = ease_in_out_sine(0.1);
-        let poly  = ease_in_out(0.1);
-        assert!(sine > poly, "sine ease should lead smooth-step at t=0.1 (got {sine} vs {poly})");
+        let sine = ease_in_out_sine(0.1);
+        let poly = ease_in_out(0.1);
+        assert!(
+            sine > poly,
+            "sine ease should lead smooth-step at t=0.1 (got {sine} vs {poly})"
+        );
     }
 
     #[test]
@@ -612,7 +632,7 @@ mod tests {
     #[test]
     fn sample_plane_clamped_negative_coords() {
         let plane: Vec<u8> = (10..18).collect(); // 4×2, values 10..17
-        // Negative x → clamp to col 0
+                                                 // Negative x → clamp to col 0
         assert_eq!(sample_plane_clamped(&plane, -5, 0, 4, 2), 10);
         // Negative y → clamp to row 0
         assert_eq!(sample_plane_clamped(&plane, 1, -3, 4, 2), 11);
@@ -621,7 +641,7 @@ mod tests {
     #[test]
     fn sample_plane_clamped_out_of_bounds_high() {
         let plane: Vec<u8> = (0..8).collect(); // 4×2
-        // x too large → clamp to col 3 (value = row*4+3)
+                                               // x too large → clamp to col 3 (value = row*4+3)
         assert_eq!(sample_plane_clamped(&plane, 99, 0, 4, 2), 3);
         // y too large → clamp to row 1, col 2 = 6
         assert_eq!(sample_plane_clamped(&plane, 2, 99, 4, 2), 6);
@@ -639,9 +659,9 @@ mod tests {
         let a = vec![0u8, 100, 200];
         let b = vec![100u8, 200, 50];
         let at_zero = blend_buffers(&a, &b, 0.0);
-        let at_one  = blend_buffers(&a, &b, 1.0);
+        let at_one = blend_buffers(&a, &b, 1.0);
         assert_eq!(at_zero, a);
-        assert_eq!(at_one,  b);
+        assert_eq!(at_one, b);
     }
 
     #[test]
@@ -655,12 +675,17 @@ mod tests {
     #[test]
     fn rgba_yuv_roundtrip_within_tolerance() {
         let (w, h) = (2, 2);
-        let rgba_in: Vec<u8> = (0..16).map(|i| if i % 4 == 3 { 255 } else { 128 }).collect();
-        let yuv  = rgba_to_yuv420p(&rgba_in, w, h);
+        let rgba_in: Vec<u8> = (0..16)
+            .map(|i| if i % 4 == 3 { 255 } else { 128 })
+            .collect();
+        let yuv = rgba_to_yuv420p(&rgba_in, w, h);
         let rgba_out = yuv420p_to_rgba(&yuv, w, h);
         for i in (0..rgba_in.len()).step_by(4) {
             let diff = (rgba_in[i] as i16 - rgba_out[i] as i16).abs();
-            assert!(diff <= 2, "channel {i} roundtrip error {diff} exceeds tolerance");
+            assert!(
+                diff <= 2,
+                "channel {i} roundtrip error {diff} exceeds tolerance"
+            );
         }
     }
 }

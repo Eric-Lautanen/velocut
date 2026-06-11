@@ -42,8 +42,15 @@ fn load_icon() -> egui::IconData {
     let bytes = include_bytes!("../../../assets/linux/icon-256.png");
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().expect("Failed to read icon PNG info");
-    let mut buf = vec![0u8; reader.output_buffer_size().expect("Failed to get icon buffer size")];
-    let info = reader.next_frame(&mut buf).expect("Failed to decode icon PNG");
+    let mut buf = vec![
+        0u8;
+        reader
+            .output_buffer_size()
+            .expect("Failed to get icon buffer size")
+    ];
+    let info = reader
+        .next_frame(&mut buf)
+        .expect("Failed to decode icon PNG");
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => buf[..info.buffer_size()]
@@ -54,7 +61,7 @@ fn load_icon() -> egui::IconData {
     };
     egui::IconData {
         rgba,
-        width:  info.width,
+        width: info.width,
         height: info.height,
     }
 }
@@ -68,20 +75,20 @@ fn load_icon() -> egui::IconData {
 /// on Windows builds.
 #[cfg(target_os = "windows")]
 pub fn fix_taskbar_icon() {
-    const GWL_EXSTYLE:     i32   = -20;
-    const GCL_HICON:       i32   = -14; // large icon stored on the window class by eframe
-    const GCL_HICONSM:     i32   = -34; // small icon stored on the window class by eframe
+    const GWL_EXSTYLE: i32 = -20;
+    const GCL_HICON: i32 = -14; // large icon stored on the window class by eframe
+    const GCL_HICONSM: i32 = -34; // small icon stored on the window class by eframe
     const WS_EX_APPWINDOW: isize = 0x0004_0000;
-    const WM_SETICON:       u32  = 0x0080;
-    const ICON_SMALL:      usize = 0;
-    const ICON_BIG:        usize = 1;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
 
     extern "system" {
         fn GetCurrentThreadId() -> u32;
         fn EnumThreadWindows(
             thread_id: u32,
-            callback:  unsafe extern "system" fn(isize, isize) -> i32,
-            param:     isize,
+            callback: unsafe extern "system" fn(isize, isize) -> i32,
+            param: isize,
         ) -> i32;
         fn GetWindowLongPtrW(hwnd: isize, n_index: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: isize, n_index: i32, new_val: isize) -> isize;

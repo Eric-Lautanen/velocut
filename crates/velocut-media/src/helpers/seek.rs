@@ -47,7 +47,7 @@ use ffmpeg_the_third as ffmpeg;
 pub fn seek_to_secs(
     ictx: &mut ffmpeg::format::context::Input,
     target_secs: f64,
-    label: &str,   // caller description for log messages e.g. "encode_clip"
+    label: &str, // caller description for log messages e.g. "encode_clip"
 ) -> bool {
     if target_secs <= 0.0 {
         return true; // already at start — no seek needed

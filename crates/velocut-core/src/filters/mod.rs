@@ -96,34 +96,36 @@ declare_filters! {
 /// | strength     | 1.0     | 0.0 .. 1.0  | blends preset params with identity; 1.0 = full effect |
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FilterParams {
-    pub kind:        FilterKind,
-    pub brightness:  f32,
-    pub contrast:    f32,
-    pub saturation:  f32,
-    pub gamma:       f32,
-    pub hue:         f32,
+    pub kind: FilterKind,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub hue: f32,
     pub temperature: f32,
     /// 0.0 = ignore all params (identity), 1.0 = full effect.
     /// Lets users dial-in partial preset intensity without exposing 6 sliders.
-    pub strength:    f32,
+    pub strength: f32,
 }
 
 impl Default for FilterParams {
-    fn default() -> Self { Self::none() }
+    fn default() -> Self {
+        Self::none()
+    }
 }
 
 impl FilterParams {
     /// Identity — no processing, zero cost at runtime.
     pub fn none() -> Self {
         Self {
-            kind:        FilterKind::None,
-            brightness:  0.0,
-            contrast:    1.0,
-            saturation:  1.0,
-            gamma:       1.0,
-            hue:         0.0,
+            kind: FilterKind::None,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            gamma: 1.0,
+            hue: 0.0,
             temperature: 0.0,
-            strength:    1.0,
+            strength: 1.0,
         }
     }
 
@@ -131,12 +133,12 @@ impl FilterParams {
     /// Both encode and scrub paths call this before doing any work.
     pub fn is_identity(&self) -> bool {
         self.strength == 0.0
-            || (self.brightness  == 0.0
-                && self.contrast     == 1.0
-                && self.saturation   == 1.0
-                && self.gamma        == 1.0
-                && self.hue          == 0.0
-                && self.temperature  == 0.0)
+            || (self.brightness == 0.0
+                && self.contrast == 1.0
+                && self.saturation == 1.0
+                && self.gamma == 1.0
+                && self.hue == 0.0
+                && self.temperature == 0.0)
     }
 
     /// Canonical parameter values for each named preset.
@@ -148,109 +150,109 @@ impl FilterParams {
             // Slightly desaturated, lifted shadows, gentle S-curve feel
             FilterKind::Cinematic => Self {
                 kind,
-                brightness:  0.03,
-                contrast:    1.15,
-                saturation:  0.80,
-                gamma:       0.92,
-                hue:         0.0,
+                brightness: 0.03,
+                contrast: 1.15,
+                saturation: 0.80,
+                gamma: 0.92,
+                hue: 0.0,
                 temperature: 0.05,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Warm tint, reduced saturation, lifted blacks (analog feel)
             FilterKind::Vintage => Self {
                 kind,
-                brightness:  0.06,
-                contrast:    0.85,
-                saturation:  0.70,
-                gamma:       1.05,
-                hue:         5.0,
+                brightness: 0.06,
+                contrast: 0.85,
+                saturation: 0.70,
+                gamma: 1.05,
+                hue: 5.0,
                 temperature: 0.30,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Blue shift, slight contrast boost (overcast/moody)
             FilterKind::Cool => Self {
                 kind,
-                brightness:  -0.03,
-                contrast:    1.10,
-                saturation:  0.95,
-                gamma:       1.0,
-                hue:         -8.0,
+                brightness: -0.03,
+                contrast: 1.10,
+                saturation: 0.95,
+                gamma: 1.0,
+                hue: -8.0,
                 temperature: -0.35,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Saturated, punchy (social media pop)
             FilterKind::Vivid => Self {
                 kind,
-                brightness:  0.02,
-                contrast:    1.20,
-                saturation:  1.50,
-                gamma:       0.95,
-                hue:         0.0,
+                brightness: 0.02,
+                contrast: 1.20,
+                saturation: 1.50,
+                gamma: 0.95,
+                hue: 0.0,
                 temperature: 0.0,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Greyscale
             FilterKind::BlackAndWhite => Self {
                 kind,
-                brightness:  0.0,
-                contrast:    1.05,
-                saturation:  0.0,
-                gamma:       1.0,
-                hue:         0.0,
+                brightness: 0.0,
+                contrast: 1.05,
+                saturation: 0.0,
+                gamma: 1.0,
+                hue: 0.0,
                 temperature: 0.0,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Low contrast, lifted shadows (film-fade / Instagram matte)
             FilterKind::Faded => Self {
                 kind,
-                brightness:  0.10,
-                contrast:    0.75,
-                saturation:  0.85,
-                gamma:       1.08,
-                hue:         0.0,
+                brightness: 0.10,
+                contrast: 0.75,
+                saturation: 0.85,
+                gamma: 1.08,
+                hue: 0.0,
                 temperature: 0.08,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Warm orange/amber push (sunset / magic hour)
             FilterKind::GoldenHour => Self {
                 kind,
-                brightness:  0.04,
-                contrast:    1.10,
-                saturation:  1.15,
-                gamma:       0.95,
-                hue:         8.0,
+                brightness: 0.04,
+                contrast: 1.10,
+                saturation: 1.15,
+                gamma: 0.95,
+                hue: 8.0,
                 temperature: 0.45,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Deep cool blue — night / lo-fi
             FilterKind::NightBlue => Self {
                 kind,
-                brightness:  -0.08,
-                contrast:    1.05,
-                saturation:  0.75,
-                gamma:       1.10,
-                hue:         -15.0,
+                brightness: -0.08,
+                contrast: 1.05,
+                saturation: 0.75,
+                gamma: 1.10,
+                hue: -15.0,
                 temperature: -0.50,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // High contrast, vivid, slight warm push — action / sport
             FilterKind::Punchy => Self {
                 kind,
-                brightness:  0.0,
-                contrast:    1.35,
-                saturation:  1.30,
-                gamma:       0.88,
-                hue:         3.0,
+                brightness: 0.0,
+                contrast: 1.35,
+                saturation: 1.30,
+                gamma: 0.88,
+                hue: 3.0,
                 temperature: 0.12,
-                strength:    1.0,
+                strength: 1.0,
             },
             // 180° hue rotation flips warm skin tones (orange ≈ +20°) into
             // blue/cyan — the "BGR channel swap" aesthetic without needing a
@@ -258,13 +260,13 @@ impl FilterParams {
             // effect so blues read vividly even on darker skin.
             FilterKind::FalseColor => Self {
                 kind,
-                brightness:  0.0,
-                contrast:    1.10,
-                saturation:  1.60,
-                gamma:       1.0,
-                hue:         180.0,
+                brightness: 0.0,
+                contrast: 1.10,
+                saturation: 1.60,
+                gamma: 1.0,
+                hue: 180.0,
                 temperature: -0.20,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Blown highlights, heavy warm push, lifted midtones — simulates
@@ -272,39 +274,39 @@ impl FilterParams {
             // go nearly black.
             FilterKind::Infrared => Self {
                 kind,
-                brightness:  0.12,
-                contrast:    1.40,
-                saturation:  0.30,
-                gamma:       0.80,
-                hue:         12.0,
+                brightness: 0.12,
+                contrast: 1.40,
+                saturation: 0.30,
+                gamma: 0.80,
+                hue: 12.0,
                 temperature: 0.50,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Dreamy overexposed haze — low contrast, lifted blacks, slight
             // desaturation.  Works well on portraits and slow-motion footage.
             FilterKind::Mist => Self {
                 kind,
-                brightness:  0.18,
-                contrast:    0.65,
-                saturation:  0.80,
-                gamma:       1.15,
-                hue:         0.0,
+                brightness: 0.18,
+                contrast: 0.65,
+                saturation: 0.80,
+                gamma: 1.15,
+                hue: 0.0,
                 temperature: 0.10,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Hard B&W with crushed shadows — classic detective / neo-noir look.
             // Deeper blacks than BlackAndWhite and more aggressive contrast.
             FilterKind::Noir => Self {
                 kind,
-                brightness:  -0.06,
-                contrast:    1.55,
-                saturation:  0.0,
-                gamma:       0.85,
-                hue:         0.0,
+                brightness: -0.06,
+                contrast: 1.55,
+                saturation: 0.0,
+                gamma: 0.85,
+                hue: 0.0,
                 temperature: 0.0,
-                strength:    1.0,
+                strength: 1.0,
             },
 
             // Hollywood split-tone: push shadows toward teal and highlights
@@ -312,13 +314,13 @@ impl FilterParams {
             // (the orange pull) balanced against a cool-blue contrast base.
             FilterKind::TealOrange => Self {
                 kind,
-                brightness:  0.02,
-                contrast:    1.25,
-                saturation:  1.20,
-                gamma:       0.93,
-                hue:         -6.0,
+                brightness: 0.02,
+                contrast: 1.25,
+                saturation: 1.20,
+                gamma: 0.93,
+                hue: -6.0,
                 temperature: 0.22,
-                strength:    1.0,
+                strength: 1.0,
             },
         }
     }
@@ -329,18 +331,20 @@ impl FilterParams {
     /// Returns a `FilterParams` with `strength = 1.0` so the math functions
     /// can use the values directly without re-applying the blend factor.
     pub fn apply_strength(&self) -> Self {
-        if self.strength >= 1.0 { return self.clone(); }
+        if self.strength >= 1.0 {
+            return self.clone();
+        }
         let s = self.strength.clamp(0.0, 1.0);
         let id = Self::none();
         Self {
-            kind:        self.kind,
-            brightness:  lerp(id.brightness,  self.brightness,  s),
-            contrast:    lerp(id.contrast,     self.contrast,    s),
-            saturation:  lerp(id.saturation,   self.saturation,  s),
-            gamma:       lerp(id.gamma,        self.gamma,       s),
-            hue:         lerp(id.hue,          self.hue,         s),
-            temperature: lerp(id.temperature,  self.temperature, s),
-            strength:    1.0,
+            kind: self.kind,
+            brightness: lerp(id.brightness, self.brightness, s),
+            contrast: lerp(id.contrast, self.contrast, s),
+            saturation: lerp(id.saturation, self.saturation, s),
+            gamma: lerp(id.gamma, self.gamma, s),
+            hue: lerp(id.hue, self.hue, s),
+            temperature: lerp(id.temperature, self.temperature, s),
+            strength: 1.0,
         }
     }
 }

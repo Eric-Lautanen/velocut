@@ -4,11 +4,11 @@
 // Modules emit these; app.rs processes them after the UI pass.
 // Adding a new feature = add a variant here + one match arm in app.rs.
 
-use std::path::PathBuf;
-use uuid::Uuid;
+use crate::filters::FilterParams;
 use crate::state::AspectRatio;
 use crate::transitions::TransitionType;
-use crate::filters::FilterParams;
+use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub enum EditorCommand {
@@ -26,26 +26,56 @@ pub enum EditorCommand {
     SelectLibraryClip(Option<Uuid>),
 
     // ── Timeline ─────────────────────────────────────────────────────────────
-    AddToTimeline { media_id: Uuid, at_time: f64, track_row: usize },
+    AddToTimeline {
+        media_id: Uuid,
+        at_time: f64,
+        track_row: usize,
+    },
     DeleteTimelineClip(Uuid),
     SelectTimelineClip(Option<Uuid>),
-    MoveTimelineClip { id: Uuid, new_start: f64, new_row: usize },
-    TrimClipStart  { id: Uuid, new_source_offset: f64, new_duration: f64 },
-    TrimClipEnd    { id: Uuid, new_duration: f64 },
+    MoveTimelineClip {
+        id: Uuid,
+        new_start: f64,
+        new_row: usize,
+    },
+    TrimClipStart {
+        id: Uuid,
+        new_source_offset: f64,
+        new_duration: f64,
+    },
+    TrimClipEnd {
+        id: Uuid,
+        new_duration: f64,
+    },
     SplitClipAt(f64),
     /// Extract the audio from a video timeline clip onto the A track below it.
     /// Mutes audio on the source video clip and creates a linked audio clip.
     ExtractAudioTrack(Uuid),
     /// Set per-clip gain (0.0–2.0). Applied multiplicatively with global volume.
-    SetClipVolume { id: Uuid, volume: f32 },
+    SetClipVolume {
+        id: Uuid,
+        volume: f32,
+    },
     /// Set per-clip audio fade-in duration (seconds, 0.0 = none).
-    SetClipFadeIn      { id: Uuid, secs: f32 },
+    SetClipFadeIn {
+        id: Uuid,
+        secs: f32,
+    },
     /// Set silence before the fade-in ramp (0 = ramp at clip start).
-    SetClipFadeInStart { id: Uuid, secs: f32 },
+    SetClipFadeInStart {
+        id: Uuid,
+        secs: f32,
+    },
     /// Set per-clip audio fade-out ramp duration (seconds, 0.0 = none).
-    SetClipFadeOut     { id: Uuid, secs: f32 },
+    SetClipFadeOut {
+        id: Uuid,
+        secs: f32,
+    },
     /// Set silence after fade-out ramp ends, before clip end (0 = ramp ends at clip boundary).
-    SetClipFadeOutEnd  { id: Uuid, secs: f32 },
+    SetClipFadeOutEnd {
+        id: Uuid,
+        secs: f32,
+    },
 
     // ── Undo / Redo ───────────────────────────────────────────────────────────
     /// Snapshot the current ProjectState onto the undo stack and clear redo.
@@ -61,7 +91,12 @@ pub enum EditorCommand {
     /// Emitted by ExportModule when the user clicks Render. `filename` is the
     /// bare stem (no extension, no directory); app.rs opens the save dialog and
     /// calls MediaWorker::start_encode with the resolved PathBuf.
-    RenderMP4 { filename: String, width: u32, height: u32, fps: u32 },
+    RenderMP4 {
+        filename: String,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
     /// Request the active encode job (if any) to stop. The encode thread
     /// observes its cancel AtomicBool and exits after finishing the current frame.
     CancelEncode(Uuid),
@@ -74,18 +109,30 @@ pub enum EditorCommand {
     SetCrossfadeDuration(f32),
     /// Set or update the transition at a specific clip boundary.
     /// `after_clip_id` is the TimelineClip UUID that comes before the transition.
-    SetTransition { after_clip_id: Uuid, kind: TransitionType },
+    SetTransition {
+        after_clip_id: Uuid,
+        kind: TransitionType,
+    },
     /// Remove the transition after a specific clip, reverting it to a hard cut.
     RemoveTransition(Uuid),
 
-    SetClipFilter { id: Uuid, filter: FilterParams },
+    SetClipFilter {
+        id: Uuid,
+        filter: FilterParams,
+    },
 
     // ── View / UI ────────────────────────────────────────────────────────────
     SetAspectRatio(AspectRatio),
     SetTimelineZoom(f32),
     ClearSaveStatus,
-    SaveFrameToDisk { path: PathBuf, timestamp: f64 },
-    RequestSaveFramePicker { path: PathBuf, timestamp: f64 },
+    SaveFrameToDisk {
+        path: PathBuf,
+        timestamp: f64,
+    },
+    RequestSaveFramePicker {
+        path: PathBuf,
+        timestamp: f64,
+    },
 
     // ── Project reset ─────────────────────────────────────────────────────────
     /// Full app reset: wipe library, timeline, transitions, all temp WAV files,

@@ -7,16 +7,16 @@
 // Extracted from app.rs so playback and scrub changes never require touching
 // the main app loop. To add a feature: edit here, not app.rs.
 
-use velocut_core::state::ProjectState;
-use velocut_core::commands::EditorCommand;
-use velocut_core::media_types::{PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
-use velocut_core::transitions::TransitionKind;
+use super::EditorModule;
 use crate::context::AppContext;
 use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
-use super::EditorModule;
 use eframe::egui;
 use uuid::Uuid;
+use velocut_core::commands::EditorCommand;
+use velocut_core::media_types::{PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
+use velocut_core::state::ProjectState;
+use velocut_core::transitions::TransitionKind;
 
 pub struct VideoModule;
 
@@ -37,16 +37,12 @@ impl VideoModule {
     /// (the classic 3×-speed bug). Instead we use a one-slot pending buffer
     /// and only promote a frame to frame_cache once wall-clock current_time
     /// has caught up to that frame's PTS.
-    pub fn poll_playback(
-        state: &ProjectState,
-        ctx:   &mut AppContext,
-        egui_ctx: &egui::Context,
-    ) {
+    pub fn poll_playback(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context) {
         // Find clip under playhead — we need both pb_local_t and media_id.
         let current_clip = clip_query::clip_at_time(state, state.current_time);
         let current_media_id = current_clip.map(|c| c.media_id);
-        let pb_local_t: Option<f64> = current_clip
-            .map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
+        let pb_local_t: Option<f64> =
+            current_clip.map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
 
         // ── Clip-transition eviction (must run before the UI renders) ────────────
         // tick() also calls frame_cache.remove on clip change, but tick() runs
@@ -61,8 +57,8 @@ impl VideoModule {
         if state.is_playing {
             let clip_changed = match (current_media_id, ctx.playback.playback_media_id) {
                 (Some(cur), Some(prev)) => cur != prev,
-                (Some(_), None)         => true,  // playback just started
-                _                       => false,
+                (Some(_), None) => true, // playback just started
+                _ => false,
             };
             if clip_changed {
                 if let Some(id) = current_media_id {
@@ -70,8 +66,11 @@ impl VideoModule {
                 }
                 // Only clear pending if it belongs to the wrong clip.
                 // Correct new-clip frames may already be in flight.
-                if ctx.cache.pending_pb_frame.as_ref()
-                    .map(|f| current_media_id.map_or(true, |id| f.id != id))
+                if ctx
+                    .cache
+                    .pending_pb_frame
+                    .as_ref()
+                    .map(|f| current_media_id != Some(f.id))
                     .unwrap_or(false)
                 {
                     ctx.cache.pending_pb_frame = None;
@@ -96,7 +95,9 @@ impl VideoModule {
         //    discards it immediately so the slot opens for the next frame.
         if let Some(pending) = &ctx.cache.pending_pb_frame {
             let wrong_clip = current_media_id.map(|id| id != pending.id).unwrap_or(true);
-            let too_old    = pb_local_t.map(|lt| pending.timestamp < lt - 3.0).unwrap_or(false);
+            let too_old = pb_local_t
+                .map(|lt| pending.timestamp < lt - 3.0)
+                .unwrap_or(false);
             if wrong_clip || too_old {
                 ctx.cache.pending_pb_frame = None;
             }
@@ -110,8 +111,10 @@ impl VideoModule {
         // up to 4 frames × 16ms = ~64ms of showing nothing at the transition.
         if ctx.cache.pending_pb_frame.is_none() {
             while let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
-                let stale = current_media_id.map_or(false, |id| id != f.id);
-                if stale { continue; }
+                let stale = current_media_id.is_some_and(|id| id != f.id);
+                if stale {
+                    continue;
+                }
                 ctx.cache.pending_pb_frame = Some(f);
                 break;
             }
@@ -121,14 +124,18 @@ impl VideoModule {
         // With the 32-frame channel and burn_to_pts completing before first send,
         // this drains the early keyframe frames in a single tick after seek.
         if let Some(local_t) = pb_local_t {
-            while ctx.cache.pending_pb_frame
+            while ctx
+                .cache
+                .pending_pb_frame
                 .as_ref()
                 .map(|f: &PlaybackFrame| f.timestamp < local_t - (1.0 / 30.0))
                 .unwrap_or(false)
             {
                 match ctx.media_worker.pb_rx.try_recv() {
-                    Ok(newer) => { ctx.cache.pending_pb_frame = Some(newer); }
-                    Err(_)    => break,
+                    Ok(newer) => {
+                        ctx.cache.pending_pb_frame = Some(newer);
+                    }
+                    Err(_) => break,
                 }
             }
         }
@@ -154,22 +161,30 @@ impl VideoModule {
         // At 60 fps H.264 with a 5 s GOP, burn is ~300 frames × ~2 ms = ~600 ms.
         // 3 s is ample headroom. Genuine staleness (different clip, scrub bleed)
         // is caught by the wrong_clip / too_old guards above.
-        let frame_due = ctx.cache.pending_pb_frame.as_ref().map(|f: &PlaybackFrame| {
-            pb_local_t.map(|lt| {
-                let above_lower   = f.timestamp >= lt - 3.0;
-                let normal_window = f.timestamp <= lt + (2.0 / 30.0);
-                // Startup exception: at clip startup (lt < 150ms) show any
-                // near-future frame immediately rather than stalling on held_frame.
-                let startup_early = lt < 0.15 && f.timestamp < 0.30;
-                above_lower && (normal_window || startup_early)
-            }).unwrap_or(true)
-        }).unwrap_or(false);
-
+        let frame_due = ctx
+            .cache
+            .pending_pb_frame
+            .as_ref()
+            .map(|f: &PlaybackFrame| {
+                pb_local_t
+                    .map(|lt| {
+                        let above_lower = f.timestamp >= lt - 3.0;
+                        let normal_window = f.timestamp <= lt + (2.0 / 30.0);
+                        // Startup exception: at clip startup (lt < 150ms) show any
+                        // near-future frame immediately rather than stalling on held_frame.
+                        let startup_early = lt < 0.15 && f.timestamp < 0.30;
+                        above_lower && (normal_window || startup_early)
+                    })
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
 
         if frame_due {
             if let Some(mut f) = ctx.cache.pending_pb_frame.take() {
                 // Look up the filter for the clip currently under the playhead (V-row only).
-                let active_filter = state.timeline.iter()
+                let active_filter = state
+                    .timeline
+                    .iter()
                     .find(|c| {
                         c.track_row % 2 == 0
                             && state.current_time >= c.start_time
@@ -186,7 +201,8 @@ impl VideoModule {
                 let tex = egui_ctx.load_texture(
                     format!("pb-{}", f.id),
                     egui::ColorImage::from_rgba_unmultiplied(
-                        [f.width as usize, f.height as usize], &f.data,
+                        [f.width as usize, f.height as usize],
+                        &f.data,
                     ),
                     egui::TextureOptions::LINEAR,
                 );
@@ -201,7 +217,12 @@ impl VideoModule {
 
     // ── tick ──────────────────────────────────────────────────────────────────
     /// 3-layer scrub + playback start/stop. Call every frame from app::update().
-    pub fn tick(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context, preview_size: Option<(u32, u32)>) {
+    pub fn tick(
+        state: &ProjectState,
+        ctx: &mut AppContext,
+        egui_ctx: &egui::Context,
+        preview_size: Option<(u32, u32)>,
+    ) {
         let just_started = state.is_playing && !ctx.playback.prev_playing;
         let just_stopped = !state.is_playing && ctx.playback.prev_playing;
         ctx.playback.prev_playing = state.is_playing;
@@ -218,7 +239,9 @@ impl VideoModule {
                     eprintln!(
                         "[tick] clip_changed: just_started={just_started} current_time={:.3} \
                          clip.start_time={:.3} clip.media_id={} prev_media_id={:?}",
-                        state.current_time, clip.start_time, clip.media_id,
+                        state.current_time,
+                        clip.start_time,
+                        clip.media_id,
                         ctx.playback.playback_media_id
                     );
                     ctx.playback.playback_media_id = Some(clip.media_id);
@@ -227,22 +250,45 @@ impl VideoModule {
                     // Only clear pending if it belongs to a different clip.
                     // The pb thread may already have sent a correct frame for the
                     // new clip — clearing it would cause a one-frame blank.
-                    if ctx.cache.pending_pb_frame.as_ref().map(|f| f.id != clip.media_id).unwrap_or(false) {
+                    if ctx
+                        .cache
+                        .pending_pb_frame
+                        .as_ref()
+                        .map(|f| f.id != clip.media_id)
+                        .unwrap_or(false)
+                    {
                         ctx.cache.pending_pb_frame = None;
                     }
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
-                        let local_ts = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
+                        let local_ts =
+                            (state.current_time - clip.start_time + clip.source_offset).max(0.0);
                         // Pass aspect=0.0 → LiveDecoder opens at native source resolution.
                         // The pb thread is the preview player; it must be full quality.
                         // crop_uv_rect in preview_module handles any AR mismatch on the GPU.
                         if let Some(spec) = build_incoming_blend_spec(state, clip)
                             .or_else(|| build_blend_spec(state, clip))
                         {
-                            eprintln!("[tick] → start_blend_playback alpha_start={:.3}", spec.alpha_start);
-                            ctx.media_worker.start_blend_playback(lib.id, lib.path.clone(), local_ts, 0.0, spec, preview_size);
+                            eprintln!(
+                                "[tick] → start_blend_playback alpha_start={:.3}",
+                                spec.alpha_start
+                            );
+                            ctx.media_worker.start_blend_playback(
+                                lib.id,
+                                lib.path.clone(),
+                                local_ts,
+                                0.0,
+                                spec,
+                                preview_size,
+                            );
                         } else {
                             eprintln!("[tick] → start_playback (no blend spec — hard cut)");
-                            ctx.media_worker.start_playback(lib.id, lib.path.clone(), local_ts, 0.0, preview_size);
+                            ctx.media_worker.start_playback(
+                                lib.id,
+                                lib.path.clone(),
+                                local_ts,
+                                0.0,
+                                preview_size,
+                            );
                         }
                     }
                     ctx.playback.prebuffer_sent_for = None; // reset on clip change
@@ -253,17 +299,26 @@ impl VideoModule {
                 // opens the decoder and incrementally burns its GOP so it is ready
                 // (or nearly so) by the time Start/StartBlend arrives at clip_changed.
                 let time_remaining = (clip.start_time + clip.duration) - state.current_time;
-                if time_remaining > 0.0 && time_remaining < 0.5
+                if time_remaining > 0.0
+                    && time_remaining < 0.5
                     && ctx.playback.prebuffer_sent_for != Some(clip.id)
                 {
                     let clip_end = clip.start_time + clip.duration;
-                    let next_clip = state.timeline.iter()
+                    let next_clip = state
+                        .timeline
+                        .iter()
                         .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
                         .find(|c| (c.start_time - clip_end).abs() < 0.05);
                     if let Some(nc) = next_clip {
                         if let Some(lib) = clip_query::library_entry_for(state, nc) {
                             ctx.playback.prebuffer_sent_for = Some(clip.id);
-                            ctx.media_worker.prebuffer(lib.id, lib.path.clone(), nc.source_offset, 0.0, preview_size);
+                            ctx.media_worker.prebuffer(
+                                lib.id,
+                                lib.path.clone(),
+                                nc.source_offset,
+                                0.0,
+                                preview_size,
+                            );
                             eprintln!("[tick] prebuffer sent for next clip id={} remaining={time_remaining:.3}s", lib.id);
                         }
                     }
@@ -275,12 +330,12 @@ impl VideoModule {
         // ── Transition: playing → stopped ─────────────────────────────────────
         if just_stopped {
             ctx.media_worker.stop_playback();
-            ctx.playback.playback_media_id  = None;
-            ctx.playback.last_frame_req     = None;
-            ctx.playback.scrub_last_moved   = None;
-            ctx.playback.scrub_coarse_req   = None;
+            ctx.playback.playback_media_id = None;
+            ctx.playback.last_frame_req = None;
+            ctx.playback.scrub_last_moved = None;
+            ctx.playback.scrub_coarse_req = None;
             ctx.playback.prebuffer_sent_for = None;
-            ctx.cache.pending_pb_frame      = None;
+            ctx.cache.pending_pb_frame = None;
             // Bucket cache is no longer needed after playback stops — clear it
             // so TextureHandles are released and GPU memory returns to baseline.
             ctx.cache.frame_bucket_cache.clear();
@@ -289,23 +344,26 @@ impl VideoModule {
         let Some(clip) = current_clip else {
             if let Some((prev_id, _)) = ctx.playback.last_frame_req {
                 // Playhead moved into empty space — evict that clip's bucket cache.
-                ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+                ctx.cache
+                    .frame_bucket_cache
+                    .retain(|(id, _), _| *id != prev_id);
             }
-            ctx.playback.last_frame_req   = None;
+            ctx.playback.last_frame_req = None;
             ctx.playback.scrub_last_moved = None;
             ctx.playback.scrub_coarse_req = None;
             return;
         };
 
-        let local_t       = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
-        let fine_bucket   = (local_t * 4.0) as u32;   // ¼s grid — cache key only
-        let coarse_bucket = (local_t / 2.0) as u32;   // 2s grid — prefetch key
-
+        let local_t = (state.current_time - clip.start_time + clip.source_offset).max(0.0);
+        let fine_bucket = (local_t * 4.0) as u32; // ¼s grid — cache key only
+        let coarse_bucket = (local_t / 2.0) as u32; // 2s grid — prefetch key
 
         // scrub_moved: any position change > ~10ms fires a new decode request.
         // Compare exact f64 ts so every ruler pixel triggers a request, not just
         // every ¼s bucket crossing. The latest-wins condvar slot is the rate limiter.
-        let scrub_moved = ctx.playback.last_frame_req
+        let scrub_moved = ctx
+            .playback
+            .last_frame_req
             .map(|(rid, last_ts)| rid != clip.media_id || (last_ts - local_t).abs() > 0.010)
             .unwrap_or(true);
 
@@ -322,7 +380,9 @@ impl VideoModule {
                     // Evict all bucket cache entries for the previous clip.
                     // Buckets accumulate one entry per ¼s scrubbed — without this
                     // they are never freed, causing unbounded TextureHandle growth.
-                    ctx.cache.frame_bucket_cache.retain(|(id, _), _| *id != prev_id);
+                    ctx.cache
+                        .frame_bucket_cache
+                        .retain(|(id, _), _| *id != prev_id);
                     // If the new clip is inside a transition zone, also evict any
                     // stale raw frame that may be sitting in frame_cache for it.
                     //
@@ -354,7 +414,9 @@ impl VideoModule {
                 let search_range = if zone.is_some() { 2u32 } else { 8u32 };
                 let found_nearby = (0..=search_range).find_map(|delta| {
                     let b = fine_bucket.saturating_sub(delta);
-                    ctx.cache.frame_bucket_cache.get(&(clip.media_id, b))
+                    ctx.cache
+                        .frame_bucket_cache
+                        .get(&(clip.media_id, b))
                         .map(|(tex, _)| tex.clone())
                 });
                 if let Some(cached) = found_nearby {
@@ -378,33 +440,37 @@ impl VideoModule {
             // If the playhead is inside a transition zone, decode both clips and
             // send a blended frame; otherwise request a normal single-clip frame.
             if let Some(zone) = zone {
-                let path_a = clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
-                let path_b = clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
+                let path_a =
+                    clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
+                let path_b =
+                    clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
                 if let (Some(pa), Some(pb)) = (path_a, path_b) {
-                    ctx.media_worker.request_transition_frame(TransitionScrubRequest {
-                        // Tag with the CURRENT clip's media_id, not always zone.clip_a.media_id.
-                        //
-                        // ingest_media_results stores the VideoFrame result under this id.
-                        // app.rs looks it up via frame_cache[active_media_id] where
-                        // active_media_id = clip_at_time(current_time).media_id = clip.media_id.
-                        //
-                        // In the first half of the zone clip == clip_a so the value is the
-                        // same as before. In the second half clip == clip_b, so tagging with
-                        // clip_a.media_id caused a permanent cache miss — ingest stored the
-                        // blend under clip_a's key while preview looked it up under clip_b's.
-                        clip_a_id:   clip.media_id,
-                        clip_a_path: pa,
-                        clip_a_ts:   zone.clip_a_source_ts,
-                        clip_b_id:   zone.clip_b.media_id,
-                        clip_b_path: pb,
-                        clip_b_ts:   zone.clip_b_source_ts,
-                        alpha:       zone.alpha,
-                        kind:        zone.transition.kind,
-                    });
+                    ctx.media_worker
+                        .request_transition_frame(TransitionScrubRequest {
+                            // Tag with the CURRENT clip's media_id, not always zone.clip_a.media_id.
+                            //
+                            // ingest_media_results stores the VideoFrame result under this id.
+                            // app.rs looks it up via frame_cache[active_media_id] where
+                            // active_media_id = clip_at_time(current_time).media_id = clip.media_id.
+                            //
+                            // In the first half of the zone clip == clip_a so the value is the
+                            // same as before. In the second half clip == clip_b, so tagging with
+                            // clip_a.media_id caused a permanent cache miss — ingest stored the
+                            // blend under clip_a's key while preview looked it up under clip_b's.
+                            clip_a_id: clip.media_id,
+                            clip_a_path: pa,
+                            clip_a_ts: zone.clip_a_source_ts,
+                            clip_b_id: zone.clip_b.media_id,
+                            clip_b_path: pb,
+                            clip_b_ts: zone.clip_b_source_ts,
+                            alpha: zone.alpha,
+                            kind: zone.transition.kind,
+                        });
                 }
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 let aspect = state.active_video_ratio();
-                ctx.media_worker.request_frame(lib.id, lib.path.clone(), local_t, aspect);
+                ctx.media_worker
+                    .request_frame(lib.id, lib.path.clone(), local_t, aspect);
             }
 
             // Layer 2b (per 2s): coarse warm-up prefetch ahead of scrub head.
@@ -417,7 +483,12 @@ impl VideoModule {
                     ctx.playback.scrub_coarse_req = Some(coarse_key);
                     if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                         let aspect = state.active_video_ratio();
-                        ctx.media_worker.request_frame(lib.id, lib.path.clone(), coarse_bucket as f64 * 2.0, aspect);
+                        ctx.media_worker.request_frame(
+                            lib.id,
+                            lib.path.clone(),
+                            coarse_bucket as f64 * 2.0,
+                            aspect,
+                        );
                     }
                 }
             }
@@ -443,7 +514,9 @@ impl VideoModule {
                     }
                 }
             };
-            if !idle { return; }
+            if !idle {
+                return;
+            }
             // L3: check for transition zone exactly as L2 does.
             // Inside a zone: request_transition_frame_hq decodes both clips at
             // native resolution and blends them, replacing the 320-px scrub thumb
@@ -451,25 +524,29 @@ impl VideoModule {
             // Outside a zone: request_frame_hq as before.
             let zone_hq = clip_query::active_transition_at(state);
             if let Some(zone) = zone_hq {
-                let path_a = clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
-                let path_b = clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
+                let path_a =
+                    clip_query::library_entry_for(state, zone.clip_a).map(|l| l.path.clone());
+                let path_b =
+                    clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
                 if let (Some(pa), Some(pb)) = (path_a, path_b) {
-                    ctx.media_worker.request_transition_frame_hq(TransitionScrubRequest {
-                        clip_a_id:   clip.media_id,
-                        clip_a_path: pa,
-                        clip_a_ts:   zone.clip_a_source_ts,
-                        clip_b_id:   zone.clip_b.media_id,
-                        clip_b_path: pb,
-                        clip_b_ts:   zone.clip_b_source_ts,
-                        alpha:       zone.alpha,
-                        kind:        zone.transition.kind,
-                    });
+                    ctx.media_worker
+                        .request_transition_frame_hq(TransitionScrubRequest {
+                            clip_a_id: clip.media_id,
+                            clip_a_path: pa,
+                            clip_a_ts: zone.clip_a_source_ts,
+                            clip_b_id: zone.clip_b.media_id,
+                            clip_b_path: pb,
+                            clip_b_ts: zone.clip_b_source_ts,
+                            alpha: zone.alpha,
+                            kind: zone.transition.kind,
+                        });
                     ctx.playback.scrub_last_moved = None;
                 }
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 // Use local_t (exact playhead position), not the quantised fine_bucket,
                 // so the HQ decode lands on the precise frame the user is looking at.
-                ctx.media_worker.request_frame_hq(lib.id, lib.path.clone(), local_t, preview_size);
+                ctx.media_worker
+                    .request_frame_hq(lib.id, lib.path.clone(), local_t, preview_size);
                 ctx.playback.scrub_last_moved = None;
             }
         }
@@ -479,14 +556,16 @@ impl VideoModule {
 // ── EditorModule (no panel) ───────────────────────────────────────────────────
 
 impl EditorModule for VideoModule {
-    fn name(&self) -> &str { "Video" }
+    fn name(&self) -> &str {
+        "Video"
+    }
 
     fn ui(
         &mut self,
-        _ui:          &mut egui::Ui,
-        _state:       &ProjectState,
+        _ui: &mut egui::Ui,
+        _state: &ProjectState,
         _thumb_cache: &mut ThumbnailCache,
-        _cmd:         &mut Vec<EditorCommand>,
+        _cmd: &mut Vec<EditorCommand>,
     ) {
         // No panel — driven entirely by tick() and poll_playback().
     }
@@ -502,17 +581,19 @@ impl EditorModule for VideoModule {
 /// can open clip_b's decoder lazily and blend frames at the boundary.
 fn build_blend_spec(
     state: &velocut_core::state::ProjectState,
-    clip:  &velocut_core::state::TimelineClip,
+    clip: &velocut_core::state::TimelineClip,
 ) -> Option<PlaybackTransitionSpec> {
     // Find a non-Cut transition recorded after this clip.
-    let tr = state.transitions.iter().find(|tr| {
-        tr.after_clip_id == clip.id
-            && tr.kind.kind != TransitionKind::Cut
-    })?;
+    let tr = state
+        .transitions
+        .iter()
+        .find(|tr| tr.after_clip_id == clip.id && tr.kind.kind != TransitionKind::Cut)?;
 
     // Find the next V-row video clip (butted up against this one's end via snap-to-end).
     let clip_end = clip.start_time + clip.duration;
-    let next_clip = state.timeline.iter()
+    let next_clip = state
+        .timeline
+        .iter()
         .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
         // Snapped clips are exactly adjacent; allow a small epsilon for float drift.
         .find(|c| (c.start_time - clip_end).abs() < 0.05)?;
@@ -521,18 +602,18 @@ fn build_blend_spec(
 
     // Source timestamp in clip_a at which blending begins.
     // Transition is centered on the cut: blend starts D/2 before clip_a ends.
-    let blend_start_ts = (clip.source_offset + clip.duration
-        - tr.kind.duration_secs as f64 / 2.0).max(0.0);
+    let blend_start_ts =
+        (clip.source_offset + clip.duration - tr.kind.duration_secs as f64 / 2.0).max(0.0);
 
     Some(PlaybackTransitionSpec {
-        clip_b_id:           next_clip.media_id,
-        clip_b_path:         next_lib.path.clone(),
+        clip_b_id: next_clip.media_id,
+        clip_b_path: next_lib.path.clone(),
         clip_b_source_start: next_clip.source_offset,
         blend_start_ts,
-        duration:            tr.kind.duration_secs,
-        kind:                tr.kind.kind,
-        alpha_start:         0.0,  // clip_a side: ramps 0.0 → 0.5 at cut
-        invert_ab:           false,
+        duration: tr.kind.duration_secs,
+        kind: tr.kind.kind,
+        alpha_start: 0.0, // clip_a side: ramps 0.0 → 0.5 at cut
+        invert_ab: false,
     })
 }
 
@@ -544,13 +625,15 @@ fn build_blend_spec(
 /// Uses a direct time-range guard instead of `active_transition_at` to avoid
 /// the early-exit bug in that function when 3+ clips are on the timeline.
 fn build_incoming_blend_spec(
-    state:  &velocut_core::state::ProjectState,
+    state: &velocut_core::state::ProjectState,
     clip_b: &velocut_core::state::TimelineClip,
 ) -> Option<PlaybackTransitionSpec> {
     let clip_b_start = clip_b.start_time;
 
     // Find the preceding V-row clip (clip_a).
-    let clip_a = state.timeline.iter()
+    let clip_a = state
+        .timeline
+        .iter()
         .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
         .find(|c| (c.start_time + c.duration - clip_b_start).abs() < 0.05);
 
@@ -567,10 +650,10 @@ fn build_incoming_blend_spec(
     };
 
     // Find the non-Cut transition recorded after clip_a.
-    let tr = state.transitions.iter().find(|tr| {
-        tr.after_clip_id == clip_a.id
-            && tr.kind.kind != TransitionKind::Cut
-    });
+    let tr = state
+        .transitions
+        .iter()
+        .find(|tr| tr.after_clip_id == clip_a.id && tr.kind.kind != TransitionKind::Cut);
 
     let tr = match tr {
         Some(t) => t,
@@ -583,14 +666,13 @@ fn build_incoming_blend_spec(
         }
     };
 
-    let half_d  = tr.kind.duration_secs as f64 / 2.0;
+    let half_d = tr.kind.duration_secs as f64 / 2.0;
     let elapsed = (state.current_time - clip_b_start).max(0.0);
 
     eprintln!(
         "[blend_in] guard: current_time={:.3} clip_b_start={:.3} elapsed={:.3} \
          half_d={:.3} duration={:.3} kind={:?}",
-        state.current_time, clip_b_start, elapsed, half_d,
-        tr.kind.duration_secs, tr.kind.kind
+        state.current_time, clip_b_start, elapsed, half_d, tr.kind.duration_secs, tr.kind.kind
     );
 
     // In-zone guard: only activate when we are still inside the incoming blend
@@ -609,7 +691,8 @@ fn build_incoming_blend_spec(
             "[blend_in] GUARD TRIGGERED — elapsed {:.3} >= half_d+2f {:.3}; \
              returning None (hard cut will follow). \
              This is the clip_b blend bug if you see it during normal playback.",
-            elapsed, half_d + TWO_FRAMES
+            elapsed,
+            half_d + TWO_FRAMES
         );
         return None;
     }
@@ -646,13 +729,13 @@ fn build_incoming_blend_spec(
     );
 
     Some(PlaybackTransitionSpec {
-        clip_b_id:           clip_a.media_id,       // secondary = clip_a tail
-        clip_b_path:         clip_a_lib.path.clone(),
+        clip_b_id: clip_a.media_id, // secondary = clip_a tail
+        clip_b_path: clip_a_lib.path.clone(),
         clip_b_source_start: clip_a_tail,
-        blend_start_ts:      clip_b.source_offset,  // blend from clip_b's first frame
-        duration:            tr.kind.duration_secs, // full D; alpha_start offsets into it
-        kind:                tr.kind.kind,
-        alpha_start,          // dynamic: 0.5 + elapsed/duration, clamped to [0.5, 1.0]
-        invert_ab:           true,  // primary=clip_b is "b"; secondary=clip_a is "a"
+        blend_start_ts: clip_b.source_offset, // blend from clip_b's first frame
+        duration: tr.kind.duration_secs,      // full D; alpha_start offsets into it
+        kind: tr.kind.kind,
+        alpha_start,     // dynamic: 0.5 + elapsed/duration, clamped to [0.5, 1.0]
+        invert_ab: true, // primary=clip_b is "b"; secondary=clip_a is "a"
     })
 }

@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn short_string_is_unchanged() {
         assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello", 5),  "hello");
+        assert_eq!(truncate("hello", 5), "hello");
     }
 
     #[test]

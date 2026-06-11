@@ -2,15 +2,15 @@
 //
 // In-process FFmpeg probing: duration, video dimensions, thumbnail extraction.
 
-use std::path::PathBuf;
 use crossbeam_channel::Sender;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-use ffmpeg_the_third as ffmpeg;
+use ffmpeg::ffi;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsContext, flag::Flags};
-use ffmpeg::ffi;
+use ffmpeg_the_third as ffmpeg;
 
 use velocut_core::media_types::MediaResult;
 
@@ -24,23 +24,30 @@ pub fn probe_duration(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) -> f64
                 return dur;
             }
             // Fall back to stream duration
-            if let Some(stream) = ctx.streams().best(Type::Video)
+            if let Some(stream) = ctx
+                .streams()
+                .best(Type::Video)
                 .or_else(|| ctx.streams().best(Type::Audio))
             {
                 let tb = stream.time_base();
-                let d  = stream.duration() as f64 * tb.numerator() as f64
-                    / tb.denominator() as f64;
+                let d = stream.duration() as f64 * tb.numerator() as f64 / tb.denominator() as f64;
                 if d > 0.0 {
                     let _ = tx.send(MediaResult::Duration { id, seconds: d });
                     return d;
                 }
             }
-            let _ = tx.send(MediaResult::Error { id, msg: "duration unknown".into() });
+            let _ = tx.send(MediaResult::Error {
+                id,
+                msg: "duration unknown".into(),
+            });
             0.0
         }
         Err(e) => {
             eprintln!("[media] probe_duration open failed: {e}");
-            let _ = tx.send(MediaResult::Error { id, msg: e.to_string() });
+            let _ = tx.send(MediaResult::Error {
+                id,
+                msg: e.to_string(),
+            });
             0.0
         }
     }
@@ -54,16 +61,16 @@ pub fn probe_duration(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) -> f64
 /// codec parameters out of the stream borrow before seeking, eliminating the
 /// second file open entirely. One ictx, one set of I/O buffers.
 pub fn probe_video_size_and_thumbnail(
-    path:     &PathBuf,
-    id:       Uuid,
+    path: &PathBuf,
+    id: Uuid,
     duration: f64,
-    tx:       &Sender<MediaResult>,
+    tx: &Sender<MediaResult>,
 ) {
     let Ok(mut ictx) = input(path) else { return };
 
     let video_stream_idx = match ictx.streams().best(Type::Video) {
         Some(s) => s.index(),
-        None    => return, // audio-only file
+        None => return, // audio-only file
     };
 
     // Extract everything we need from the stream borrow in one block,
@@ -75,7 +82,7 @@ pub fn probe_video_size_and_thumbnail(
             ((*p).width as u32, (*p).height as u32)
         };
         let ts = if duration > 2.0 {
-            let t  = (duration * 0.1).max(1.0);
+            let t = (duration * 0.1).max(1.0);
             let tb = stream.time_base();
             (t * tb.denominator() as f64 / tb.numerator() as f64) as i64
         } else {
@@ -84,15 +91,22 @@ pub fn probe_video_size_and_thumbnail(
         // Copy codec parameters into an owned context — same pattern as
         // LiveDecoder::open. Releases the stream borrow so ictx is usable below.
         let dec_ctx = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
-            Ok(c)  => c,
-            Err(e) => { eprintln!("[media] codec ctx: {e}"); return; }
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[media] codec ctx: {e}");
+                return;
+            }
         };
         (w, h, ts, dec_ctx)
     };
 
     if raw_w > 0 && raw_h > 0 {
         eprintln!("[media] video size {raw_w}x{raw_h} ← {}", path.display());
-        let _ = tx.send(MediaResult::VideoSize { id, width: raw_w, height: raw_h });
+        let _ = tx.send(MediaResult::VideoSize {
+            id,
+            width: raw_w,
+            height: raw_h,
+        });
     }
 
     // [Fix] Discard non-video streams so the demuxer doesn't buffer audio packets
@@ -100,7 +114,9 @@ pub fn probe_video_size_and_thumbnail(
     // for the entire thumbnail decode pass.
     for mut stream in ictx.streams_mut() {
         if stream.index() != video_stream_idx {
-            unsafe { (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL; }
+            unsafe {
+                (*stream.as_mut_ptr()).discard = ffi::AVDiscard::AVDISCARD_ALL;
+            }
         }
     }
 
@@ -111,8 +127,7 @@ pub fn probe_video_size_and_thumbnail(
 
     // Thumbnail output: 160 wide, proportional height
     let thumb_w: u32 = 160;
-    let thumb_h: u32 = ((thumb_w as f64 * raw_h as f64 / raw_w.max(1) as f64) as u32)
-        .max(2) & !1; // must be even
+    let thumb_h: u32 = ((thumb_w as f64 * raw_h as f64 / raw_w.max(1) as f64) as u32).max(2) & !1; // must be even
 
     // Build the scaler lazily on the first decoded frame using the frame's actual
     // format and coded dimensions. Building it upfront from decoder.format() /
@@ -128,32 +143,59 @@ pub fn probe_video_size_and_thumbnail(
 
     let mut found = false;
     'outer: for (stream, packet) in ictx.packets().flatten() {
-        if stream.index() != video_stream_idx { continue; }
-        if decoder.send_packet(&packet).is_err() { continue; }
+        if stream.index() != video_stream_idx {
+            continue;
+        }
+        if decoder.send_packet(&packet).is_err() {
+            continue;
+        }
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
             let sc = match scaler {
                 Some(ref mut s) => s,
                 None => match SwsContext::get(
-                    decoded.format(), decoded.width(), decoded.height(),
-                    Pixel::RGBA, thumb_w, thumb_h, Flags::BILINEAR,
+                    decoded.format(),
+                    decoded.width(),
+                    decoded.height(),
+                    Pixel::RGBA,
+                    thumb_w,
+                    thumb_h,
+                    Flags::BILINEAR,
                 ) {
-                    Ok(s)  => { scaler = Some(s); scaler.as_mut().unwrap() }
-                    Err(e) => { eprintln!("[media] thumbnail scaler: {e}"); continue; }
+                    Ok(s) => {
+                        scaler = Some(s);
+                        scaler.as_mut().unwrap()
+                    }
+                    Err(e) => {
+                        eprintln!("[media] thumbnail scaler: {e}");
+                        continue;
+                    }
                 },
             };
             let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
-            if sc.run(&decoded, &mut rgb_frame).is_err() { continue; }
+            if sc.run(&decoded, &mut rgb_frame).is_err() {
+                continue;
+            }
             // Destripe: copy only visible pixels, not stride padding
             let stride = rgb_frame.stride(0);
-            let raw    = rgb_frame.data(0);
+            let raw = rgb_frame.data(0);
             let row_bytes = thumb_w as usize * 4;
             let data: Vec<u8> = (0..thumb_h as usize)
                 .flat_map(|row| &raw[row * stride..row * stride + row_bytes])
                 .copied()
                 .collect();
-            eprintln!("[media] thumbnail {}x{} ← {}", thumb_w, thumb_h, path.display());
-            let _ = tx.send(MediaResult::Thumbnail { id, width: thumb_w, height: thumb_h, data });
+            eprintln!(
+                "[media] thumbnail {}x{} ← {}",
+                thumb_w,
+                thumb_h,
+                path.display()
+            );
+            let _ = tx.send(MediaResult::Thumbnail {
+                id,
+                width: thumb_w,
+                height: thumb_h,
+                data,
+            });
             found = true;
             break 'outer;
         }

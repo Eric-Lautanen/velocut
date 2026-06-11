@@ -1,16 +1,19 @@
 // crates/velocut-ui/src/modules/timeline.rs
 use super::EditorModule;
-use velocut_core::state::{ProjectState, ClipType};
-use velocut_core::commands::EditorCommand;
-use velocut_core::helpers::time::format_time;
-use velocut_core::transitions::TransitionType;
 use crate::helpers::clip_query;
 use crate::helpers::format::fit_label;
 use crate::modules::ThumbnailCache;
-use crate::theme::{ACCENT, ACTION_BTN_FILL, ACTION_BTN_STROKE, CLIP_VIDEO, CLIP_AUDIO, CLIP_SELECTED, DARK_BG_0, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, PLAYHEAD_BTN_FILL, PLAYHEAD_BTN_STROKE};
-use egui::{Ui, Color32, Rect, Pos2, Sense, Stroke, Align2, FontId, Vec2, Id, RichText};
+use crate::theme::{
+    ACCENT, ACTION_BTN_FILL, ACTION_BTN_STROKE, CLIP_AUDIO, CLIP_SELECTED, CLIP_VIDEO, DARK_BG_0,
+    DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, PLAYHEAD_BTN_FILL, PLAYHEAD_BTN_STROKE,
+};
+use egui::{Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use uuid::Uuid;
+use velocut_core::commands::EditorCommand;
 use velocut_core::filters::{FilterKind, FilterParams};
+use velocut_core::helpers::time::format_time;
+use velocut_core::state::{ClipType, ProjectState};
+use velocut_core::transitions::TransitionType;
 
 pub struct TimelineModule {
     /// Which clip ID's outgoing transition popup is open, and where to show it.
@@ -61,16 +64,16 @@ pub struct TimelineModule {
 impl TimelineModule {
     pub fn new() -> Self {
         Self {
-            transition_popup:             None,
+            transition_popup: None,
             transition_popup_just_opened: false,
-            vol_popup:                    None,
-            vol_popup_just_opened:        false,
-            hotkeys_open:                 false,
-            hotkeys_just_opened:          false,
-            last_scrub_emitted_time:      f64::NEG_INFINITY,
-            filter_popup:                 None,
-            filter_popup_just_opened:     false,
-            drag_target:                  None,
+            vol_popup: None,
+            vol_popup_just_opened: false,
+            hotkeys_open: false,
+            hotkeys_just_opened: false,
+            last_scrub_emitted_time: f64::NEG_INFINITY,
+            filter_popup: None,
+            filter_popup_just_opened: false,
+            drag_target: None,
         }
     }
 }
@@ -80,8 +83,7 @@ impl TimelineModule {
 
 /// Standard toolbar button — consistent height, icon-forward.
 fn tool_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
-    egui::Button::new(label)
-        .min_size(egui::vec2(0.0, 26.0))
+    egui::Button::new(label).min_size(egui::vec2(0.0, 26.0))
 }
 
 /// Accented action button (Split) — subtle tinted fill so it reads as primary.
@@ -101,9 +103,17 @@ fn playhead_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 }
 
 impl EditorModule for TimelineModule {
-    fn name(&self) -> &str { "Timeline" }
+    fn name(&self) -> &str {
+        "Timeline"
+    }
 
-    fn ui(&mut self, ui: &mut Ui, state: &ProjectState, thumb_cache: &mut ThumbnailCache, cmd: &mut Vec<EditorCommand>) {
+    fn ui(
+        &mut self,
+        ui: &mut Ui,
+        state: &ProjectState,
+        thumb_cache: &mut ThumbnailCache,
+        cmd: &mut Vec<EditorCommand>,
+    ) {
         // Auto-clear save status after 3 seconds (pure UI memory, no state mutation)
         if state.save_status.is_some() {
             let t = ui.input(|i| i.time);
@@ -122,24 +132,32 @@ impl EditorModule for TimelineModule {
 
         // ── Keyboard shortcuts (only when no popup is open) ───────────────────
         if self.transition_popup.is_none() {
-            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            {
                 if let Some(id) = state.selected_timeline_clip {
                     cmd.push(EditorCommand::PushUndoSnapshot);
                     cmd.push(EditorCommand::DeleteTimelineClip(id));
                 }
             }
             if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-                if state.is_playing { cmd.push(EditorCommand::Pause); }
-                else                { cmd.push(EditorCommand::Play);  }
+                if state.is_playing {
+                    cmd.push(EditorCommand::Pause);
+                } else {
+                    cmd.push(EditorCommand::Play);
+                }
             }
             if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 cmd.push(EditorCommand::Pause);
-                cmd.push(EditorCommand::SetPlayhead((state.current_time - 1.0 / 30.0).max(0.0)));
+                cmd.push(EditorCommand::SetPlayhead(
+                    (state.current_time - 1.0 / 30.0).max(0.0),
+                ));
             }
             if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                 let total = state.total_duration();
                 cmd.push(EditorCommand::Pause);
-                cmd.push(EditorCommand::SetPlayhead((state.current_time + 1.0 / 30.0).min(total.max(0.0))));
+                cmd.push(EditorCommand::SetPlayhead(
+                    (state.current_time + 1.0 / 30.0).min(total.max(0.0)),
+                ));
             }
             // S — split clip at playhead
             if ui.input(|i| i.key_pressed(egui::Key::S)) {
@@ -151,10 +169,11 @@ impl EditorModule for TimelineModule {
                 cmd.push(EditorCommand::Undo);
             }
             // Ctrl+Y or Ctrl+Shift+Z — Redo
-            if ui.input(|i| i.modifiers.ctrl &&
-                (i.key_pressed(egui::Key::Y) ||
-                 (i.modifiers.shift && i.key_pressed(egui::Key::Z))))
-            {
+            if ui.input(|i| {
+                i.modifiers.ctrl
+                    && (i.key_pressed(egui::Key::Y)
+                        || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))
+            }) {
                 cmd.push(EditorCommand::Redo);
             }
         }
@@ -447,15 +466,14 @@ impl EditorModule for TimelineModule {
                     });
 
                 // Click outside → close (same guard as transition_popup / vol_popup)
-                if !self.hotkeys_just_opened {
-                    if ui.input(|i| {
+                if !self.hotkeys_just_opened
+                    && ui.input(|i| {
                         i.pointer.any_click()
                             && i.pointer.interact_pos()
                                 .map(|p| !area_resp.response.rect.contains(p))
                                 .unwrap_or(false)
                     }) {
-                        self.hotkeys_open = false;
-                    }
+                    self.hotkeys_open = false;
                 }
                 self.hotkeys_just_opened = false;
             }
@@ -649,8 +667,8 @@ impl EditorModule for TimelineModule {
 
                                 // Highlight the target lane so the user sees enforcement.
                                 painter.rect_stroke(
-                                    lane_rect, 
-                                    0.0, 
+                                    lane_rect,
+                                    0.0,
                                     Stroke::new(1.0, ACCENT.linear_multiply(0.5)),
                                     egui::StrokeKind::Inside
                                 );
@@ -935,7 +953,7 @@ impl EditorModule for TimelineModule {
                                         //   Audio (incl. extracted-audio)  → odd  rows (A1=1, A2=3)
                                         match render_type {
                                             ClipType::Video => {
-                                                let r = if raw_row % 2 == 0 { raw_row }
+                                                let r = if raw_row.is_multiple_of(2) { raw_row }
                                                         else { raw_row.saturating_sub(1) };
                                                 r.min(2)
                                             }
@@ -1313,7 +1331,7 @@ impl EditorModule for TimelineModule {
                                         // already occupies column 0 so we start at 1.
                                         let mut col = 1usize;
                                         for entry in velocut_core::transitions::registered() {
-                                            if col % COLS == 0 {
+                                            if col.is_multiple_of(COLS) {
                                                 ui.end_row();
                                             }
                                             let selected = current_kind.kind == entry.kind();
@@ -1578,13 +1596,13 @@ impl EditorModule for TimelineModule {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("🎨  Color Filter").size(11.0).strong().color(ACCENT));
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if !cur_filter.is_identity() {
-                                                if ui.small_button(RichText::new("Reset").size(9.0).color(Color32::from_gray(130))).clicked() {
-                                                    cmd.push(EditorCommand::SetClipFilter {
-                                                        id: filter_clip_id,
-                                                        filter: FilterParams::none(),
-                                                    });
-                                                }
+                                            if !cur_filter.is_identity()
+                                                && ui.small_button(RichText::new("Reset").size(9.0).color(Color32::from_gray(130))).clicked()
+                                            {
+                                                cmd.push(EditorCommand::SetClipFilter {
+                                                    id: filter_clip_id,
+                                                    filter: FilterParams::none(),
+                                                });
                                             }
                                         });
                                     });
@@ -1684,7 +1702,7 @@ impl EditorModule for TimelineModule {
                                                     egui::Layout::right_to_left(egui::Align::Center),
                                                     |ui| {
                                                         ui.label(RichText::new(
-                                                            format!("{}", fmt.replace("{}", &format!("{:.2}", val)))
+                                                            fmt.replace("{}", &format!("{:.2}", val))
                                                         ).size(9.0).monospace().color(ACCENT));
                                                     });
                                             });
@@ -1708,12 +1726,10 @@ impl EditorModule for TimelineModule {
                                 });
                         });
 
-                    if !self.filter_popup_just_opened {
-                        if ui.input(|i| i.pointer.any_click()) {
-                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                if !farea_resp.response.rect.contains(pos) {
-                                    self.filter_popup = None;
-                                }
+                    if !self.filter_popup_just_opened && ui.input(|i| i.pointer.any_click()) {
+                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            if !farea_resp.response.rect.contains(pos) {
+                                self.filter_popup = None;
                             }
                         }
                     }
@@ -1757,35 +1773,34 @@ fn hotkey_section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
                 });
             });
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(desc)
-                    .size(10.5)
-                    .color(DARK_TEXT_DIM),
-            );
+            ui.label(egui::RichText::new(desc).size(10.5).color(DARK_TEXT_DIM));
         });
     }
     ui.add_space(6.0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_waveform(
-    painter:            &egui::Painter,
-    clip_rect:          Rect,
-    peaks:              &[f32],
-    clip_type:          ClipType,
-    clip_volume:        f32,
-    global_volume:      f32,
-    fade_in_secs:       f32,
+    painter: &egui::Painter,
+    clip_rect: Rect,
+    peaks: &[f32],
+    clip_type: ClipType,
+    clip_volume: f32,
+    global_volume: f32,
+    fade_in_secs: f32,
     fade_in_start_secs: f32,
-    fade_out_secs:      f32,
-    fade_out_end_secs:  f32,
-    duration:           f32,
+    fade_out_secs: f32,
+    fade_out_end_secs: f32,
+    duration: f32,
 ) {
-    if peaks.is_empty() { return; }
-    let w     = clip_rect.width();
-    let h     = clip_rect.height();
+    if peaks.is_empty() {
+        return;
+    }
+    let w = clip_rect.width();
+    let h = clip_rect.height();
     let mid_y = clip_rect.min.y + h * 0.5;
     let visible = (w as usize).min(peaks.len()).max(1);
-    let step    = peaks.len() as f32 / visible as f32;
+    let step = peaks.len() as f32 / visible as f32;
     let wave_color = if clip_type == ClipType::Audio {
         Color32::from_rgba_unmultiplied(100, 240, 165, 220)
     } else {
@@ -1795,15 +1810,29 @@ fn draw_waveform(
     // Equal-power 3-zone gain: silence → sqrt-ramp → full (fade-in)
     //                          full → sqrt-ramp → silence (fade-out)
     let fade_gain = |i: usize| -> f32 {
-        if duration <= 0.0 { return 1.0; }
+        if duration <= 0.0 {
+            return 1.0;
+        }
         let t = (i as f32 / visible as f32) * duration;
         let r = duration - t;
-        let in_gain = if t < fade_in_start_secs { 0.0 }
-            else if fade_in_secs > 0.0 { ((t - fade_in_start_secs) / fade_in_secs).clamp(0.0, 1.0).sqrt() }
-            else { 1.0 };
-        let out_gain = if r < fade_out_end_secs { 0.0 }
-            else if fade_out_secs > 0.0 { ((r - fade_out_end_secs) / fade_out_secs).clamp(0.0, 1.0).sqrt() }
-            else { 1.0 };
+        let in_gain = if t < fade_in_start_secs {
+            0.0
+        } else if fade_in_secs > 0.0 {
+            ((t - fade_in_start_secs) / fade_in_secs)
+                .clamp(0.0, 1.0)
+                .sqrt()
+        } else {
+            1.0
+        };
+        let out_gain = if r < fade_out_end_secs {
+            0.0
+        } else if fade_out_secs > 0.0 {
+            ((r - fade_out_end_secs) / fade_out_secs)
+                .clamp(0.0, 1.0)
+                .sqrt()
+        } else {
+            1.0
+        };
         in_gain.min(out_gain)
     };
 
@@ -1811,30 +1840,30 @@ fn draw_waveform(
 
     // Draw waveform bars scaled by volume * fade envelope.
     for i in 0..visible {
-        let idx  = ((i as f32 * step) as usize).min(peaks.len() - 1);
+        let idx = ((i as f32 * step) as usize).min(peaks.len() - 1);
         let peak = peaks[idx];
         let half = peak * vol * fade_gain(i) * (h * 0.44);
-        let x    = clip_rect.min.x + i as f32;
+        let x = clip_rect.min.x + i as f32;
         painter.line_segment(
             [Pos2::new(x, mid_y - half), Pos2::new(x, mid_y + half)],
-            Stroke::new(1.0, wave_color));
+            Stroke::new(1.0, wave_color),
+        );
     }
 
     // Amber envelope lines showing the 3-zone shape.
     // Blue tint = silence zones; amber = ramp zones.
     let silence_color = Color32::from_rgba_unmultiplied(80, 140, 255, 100);
-    let ramp_color    = Color32::from_rgba_unmultiplied(255, 190, 60, 200);
+    let ramp_color = Color32::from_rgba_unmultiplied(255, 190, 60, 200);
 
     // Helper: draw a filled silence strip from col `a` to col `b`.
     let draw_silence = |a: usize, b: usize| {
-        if a >= b { return; }
+        if a >= b {
+            return;
+        }
         let x0 = clip_rect.min.x + a as f32;
         let x1 = clip_rect.min.x + b as f32;
         painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(x0, mid_y - 2.0),
-                Pos2::new(x1, mid_y + 2.0),
-            ),
+            Rect::from_min_max(Pos2::new(x0, mid_y - 2.0), Pos2::new(x1, mid_y + 2.0)),
             0.0,
             silence_color,
         );
@@ -1844,18 +1873,22 @@ fn draw_waveform(
         // ── Fade-in envelope ──────────────────────────────────────────────
         if fade_in_start_secs > 0.0 || fade_in_secs > 0.0 {
             // Silence zone: col 0 → fade_in_start end
-            let silence_end_col = ((fade_in_start_secs / duration) * visible as f32).ceil() as usize;
+            let silence_end_col =
+                ((fade_in_start_secs / duration) * visible as f32).ceil() as usize;
             let silence_end_col = silence_end_col.min(visible);
             draw_silence(0, silence_end_col);
 
             // Ramp zone: silence_end_col → silence_end_col + ramp_cols
-            let ramp_end_col = (((fade_in_start_secs + fade_in_secs) / duration) * visible as f32).ceil() as usize;
+            let ramp_end_col =
+                (((fade_in_start_secs + fade_in_secs) / duration) * visible as f32).ceil() as usize;
             let ramp_end_col = ramp_end_col.min(visible);
             if ramp_end_col > silence_end_col {
                 let ramp_cols = ramp_end_col - silence_end_col;
                 let mut prev: Option<Pos2> = None;
                 for i in silence_end_col..=ramp_end_col {
-                    let progress = ((i - silence_end_col) as f32 / ramp_cols.max(1) as f32).clamp(0.0, 1.0).sqrt();
+                    let progress = ((i - silence_end_col) as f32 / ramp_cols.max(1) as f32)
+                        .clamp(0.0, 1.0)
+                        .sqrt();
                     let half = vol * progress * (h * 0.44);
                     let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
                     if let Some(p) = prev {
@@ -1869,17 +1902,21 @@ fn draw_waveform(
         // ── Fade-out envelope ─────────────────────────────────────────────
         if fade_out_end_secs > 0.0 || fade_out_secs > 0.0 {
             // Silence zone: last fade_out_end_secs → clip end
-            let silence_start_col = (((duration - fade_out_end_secs).max(0.0) / duration) * visible as f32) as usize;
+            let silence_start_col =
+                (((duration - fade_out_end_secs).max(0.0) / duration) * visible as f32) as usize;
             draw_silence(silence_start_col, visible);
 
             // Ramp zone: (duration - fade_out_end - fade_out_secs) → silence_start_col
-            let ramp_start_t  = (duration - fade_out_end_secs - fade_out_secs).max(0.0);
+            let ramp_start_t = (duration - fade_out_end_secs - fade_out_secs).max(0.0);
             let ramp_start_col = ((ramp_start_t / duration) * visible as f32) as usize;
             if silence_start_col > ramp_start_col {
                 let ramp_cols = silence_start_col - ramp_start_col;
                 let mut prev: Option<Pos2> = None;
                 for i in ramp_start_col..=silence_start_col {
-                    let remain_progress = ((silence_start_col - i) as f32 / ramp_cols.max(1) as f32).clamp(0.0, 1.0).sqrt();
+                    let remain_progress = ((silence_start_col - i) as f32
+                        / ramp_cols.max(1) as f32)
+                        .clamp(0.0, 1.0)
+                        .sqrt();
                     let half = vol * remain_progress * (h * 0.44);
                     let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
                     if let Some(p) = prev {
@@ -1892,16 +1929,28 @@ fn draw_waveform(
     }
 }
 fn ruler_step(zoom: f32) -> f64 {
-    if      zoom >= 1200.0 { 0.0333 }
-    else if zoom >= 600.0  { 0.05   }
-    else if zoom >= 300.0  { 0.1    }
-    else if zoom >= 150.0  { 0.25   }
-    else if zoom >= 80.0   { 0.5    }
-    else if zoom >= 40.0   { 1.0    }
-    else if zoom >= 18.0   { 2.0    }
-    else if zoom >= 8.0    { 5.0    }
-    else if zoom >= 3.0    { 10.0   }
-    else if zoom >= 1.5    { 30.0   }
-    else                   { 60.0   }
+    if zoom >= 1200.0 {
+        0.0333
+    } else if zoom >= 600.0 {
+        0.05
+    } else if zoom >= 300.0 {
+        0.1
+    } else if zoom >= 150.0 {
+        0.25
+    } else if zoom >= 80.0 {
+        0.5
+    } else if zoom >= 40.0 {
+        1.0
+    } else if zoom >= 18.0 {
+        2.0
+    } else if zoom >= 8.0 {
+        5.0
+    } else if zoom >= 3.0 {
+        10.0
+    } else if zoom >= 1.5 {
+        30.0
+    } else {
+        60.0
+    }
 }
 // fit_label moved to crate::helpers::format — imported above.

@@ -18,7 +18,7 @@
 /// assert_eq!(format_time(3599.0), "59:59:00");
 /// ```
 pub fn format_time(s: f64) -> String {
-    let m  = (s / 60.0) as u32;
+    let m = (s / 60.0) as u32;
     let sc = (s % 60.0) as u32;
     let fr = ((s * 30.0) as u32) % 30;
     format!("{m:02}:{sc:02}:{fr:02}")

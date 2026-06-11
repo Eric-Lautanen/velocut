@@ -31,25 +31,25 @@
 //   "Aspect Ratio" ComboBox in the settings UI.
 
 use super::EditorModule;
-use velocut_core::state::{ProjectState, AspectRatio};
-use velocut_core::commands::EditorCommand;
-use velocut_core::helpers::geometry::{aspect_ratio_value, aspect_ratio_label};
-use velocut_media::encode::HwEncodeCapabilities;
-use crate::modules::ThumbnailCache;
 use crate::helpers::reset;
+use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, RENDER_BTN};
 use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
+use velocut_core::commands::EditorCommand;
+use velocut_core::helpers::geometry::{aspect_ratio_label, aspect_ratio_value};
+use velocut_core::state::{AspectRatio, ProjectState};
+use velocut_media::encode::HwEncodeCapabilities;
 
 // ── Colour palette extensions (local to this module) ─────────────────────────
 
 /// Muted green used for the "done" success banner.
 const GREEN_DIM: Color32 = Color32::from_rgb(100, 220, 140);
 /// Muted red used for error / cancel banners.
-const RED_DIM:   Color32 = Color32::from_rgb(230, 100, 100);
+const RED_DIM: Color32 = Color32::from_rgb(230, 100, 100);
 /// Background fill for the progress bar track.
-const TRACK_BG:  Color32 = Color32::from_rgb(60,  60,  75);
+const TRACK_BG: Color32 = Color32::from_rgb(60, 60, 75);
 /// Filled portion of the progress bar.
-const TRACK_FG:  Color32 = Color32::from_rgb(110, 180, 255);
+const TRACK_FG: Color32 = Color32::from_rgb(110, 180, 255);
 
 // ── Quality preset ────────────────────────────────────────────────────────────
 
@@ -70,22 +70,22 @@ enum QualityPreset {
 impl QualityPreset {
     fn label(self) -> &'static str {
         match self {
-            QualityPreset::SD480   => "480p",
-            QualityPreset::HD720   => "720p  (HD)",
+            QualityPreset::SD480 => "480p",
+            QualityPreset::HD720 => "720p  (HD)",
             QualityPreset::FHD1080 => "1080p (Full HD)",
             QualityPreset::QHD1440 => "1440p (2K)",
-            QualityPreset::UHD4K   => "4K    (2160p)",
+            QualityPreset::UHD4K => "4K    (2160p)",
         }
     }
 
     /// Pixel count of the short side.
     fn short_side(self) -> u32 {
         match self {
-            QualityPreset::SD480   => 480,
-            QualityPreset::HD720   => 720,
+            QualityPreset::SD480 => 480,
+            QualityPreset::HD720 => 720,
             QualityPreset::FHD1080 => 1080,
             QualityPreset::QHD1440 => 1440,
-            QualityPreset::UHD4K   => 2160,
+            QualityPreset::UHD4K => 2160,
         }
     }
 
@@ -135,8 +135,8 @@ const ALL_ASPECT_RATIOS: &[AspectRatio] = &[
 
 pub struct ExportModule {
     filename: String,
-    quality:  QualityPreset,
-    fps:      u32,
+    quality: QualityPreset,
+    fps: u32,
     /// Export aspect ratio override. `None` = follow the project's aspect ratio.
     export_aspect: Option<AspectRatio>,
     /// Timestamp of when the first "Reset" click happened.
@@ -151,26 +151,28 @@ pub struct ExportModule {
 impl Default for ExportModule {
     fn default() -> Self {
         Self {
-            filename:         "sequence_01".into(),
-            quality:          QualityPreset::FHD1080,
-            fps:              30,
-            export_aspect:        None,
-            clear_confirm_at:     None,
-            show_reset_complete:  false,
-            hw_caps:              None,
+            filename: "sequence_01".into(),
+            quality: QualityPreset::FHD1080,
+            fps: 30,
+            export_aspect: None,
+            clear_confirm_at: None,
+            show_reset_complete: false,
+            hw_caps: None,
         }
     }
 }
 
 impl EditorModule for ExportModule {
-    fn name(&self) -> &str { "Export" }
+    fn name(&self) -> &str {
+        "Export"
+    }
 
     fn ui(
         &mut self,
-        ui:           &mut Ui,
-        state:        &ProjectState,
+        ui: &mut Ui,
+        state: &ProjectState,
         _thumb_cache: &mut ThumbnailCache,
-        cmd:          &mut Vec<EditorCommand>,
+        cmd: &mut Vec<EditorCommand>,
     ) {
         ui.vertical(|ui| {
             // Compute encode state early — needed by both the header reset button
@@ -300,9 +302,9 @@ impl ExportModule {
     ///           →  card  (Area::Foreground, same order, drawn after — wins)
     pub fn show_render_modal(
         &self,
-        ctx:   &Context,
+        ctx: &Context,
         state: &ProjectState,
-        cmd:   &mut Vec<EditorCommand>,
+        cmd: &mut Vec<EditorCommand>,
     ) {
         if state.encode_job.is_none() {
             return;
@@ -322,16 +324,13 @@ impl ExportModule {
         // ── Card geometry — fixed, never changes ──────────────────────────────
         const CARD_W: f32 = 440.0;
         const CARD_H: f32 = 270.0;
-        const PAD:    f32 = 28.0;
+        const PAD: f32 = 28.0;
 
-        let card_rect = egui::Rect::from_center_size(
-            screen.center(),
-            egui::vec2(CARD_W, CARD_H),
-        );
+        let card_rect = egui::Rect::from_center_size(screen.center(), egui::vec2(CARD_W, CARD_H));
         let inner_rect = card_rect.shrink(PAD);
 
         // Decide border colour from current state.
-        let is_done  = state.encode_done.is_some();
+        let is_done = state.encode_done.is_some();
         let is_error = state.encode_error.is_some();
         let border_col = if is_done {
             GREEN_DIM
@@ -365,9 +364,7 @@ impl ExportModule {
                 );
 
                 // Inset content by PAD so widgets sit inside the card border.
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(inner_rect),
-                );
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
 
                 if is_done {
                     self.modal_done(&mut child, state, cmd);
@@ -382,9 +379,11 @@ impl ExportModule {
         // ── Click-outside-to-close (done / error only) ────────────────────────
         if is_done || is_error {
             let clicked_outside = ctx.input(|i| {
-                i.pointer.any_click() && i.pointer.interact_pos()
-                    .map(|p| !card_rect.contains(p))
-                    .unwrap_or(false)
+                i.pointer.any_click()
+                    && i.pointer
+                        .interact_pos()
+                        .map(|p| !card_rect.contains(p))
+                        .unwrap_or(false)
             });
             if clicked_outside {
                 cmd.push(EditorCommand::ClearEncodeStatus);
@@ -397,10 +396,15 @@ impl ExportModule {
     fn modal_encoding(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
         let (frame, total) = state.encode_progress.unwrap_or((0, 1));
         let fraction = (frame as f32 / total as f32).clamp(0.0, 1.0);
-        let pct      = (fraction * 100.0) as u32;
+        let pct = (fraction * 100.0) as u32;
 
         // Title
-        ui.label(RichText::new("Rendering…").size(13.0).strong().color(Color32::WHITE));
+        ui.label(
+            RichText::new("Rendering…")
+                .size(13.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
         ui.add_space(14.0);
 
         // Percentage readout
@@ -413,10 +417,8 @@ impl ExportModule {
         ui.add_space(10.0);
 
         // Progress bar — same raw-painter approach as the original
-        let (bar_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 8.0),
-            egui::Sense::hover(),
-        );
+        let (bar_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
         let p = ui.painter();
         p.rect_filled(bar_rect, 4.0, TRACK_BG);
         if fraction > 0.0 {
@@ -436,7 +438,9 @@ impl ExportModule {
 
         // Cancel — full width, neutral (same as original)
         let cancel_btn = egui::Button::new(
-            RichText::new("⏹  Stop Render").size(11.0).color(DARK_TEXT_DIM),
+            RichText::new("⏹  Stop Render")
+                .size(11.0)
+                .color(DARK_TEXT_DIM),
         )
         .stroke(Stroke::new(1.0, DARK_BORDER))
         .fill(DARK_BG_2)
@@ -450,12 +454,19 @@ impl ExportModule {
     }
 
     fn modal_done(&self, ui: &mut Ui, state: &ProjectState, cmd: &mut Vec<EditorCommand>) {
-        let label = state.encode_done.as_ref()
+        let label = state
+            .encode_done
+            .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        ui.label(RichText::new("Export complete").size(13.0).strong().color(Color32::WHITE));
+        ui.label(
+            RichText::new("Export complete")
+                .size(13.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
         ui.add_space(14.0);
 
         // Success frame — fully opaque fill so content is crisp against the card
@@ -475,12 +486,10 @@ impl ExportModule {
 
         ui.add_space(14.0);
 
-        let dismiss = egui::Button::new(
-            RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM),
-        )
-        .stroke(Stroke::new(1.0, DARK_BORDER))
-        .fill(DARK_BG_2)
-        .min_size(egui::vec2(ui.available_width(), 28.0));
+        let dismiss = egui::Button::new(RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM))
+            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .fill(DARK_BG_2)
+            .min_size(egui::vec2(ui.available_width(), 28.0));
 
         if ui.add(dismiss).clicked() {
             cmd.push(EditorCommand::ClearEncodeStatus);
@@ -495,7 +504,12 @@ impl ExportModule {
             format!("⊗  Error: {msg}")
         };
 
-        ui.label(RichText::new("Render stopped").size(13.0).strong().color(Color32::WHITE));
+        ui.label(
+            RichText::new("Render stopped")
+                .size(13.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
         ui.add_space(14.0);
 
         // Error frame — fully opaque fill so content is crisp against the card
@@ -511,12 +525,10 @@ impl ExportModule {
 
         ui.add_space(14.0);
 
-        let dismiss = egui::Button::new(
-            RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM),
-        )
-        .stroke(Stroke::new(1.0, DARK_BORDER))
-        .fill(DARK_BG_2)
-        .min_size(egui::vec2(ui.available_width(), 28.0));
+        let dismiss = egui::Button::new(RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM))
+            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .fill(DARK_BG_2)
+            .min_size(egui::vec2(ui.available_width(), 28.0));
 
         if ui.add(dismiss).clicked() {
             cmd.push(EditorCommand::ClearEncodeStatus);
@@ -526,21 +538,21 @@ impl ExportModule {
     /// Filename / aspect ratio / quality / fps / stats / render button.
     fn show_settings_ui(
         &mut self,
-        ui:          &mut Ui,
-        state:       &ProjectState,
-        cmd:         &mut Vec<EditorCommand>,
+        ui: &mut Ui,
+        state: &ProjectState,
+        cmd: &mut Vec<EditorCommand>,
         is_encoding: bool,
     ) {
         // Probe HW capabilities once on first render — lightweight dry-run,
         // typically < 100 ms. Cached for the lifetime of the module.
-        let hw_caps = self.hw_caps.get_or_insert_with(|| {
-            velocut_media::encode::probe_hw_encode_capabilities()
-        });
+        let hw_caps = self
+            .hw_caps
+            .get_or_insert_with(velocut_media::encode::probe_hw_encode_capabilities);
         let sw_only = hw_caps.sw_only;
         let backend_name = hw_caps.backend_name;
 
         // Resolve the effective aspect ratio and its f32 value for dimension math.
-        let effective_ar    = self.export_aspect.unwrap_or(state.aspect_ratio);
+        let effective_ar = self.export_aspect.unwrap_or(state.aspect_ratio);
         let effective_ratio = aspect_ratio_value(effective_ar);
 
         ui.add_space(4.0);
@@ -558,9 +570,18 @@ impl ExportModule {
         // confirms the field. The TextEdit handles the key internally but
         // doesn't mark it consumed in egui's event queue.
         if name_resp.has_focus() {
-            ui.input_mut(|i| i.events.retain(|e| {
-                !matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, .. })
-            }));
+            ui.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
         }
 
         ui.add_space(10.0);
@@ -568,12 +589,19 @@ impl ExportModule {
         // ── Aspect Ratio ──────────────────────────────────────────────────────
         // Defaults to the project ratio; user can override per-export without
         // changing the project-level setting.
-        ui.label(RichText::new("Aspect Ratio").size(11.0).color(DARK_TEXT_DIM));
+        ui.label(
+            RichText::new("Aspect Ratio")
+                .size(11.0)
+                .color(DARK_TEXT_DIM),
+        );
         ui.add_space(2.0);
         ui.add_enabled_ui(!is_encoding, |ui| {
             // Label shown in the collapsed combo.
             let combo_label = if self.export_aspect.is_none() {
-                format!("↩ Match Project  ({})", aspect_ratio_label(state.aspect_ratio))
+                format!(
+                    "↩ Match Project  ({})",
+                    aspect_ratio_label(state.aspect_ratio)
+                )
             } else {
                 aspect_ratio_label(effective_ar).to_string()
             };
@@ -597,7 +625,10 @@ impl ExportModule {
                     // One entry per aspect ratio variant.
                     for &ar in ALL_ASPECT_RATIOS {
                         let selected = self.export_aspect == Some(ar);
-                        if ui.selectable_label(selected, aspect_ratio_label(ar)).clicked() {
+                        if ui
+                            .selectable_label(selected, aspect_ratio_label(ar))
+                            .clicked()
+                        {
                             self.export_aspect = Some(ar);
                         }
                     }
@@ -696,7 +727,10 @@ impl ExportModule {
                             .size(11.0)
                             .color(if selected { ACCENT } else { DARK_TEXT_DIM }),
                     )
-                    .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }))
+                    .stroke(Stroke::new(
+                        1.0,
+                        if selected { ACCENT } else { DARK_BORDER },
+                    ))
                     .fill(if selected { DARK_BG_3 } else { DARK_BG_2 });
 
                     if ui.add(btn).clicked() {
@@ -720,27 +754,36 @@ impl ExportModule {
                 ui.set_width(ui.available_width());
                 let timeline_ids: std::collections::HashSet<_> =
                     state.timeline.iter().map(|c| c.id).collect();
-                let transition_count = state.transitions.iter()
-                    .filter(|t| t.kind.kind != velocut_core::transitions::TransitionKind::Cut
-                        && timeline_ids.contains(&t.after_clip_id))
+                let transition_count = state
+                    .transitions
+                    .iter()
+                    .filter(|t| {
+                        t.kind.kind != velocut_core::transitions::TransitionKind::Cut
+                            && timeline_ids.contains(&t.after_clip_id)
+                    })
                     .count();
                 if transition_count == 0 {
                     ui.label(
                         RichText::new("No transitions set")
-                            .size(11.0).color(DARK_TEXT_DIM),
+                            .size(11.0)
+                            .color(DARK_TEXT_DIM),
                     );
                 } else {
                     ui.label(
-                        RichText::new(format!("🔗  {} transition{} active",
+                        RichText::new(format!(
+                            "🔗  {} transition{} active",
                             transition_count,
-                            if transition_count == 1 { "" } else { "s" }))
-                            .size(11.0).color(ACCENT),
+                            if transition_count == 1 { "" } else { "s" }
+                        ))
+                        .size(11.0)
+                        .color(ACCENT),
                     );
                 }
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new("Click ✂ between clips on timeline to edit")
-                        .size(10.0).color(DARK_TEXT_DIM),
+                        .size(10.0)
+                        .color(DARK_TEXT_DIM),
                 );
             });
 
@@ -755,25 +798,54 @@ impl ExportModule {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
-                let total      = state.timeline.iter()
+                let total = state
+                    .timeline
+                    .iter()
                     .map(|c| c.start_time + c.duration)
                     .fold(0.0_f64, f64::max);
-                let clips      = state.timeline.len();
+                let clips = state.timeline.len();
                 let est_frames = (total * self.fps as f64).ceil() as u64;
-                let has_audio  = state.library.iter().any(|lc| {
-                    state.timeline.iter().any(|tc| tc.media_id == lc.id)
-                        && lc.audio_path.is_some()
+                let has_audio = state.library.iter().any(|lc| {
+                    state.timeline.iter().any(|tc| tc.media_id == lc.id) && lc.audio_path.is_some()
                 });
 
-                ui.label(RichText::new(format!("Duration:  {total:.1}s")).size(11.0).monospace());
-                ui.label(RichText::new(format!("Clips:     {clips}")).size(11.0).monospace());
-                ui.label(RichText::new(format!("Output:    {res_w}×{res_h} @ {}fps", self.fps)).size(11.0).monospace());
-                ui.label(RichText::new(format!("Frames:    ~{est_frames}")).size(11.0).monospace());
-                ui.label(RichText::new(format!(
-                    "Audio:     {}",
-                    if has_audio { "AAC 128kbps stereo" } else { "none detected" }
-                )).size(11.0).monospace());
-                ui.label(RichText::new(format!("Video:     H.264 via {backend_name}")).size(11.0).monospace());
+                ui.label(
+                    RichText::new(format!("Duration:  {total:.1}s"))
+                        .size(11.0)
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!("Clips:     {clips}"))
+                        .size(11.0)
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!("Output:    {res_w}×{res_h} @ {}fps", self.fps))
+                        .size(11.0)
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!("Frames:    ~{est_frames}"))
+                        .size(11.0)
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Audio:     {}",
+                        if has_audio {
+                            "AAC 128kbps stereo"
+                        } else {
+                            "none detected"
+                        }
+                    ))
+                    .size(11.0)
+                    .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!("Video:     H.264 via {backend_name}"))
+                        .size(11.0)
+                        .monospace(),
+                );
             });
 
         ui.add_space(12.0);
@@ -781,23 +853,25 @@ impl ExportModule {
         // ── Render button (hidden while encoding; replaced by Cancel) ─────────
         if !is_encoding {
             let no_clips = state.timeline.is_empty();
-            let render_btn = egui::Button::new(
-                RichText::new("⚡ Render MP4")
-                    .size(13.0)
-                    .strong()
-                    .color(if no_clips { Color32::DARK_GRAY } else { Color32::WHITE }),
-            )
-            .fill(if no_clips { DARK_BG_3 } else { RENDER_BTN })
-            .stroke(Stroke::NONE)
-            .min_size(egui::vec2(ui.available_width(), 34.0));
+            let render_btn =
+                egui::Button::new(RichText::new("⚡ Render MP4").size(13.0).strong().color(
+                    if no_clips {
+                        Color32::DARK_GRAY
+                    } else {
+                        Color32::WHITE
+                    },
+                ))
+                .fill(if no_clips { DARK_BG_3 } else { RENDER_BTN })
+                .stroke(Stroke::NONE)
+                .min_size(egui::vec2(ui.available_width(), 34.0));
 
             let response = ui.add_enabled(!no_clips, render_btn);
             if response.clicked() {
                 cmd.push(EditorCommand::RenderMP4 {
                     filename: self.filename.clone(),
-                    width:    res_w,
-                    height:   res_h,
-                    fps:      self.fps,
+                    width: res_w,
+                    height: res_h,
+                    fps: self.fps,
                 });
             }
             if no_clips {

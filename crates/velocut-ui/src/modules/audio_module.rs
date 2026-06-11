@@ -4,19 +4,19 @@
 // Non-rendering module — tick() is called every frame from app.rs
 // after commands are processed. No egui panel is shown.
 
-use velocut_core::state::ProjectState;
-use velocut_core::commands::EditorCommand;
+use super::EditorModule;
 use crate::context::AppContext;
 use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
-use super::EditorModule;
 use egui::Ui;
 use rodio::{Decoder, Source};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
-use std::collections::{HashSet, HashMap};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use velocut_core::commands::EditorCommand;
+use velocut_core::state::ProjectState;
 
 // Diagnostic logging: routed through the shared log helper so all VeloCut
 // output lands in a single %TEMP%\velocut.log regardless of launch mode.
@@ -79,9 +79,9 @@ pub struct AudioModule {
     /// Exhausted-clip tracking for standalone overlay sinks.
     /// Mirrors `exhausted` / `sink_has_played` / `sink_created_at` for the
     /// secondary sink map `AppContext::audio_overlay_sinks`.
-    overlay_exhausted:      HashSet<Uuid>,
-    overlay_has_played:     HashSet<Uuid>,
-    overlay_created_at:     HashMap<Uuid, Instant>,
+    overlay_exhausted: HashSet<Uuid>,
+    overlay_has_played: HashSet<Uuid>,
+    overlay_created_at: HashMap<Uuid, Instant>,
 
     /// Duration of each primary clip at the time its sink was created.
     /// If the clip's duration changes (e.g. after split + delete or trim), the
@@ -118,7 +118,7 @@ impl AudioModule {
             sink_has_played: HashSet::new(),
             sink_created_at: HashMap::new(),
             stream_warmup_ticks: 0,
-            overlay_exhausted:  HashSet::new(),
+            overlay_exhausted: HashSet::new(),
             overlay_has_played: HashSet::new(),
             overlay_created_at: HashMap::new(),
             sink_clip_durations: HashMap::new(),
@@ -210,11 +210,13 @@ impl AudioModule {
 
     /// Called every frame after commands are processed.
     /// Manages rodio sinks: creates on play, clears on stop/seek.
+    #[allow(clippy::map_entry)]
     pub fn tick(&mut self, state: &ProjectState, ctx: &mut AppContext) {
         // Drop draining sinks whose hold window has expired.
         // Each entry was silenced at push time; FADE_OUT_HOLD_SECS of zeros in the
         // OS buffer ensures no pop when the sink handle is finally released.
-        self.draining_sinks.retain(|(_, t)| t.elapsed().as_secs_f64() < FADE_OUT_HOLD_SECS);
+        self.draining_sinks
+            .retain(|(_, t)| t.elapsed().as_secs_f64() < FADE_OUT_HOLD_SECS);
 
         // Lazy init: create the audio stream on the first tick rather than at
         // AppContext::new() time. In Windows GUI-subsystem mode (double-click),
@@ -245,7 +247,9 @@ impl AudioModule {
         // the mutable borrows in soft_drain_all / soft_drain_one_primary because they
         // take &mut AppContext while `stream` (a &OutputStream inside ctx) is still live.
         // Arc::clone() is cheap — it only bumps a reference count.
-        let Some(mixer) = ctx.audio_stream.as_ref().map(|s| s.mixer().clone()) else { return };
+        let Some(mixer) = ctx.audio_stream.as_ref().map(|s| s.mixer().clone()) else {
+            return;
+        };
 
         if !state.is_playing {
             // Soft-drain sinks only on the play→stop transition.
@@ -261,9 +265,10 @@ impl AudioModule {
         // This handles undo/redo during active playback: after an undo the clip
         // that owned the sink may be gone, and its rodio thread would keep
         // playing phantom audio indefinitely without this guard.
-        let timeline_ids: HashSet<Uuid> =
-            state.timeline.iter().map(|c| c.id).collect();
-        let stale: Vec<Uuid> = ctx.audio_sinks.keys()
+        let timeline_ids: HashSet<Uuid> = state.timeline.iter().map(|c| c.id).collect();
+        let stale: Vec<Uuid> = ctx
+            .audio_sinks
+            .keys()
             .filter(|id| !timeline_ids.contains(id))
             .copied()
             .collect();
@@ -314,175 +319,203 @@ impl AudioModule {
             // Use a labeled block so early exits (WAV not ready, exhausted) fall
             // through to overlay processing instead of returning from tick().
             'primary_sink: {
-            if let Some(lib) = clip_query::library_entry_for(state, clip) {
+                if let Some(lib) = clip_query::library_entry_for(state, clip) {
+                    // --- WAV guard ---------------------------------------------------
+                    // Only play from a pre-extracted WAV, never from the raw source
+                    // file directly. Raw MP4/AAC decoding via symphonia is unreliable:
+                    // these containers have non-standard timescales that cause the
+                    // symphonia decoder to stall partway through, producing a sink that
+                    // goes empty after ~0.8s even though the clip is 6s long.
+                    //
+                    // The WAV is extracted by the media worker probe pipeline and its
+                    // path lands in lib.audio_path within a second or two of import.
+                    // If it hasn't arrived yet, skip this tick silently — the next tick
+                    // will try again and the WAV will be ready soon.
+                    //
+                    // This also means we never need to handle the "symphonia gave up"
+                    // failure mode at all.
+                    // -----------------------------------------------------------------
+                    let Some(apath) = lib.audio_path.as_ref() else {
+                        // WAV not ready yet — log once per clip (only when a sink would
+                        // otherwise have been created) to make the wait visible.
+                        if !ctx.audio_sinks.contains_key(&clip.id) {
+                            audio_log(&format!(
+                                "clip {id} waiting for WAV extraction (audio_path is None)",
+                                id = clip.id,
+                            ));
+                        }
+                        break 'primary_sink; // WAV not ready — overlays can still play
+                    };
 
-                // --- WAV guard ---------------------------------------------------
-                // Only play from a pre-extracted WAV, never from the raw source
-                // file directly. Raw MP4/AAC decoding via symphonia is unreliable:
-                // these containers have non-standard timescales that cause the
-                // symphonia decoder to stall partway through, producing a sink that
-                // goes empty after ~0.8s even though the clip is 6s long.
-                //
-                // The WAV is extracted by the media worker probe pipeline and its
-                // path lands in lib.audio_path within a second or two of import.
-                // If it hasn't arrived yet, skip this tick silently — the next tick
-                // will try again and the WAV will be ready soon.
-                //
-                // This also means we never need to handle the "symphonia gave up"
-                // failure mode at all.
-                // -----------------------------------------------------------------
-                let Some(apath) = lib.audio_path.as_ref() else {
-                    // WAV not ready yet — log once per clip (only when a sink would
-                    // otherwise have been created) to make the wait visible.
-                    if !ctx.audio_sinks.contains_key(&clip.id) {
+                    let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
+
+                    // Detect whether the clip's duration changed since the sink was
+                    // created (e.g. split + delete of the tail segment, or trim).
+                    // If so, evict the old exhausted / has-played state so the
+                    // shortened clip gets a fresh sink rather than staying silent.
+                    let duration_changed = self
+                        .sink_clip_durations
+                        .get(&clip.id)
+                        .map(|&d| (d - clip.duration).abs() > 1e-9)
+                        .unwrap_or(false);
+
+                    if duration_changed {
                         audio_log(&format!(
-                            "clip {id} waiting for WAV extraction (audio_path is None)",
-                            id = clip.id,
-                        ));
-                    }
-                    break 'primary_sink; // WAV not ready — overlays can still play
-                };
-
-                let seek_t = (t - clip.start_time + clip.source_offset).max(0.0);
-
-                // Detect whether the clip's duration changed since the sink was
-                // created (e.g. split + delete of the tail segment, or trim).
-                // If so, evict the old exhausted / has-played state so the
-                // shortened clip gets a fresh sink rather than staying silent.
-                let duration_changed = self.sink_clip_durations
-                    .get(&clip.id)
-                    .map(|&d| (d - clip.duration).abs() > 1e-9)
-                    .unwrap_or(false);
-
-                if duration_changed {
-                    audio_log(&format!(
                         "clip {id} duration changed → rebuilding sink (was {old:.3}s, now {new:.3}s)",
                         id = clip.id,
                         old = self.sink_clip_durations.get(&clip.id).copied().unwrap_or(0.0),
                         new = clip.duration,
                     ));
-                    self.soft_drain_one_primary(ctx, clip.id);
-                    self.exhausted.remove(&clip.id);
-                    self.sink_has_played.remove(&clip.id);
-                    self.sink_created_at.remove(&clip.id);
-                    self.sink_clip_durations.remove(&clip.id);
-                }
+                        self.soft_drain_one_primary(ctx, clip.id);
+                        self.exhausted.remove(&clip.id);
+                        self.sink_has_played.remove(&clip.id);
+                        self.sink_created_at.remove(&clip.id);
+                        self.sink_clip_durations.remove(&clip.id);
+                    }
 
-                // If the sink for this clip already played to completion (WAV shorter
-                // than clip duration), don't rebuild it on every tick — just stay silent
-                // for the remainder of the clip.
-                if self.exhausted.contains(&clip.id) {
-                    break 'primary_sink; // exhausted — overlays can still play
-                }
+                    // If the sink for this clip already played to completion (WAV shorter
+                    // than clip duration), don't rebuild it on every tick — just stay silent
+                    // for the remainder of the clip.
+                    if self.exhausted.contains(&clip.id) {
+                        break 'primary_sink; // exhausted — overlays can still play
+                    }
 
-                // Check whether an existing sink has finished playing.
-                // Three conditions must all be true before we mark a clip exhausted:
-                //   1. sink.empty()          — decoder has delivered all samples.
-                //   2. sink_has_played       — sink was non-empty at least once
-                //                              (confirmed it actually started).
-                //   3. elapsed >= MIN_PLAY_SECS — guards against transient empty()
-                //                              readings in the first few ticks after
-                //                              sink creation in release builds.
-                if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                    let elapsed = self.sink_created_at.get(&clip.id)
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(0.0);
+                    // Check whether an existing sink has finished playing.
+                    // Three conditions must all be true before we mark a clip exhausted:
+                    //   1. sink.empty()          — decoder has delivered all samples.
+                    //   2. sink_has_played       — sink was non-empty at least once
+                    //                              (confirmed it actually started).
+                    //   3. elapsed >= MIN_PLAY_SECS — guards against transient empty()
+                    //                              readings in the first few ticks after
+                    //                              sink creation in release builds.
+                    if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
+                        let elapsed = self
+                            .sink_created_at
+                            .get(&clip.id)
+                            .map(|t| t.elapsed().as_secs_f64())
+                            .unwrap_or(0.0);
 
-                    if !sink.empty() {
-                        self.sink_has_played.insert(clip.id);
-                    } else if self.sink_has_played.contains(&clip.id) {
-                        if elapsed >= MIN_PLAY_SECS {
+                        if !sink.empty() {
+                            self.sink_has_played.insert(clip.id);
+                        } else if self.sink_has_played.contains(&clip.id) {
+                            if elapsed >= MIN_PLAY_SECS {
+                                audio_log(&format!(
+                                    "clip {id} exhausted after {elapsed:.2}s",
+                                    id = clip.id,
+                                ));
+                                self.exhausted.insert(clip.id);
+                                break 'primary_sink; // exhausted — overlays can still play
+                            }
+                            // elapsed < MIN_PLAY_SECS: transient underrun in release
+                            // build — do not mark exhausted yet.
                             audio_log(&format!(
-                                "clip {id} exhausted after {elapsed:.2}s",
+                                "clip {id} empty() at {elapsed:.3}s — ignoring (underrun guard)",
                                 id = clip.id,
                             ));
-                            self.exhausted.insert(clip.id);
-                            break 'primary_sink; // exhausted — overlays can still play
                         }
-                        // elapsed < MIN_PLAY_SECS: transient underrun in release
-                        // build — do not mark exhausted yet.
-                        audio_log(&format!(
-                            "clip {id} empty() at {elapsed:.3}s — ignoring (underrun guard)",
-                            id = clip.id,
-                        ));
+                        // else: newly created sink not yet buffered — leave it alone.
                     }
-                    // else: newly created sink not yet buffered — leave it alone.
-                }
 
-                // Rebuild sink if this clip has no active sink yet.
-                // Covers both the fresh-start case (empty map) and the
-                // clip-change case (map has a different clip's sink, which
-                // the clear() below will remove before creating the new one).
-                let needs_sink = !ctx.audio_sinks.contains_key(&clip.id);
+                    // Rebuild sink if this clip has no active sink yet.
+                    // Covers both the fresh-start case (empty map) and the
+                    // clip-change case (map has a different clip's sink, which
+                    // the clear() below will remove before creating the new one).
+                    let needs_sink = !ctx.audio_sinks.contains_key(&clip.id);
 
-                if needs_sink {
-                    self.soft_drain_all(ctx);
-                    audio_log(&format!(
-                        "opening sink — clip={id} wav={path:?} seek_t={seek_t:.3}",
-                        id = clip.id,
-                        path = apath,
-                    ));
-                    match File::open(apath) {
-                        Ok(file) => {
-                            match Decoder::new(BufReader::new(file)) {
-                                Ok(decoder) => {
-                                    // Per rodio 0.21 docs: connect_new takes &Mixer
-                                    // obtained from OutputStream::mixer().
-                                    // stream lives in AppContext so the device stays alive.
-                                    let sink = rodio::Player::connect_new(&mixer);
-                                    sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
-                                    let _ = sink.try_seek(
-                                        std::time::Duration::from_secs_f64(seek_t));
-                                    let initial_vol = if state.muted { 0.0 } else { state.volume * clip.volume * mix_factor };
-                                    sink.set_volume(initial_vol);
-                                    self.sink_last_volume.insert(clip.id, initial_vol);
-                                    sink.play();
-                                    audio_log(&format!(
-                                        "sink created seek_t={seek_t:.3} vol={}",
-                                        state.volume,
-                                    ));
-                                    self.sink_created_at.insert(clip.id, Instant::now());
-                                    self.sink_clip_durations.insert(clip.id, clip.duration);
-                                    ctx.audio_sinks.insert(clip.id, sink);
+                    if needs_sink {
+                        self.soft_drain_all(ctx);
+                        audio_log(&format!(
+                            "opening sink — clip={id} wav={path:?} seek_t={seek_t:.3}",
+                            id = clip.id,
+                            path = apath,
+                        ));
+                        match File::open(apath) {
+                            Ok(file) => {
+                                match Decoder::new(BufReader::new(file)) {
+                                    Ok(decoder) => {
+                                        // Per rodio 0.21 docs: connect_new takes &Mixer
+                                        // obtained from OutputStream::mixer().
+                                        // stream lives in AppContext so the device stays alive.
+                                        let sink = rodio::Player::connect_new(&mixer);
+                                        sink.append(
+                                            decoder.fade_in(Duration::from_secs_f64(FADE_SECS)),
+                                        );
+                                        let _ = sink
+                                            .try_seek(std::time::Duration::from_secs_f64(seek_t));
+                                        let initial_vol = if state.muted {
+                                            0.0
+                                        } else {
+                                            state.volume * clip.volume * mix_factor
+                                        };
+                                        sink.set_volume(initial_vol);
+                                        self.sink_last_volume.insert(clip.id, initial_vol);
+                                        sink.play();
+                                        audio_log(&format!(
+                                            "sink created seek_t={seek_t:.3} vol={}",
+                                            state.volume,
+                                        ));
+                                        self.sink_created_at.insert(clip.id, Instant::now());
+                                        self.sink_clip_durations.insert(clip.id, clip.duration);
+                                        ctx.audio_sinks.insert(clip.id, sink);
+                                    }
+                                    Err(e) => {
+                                        audio_log(&format!("Decoder failed for WAV {apath:?}: {e}"))
+                                    }
                                 }
-                                Err(e) => audio_log(&format!("Decoder failed for WAV {apath:?}: {e}")),
+                            }
+                            Err(e) => {
+                                audio_log(&format!("File::open failed for WAV {apath:?}: {e}"))
                             }
                         }
-                        Err(e) => audio_log(&format!("File::open failed for WAV {apath:?}: {e}")),
-                    }
-                } else {
-                    // Sync volume/mute. Also apply a pre-emptive linear fade-out
-                    // over the last FADE_SECS of the clip so the outgoing sink's
-                    // amplitude is already near zero when the transition fires.
-                    // This eliminates the click that was caused by soft_drain_all
-                    // doing an instantaneous hard cut to silence on a non-zero signal.
-                    let time_remaining = (clip.start_time + clip.duration) - state.current_time;
-                    let fade_out = if time_remaining < FADE_SECS {
-                        (time_remaining / FADE_SECS).clamp(0.0, 1.0) as f32
                     } else {
-                        1.0_f32
-                    };
-                    // Per-clip fade-in / fade-out envelope (set by the user via the
-                    // volume popup sliders). Applied on top of the transition fade_out
-                    // guard above — they multiply together so neither is cancelled out.
-                    let elapsed = state.current_time - clip.start_time;
-                    let clip_fade = {
-                        let e = elapsed as f32;
-                        let r = time_remaining as f32;
-                        let in_gain = if e < clip.fade_in_start_secs { 0.0 }
-                            else if clip.fade_in_secs > 0.0 { ((e - clip.fade_in_start_secs) / clip.fade_in_secs).clamp(0.0, 1.0).sqrt() }
-                            else { 1.0 };
-                        let out_gain = if r < clip.fade_out_end_secs { 0.0 }
-                            else if clip.fade_out_secs > 0.0 { ((r - clip.fade_out_end_secs) / clip.fade_out_secs).clamp(0.0, 1.0).sqrt() }
-                            else { 1.0 };
-                        in_gain.min(out_gain)
-                    };
-                    if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
-                        let vol = if state.muted { 0.0 } else { state.volume * clip.volume * fade_out * clip_fade * mix_factor };
-                        self.set_primary_volume(clip.id, sink, vol);
+                        // Sync volume/mute. Also apply a pre-emptive linear fade-out
+                        // over the last FADE_SECS of the clip so the outgoing sink's
+                        // amplitude is already near zero when the transition fires.
+                        // This eliminates the click that was caused by soft_drain_all
+                        // doing an instantaneous hard cut to silence on a non-zero signal.
+                        let time_remaining = (clip.start_time + clip.duration) - state.current_time;
+                        let fade_out = if time_remaining < FADE_SECS {
+                            (time_remaining / FADE_SECS).clamp(0.0, 1.0) as f32
+                        } else {
+                            1.0_f32
+                        };
+                        // Per-clip fade-in / fade-out envelope (set by the user via the
+                        // volume popup sliders). Applied on top of the transition fade_out
+                        // guard above — they multiply together so neither is cancelled out.
+                        let elapsed = state.current_time - clip.start_time;
+                        let clip_fade = {
+                            let e = elapsed as f32;
+                            let r = time_remaining as f32;
+                            let in_gain = if e < clip.fade_in_start_secs {
+                                0.0
+                            } else if clip.fade_in_secs > 0.0 {
+                                ((e - clip.fade_in_start_secs) / clip.fade_in_secs)
+                                    .clamp(0.0, 1.0)
+                                    .sqrt()
+                            } else {
+                                1.0
+                            };
+                            let out_gain = if r < clip.fade_out_end_secs {
+                                0.0
+                            } else if clip.fade_out_secs > 0.0 {
+                                ((r - clip.fade_out_end_secs) / clip.fade_out_secs)
+                                    .clamp(0.0, 1.0)
+                                    .sqrt()
+                            } else {
+                                1.0
+                            };
+                            in_gain.min(out_gain)
+                        };
+                        if let Some(sink) = ctx.audio_sinks.get(&clip.id) {
+                            let vol = if state.muted {
+                                0.0
+                            } else {
+                                state.volume * clip.volume * fade_out * clip_fade * mix_factor
+                            };
+                            self.set_primary_volume(clip.id, sink, vol);
+                        }
                     }
                 }
-            }
             } // end 'primary_sink
         } else {
             // No clip under playhead — silence.
@@ -502,9 +535,10 @@ impl AudioModule {
         // mix_factor could be derived from the total active-sink count.
 
         // Evict overlay sinks for clips no longer active.
-        let active_overlay_ids: HashSet<Uuid> =
-            overlay_clips.iter().map(|c| c.id).collect();
-        let stale_overlays: Vec<Uuid> = ctx.audio_overlay_sinks.keys()
+        let active_overlay_ids: HashSet<Uuid> = overlay_clips.iter().map(|c| c.id).collect();
+        let stale_overlays: Vec<Uuid> = ctx
+            .audio_overlay_sinks
+            .keys()
             .filter(|id| !active_overlay_ids.contains(id))
             .copied()
             .collect();
@@ -520,7 +554,9 @@ impl AudioModule {
         }
 
         for clip in overlay_clips {
-            let Some(lib) = clip_query::library_entry_for(state, clip) else { continue };
+            let Some(lib) = clip_query::library_entry_for(state, clip) else {
+                continue;
+            };
             let Some(apath) = lib.audio_path.as_ref() else {
                 if !ctx.audio_overlay_sinks.contains_key(&clip.id) {
                     audio_log(&format!(
@@ -553,7 +589,9 @@ impl AudioModule {
             }
 
             if let Some(sink) = ctx.audio_overlay_sinks.get(&clip.id) {
-                let elapsed = self.overlay_created_at.get(&clip.id)
+                let elapsed = self
+                    .overlay_created_at
+                    .get(&clip.id)
                     .map(|ct| ct.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
                 if !sink.empty() {
@@ -581,30 +619,33 @@ impl AudioModule {
                     path = apath,
                 ));
                 match File::open(apath) {
-                    Ok(file) => {
-                        match Decoder::new(BufReader::new(file)) {
-                            Ok(decoder) => {
-                                let sink = rodio::Player::connect_new(&mixer);
-                                sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
-                                let _ = sink.try_seek(
-                                    std::time::Duration::from_secs_f64(seek_t));
-                                let initial_vol = if state.muted { 0.0 } else { state.volume * clip.volume * mix_factor };
-                                sink.set_volume(initial_vol);
-                                self.overlay_last_volume.insert(clip.id, initial_vol);
-                                sink.play();
-                                audio_log(&format!(
-                                    "overlay sink created seek_t={seek_t:.3} vol={}",
-                                    state.volume,
-                                ));
-                                self.overlay_created_at.insert(clip.id, Instant::now());
-                                ctx.audio_overlay_sinks.insert(clip.id, sink);
-                            }
-                            Err(e) => audio_log(&format!(
-                                "Decoder failed for overlay WAV {apath:?}: {e}")),
+                    Ok(file) => match Decoder::new(BufReader::new(file)) {
+                        Ok(decoder) => {
+                            let sink = rodio::Player::connect_new(&mixer);
+                            sink.append(decoder.fade_in(Duration::from_secs_f64(FADE_SECS)));
+                            let _ = sink.try_seek(std::time::Duration::from_secs_f64(seek_t));
+                            let initial_vol = if state.muted {
+                                0.0
+                            } else {
+                                state.volume * clip.volume * mix_factor
+                            };
+                            sink.set_volume(initial_vol);
+                            self.overlay_last_volume.insert(clip.id, initial_vol);
+                            sink.play();
+                            audio_log(&format!(
+                                "overlay sink created seek_t={seek_t:.3} vol={}",
+                                state.volume,
+                            ));
+                            self.overlay_created_at.insert(clip.id, Instant::now());
+                            ctx.audio_overlay_sinks.insert(clip.id, sink);
                         }
+                        Err(e) => {
+                            audio_log(&format!("Decoder failed for overlay WAV {apath:?}: {e}"))
+                        }
+                    },
+                    Err(e) => {
+                        audio_log(&format!("File::open failed for overlay WAV {apath:?}: {e}"))
                     }
-                    Err(e) => audio_log(&format!(
-                        "File::open failed for overlay WAV {apath:?}: {e}")),
                 }
             } else if let Some(sink) = ctx.audio_overlay_sinks.get(&clip.id) {
                 let time_remaining = (clip.start_time + clip.duration) - state.current_time;
@@ -617,15 +658,31 @@ impl AudioModule {
                 let clip_fade = {
                     let e = elapsed as f32;
                     let r = time_remaining as f32;
-                    let in_gain = if e < clip.fade_in_start_secs { 0.0 }
-                        else if clip.fade_in_secs > 0.0 { ((e - clip.fade_in_start_secs) / clip.fade_in_secs).clamp(0.0, 1.0).sqrt() }
-                        else { 1.0 };
-                    let out_gain = if r < clip.fade_out_end_secs { 0.0 }
-                        else if clip.fade_out_secs > 0.0 { ((r - clip.fade_out_end_secs) / clip.fade_out_secs).clamp(0.0, 1.0).sqrt() }
-                        else { 1.0 };
+                    let in_gain = if e < clip.fade_in_start_secs {
+                        0.0
+                    } else if clip.fade_in_secs > 0.0 {
+                        ((e - clip.fade_in_start_secs) / clip.fade_in_secs)
+                            .clamp(0.0, 1.0)
+                            .sqrt()
+                    } else {
+                        1.0
+                    };
+                    let out_gain = if r < clip.fade_out_end_secs {
+                        0.0
+                    } else if clip.fade_out_secs > 0.0 {
+                        ((r - clip.fade_out_end_secs) / clip.fade_out_secs)
+                            .clamp(0.0, 1.0)
+                            .sqrt()
+                    } else {
+                        1.0
+                    };
                     in_gain.min(out_gain)
                 };
-                let vol = if state.muted { 0.0 } else { state.volume * clip.volume * fade_out * clip_fade * mix_factor };
+                let vol = if state.muted {
+                    0.0
+                } else {
+                    state.volume * clip.volume * fade_out * clip_fade * mix_factor
+                };
                 self.set_overlay_volume(clip.id, sink, vol);
             }
         }
@@ -633,14 +690,16 @@ impl AudioModule {
 }
 
 impl EditorModule for AudioModule {
-    fn name(&self) -> &str { "Audio" }
+    fn name(&self) -> &str {
+        "Audio"
+    }
 
     fn ui(
         &mut self,
-        _ui:          &mut Ui,
-        _state:       &ProjectState,
+        _ui: &mut Ui,
+        _state: &ProjectState,
         _thumb_cache: &mut ThumbnailCache,
-        _cmd:         &mut Vec<EditorCommand>,
+        _cmd: &mut Vec<EditorCommand>,
     ) {
         // No UI panel — driven entirely by tick().
     }

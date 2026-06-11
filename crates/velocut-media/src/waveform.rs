@@ -4,14 +4,14 @@
 // Replaces the old ffmpeg CLI subprocess approach — no child process spawn,
 // no PATH dependency, no stdout pipe. Handles all common sample formats.
 
-use std::path::PathBuf;
 use crossbeam_channel::Sender;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use velocut_core::media_types::MediaResult;
 
-use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::sample::{Sample, Type as SampleType};
+use ffmpeg_the_third as ffmpeg;
 
 const WAVEFORM_COLS: usize = 4000;
 
@@ -35,13 +35,16 @@ pub fn extract_waveform(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) {
         .map(|chunk| chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max))
         .collect();
 
-    eprintln!("[media] waveform {} peaks <- {}", peaks.len(), path.display());
+    eprintln!(
+        "[media] waveform {} peaks <- {}",
+        peaks.len(),
+        path.display()
+    );
     let _ = tx.send(MediaResult::Waveform { id, peaks });
 }
 
 fn decode_audio_samples(path: &PathBuf) -> Result<Vec<f32>, String> {
-    let mut ictx = ffmpeg::format::input(path)
-        .map_err(|e| format!("open: {e}"))?;
+    let mut ictx = ffmpeg::format::input(path).map_err(|e| format!("open: {e}"))?;
 
     let stream = ictx
         .streams()
@@ -67,7 +70,7 @@ fn decode_audio_samples(path: &PathBuf) -> Result<Vec<f32>, String> {
         if stream.index() != stream_index {
             continue;
         }
-        
+
         if decoder.send_packet(&packet).is_ok() {
             let mut frame = ffmpeg::frame::Audio::empty();
             while decoder.receive_frame(&mut frame).is_ok() {
@@ -90,46 +93,73 @@ fn decode_audio_samples(path: &PathBuf) -> Result<Vec<f32>, String> {
 /// Planar formats: plane 0 is already channel 0.
 fn append_frame_samples(frame: &ffmpeg::frame::Audio, out: &mut Vec<f32>) {
     let channels = frame.ch_layout().channels() as usize;
-    let data      = frame.data(0);
+    let data = frame.data(0);
 
     match frame.format() {
         Sample::F32(SampleType::Packed) => {
-            out.extend(data.chunks_exact(4).step_by(channels.max(1))
-                .map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]).clamp(-1.0, 1.0)));
+            out.extend(
+                data.chunks_exact(4)
+                    .step_by(channels.max(1))
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).clamp(-1.0, 1.0)),
+            );
         }
         Sample::F32(SampleType::Planar) => {
-            out.extend(data.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]).clamp(-1.0, 1.0)));
+            out.extend(
+                data.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).clamp(-1.0, 1.0)),
+            );
         }
         Sample::I16(SampleType::Packed) => {
-            out.extend(data.chunks_exact(2).step_by(channels.max(1))
-                .map(|b| i16::from_le_bytes([b[0],b[1]]) as f32 / 32768.0));
+            out.extend(
+                data.chunks_exact(2)
+                    .step_by(channels.max(1))
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+            );
         }
         Sample::I16(SampleType::Planar) => {
-            out.extend(data.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0],b[1]]) as f32 / 32768.0));
+            out.extend(
+                data.chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+            );
         }
         Sample::I32(SampleType::Packed) => {
-            out.extend(data.chunks_exact(4).step_by(channels.max(1))
-                .map(|b| i32::from_le_bytes([b[0],b[1],b[2],b[3]]) as f32 / 2_147_483_648.0));
+            out.extend(
+                data.chunks_exact(4)
+                    .step_by(channels.max(1))
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0),
+            );
         }
         Sample::I32(SampleType::Planar) => {
-            out.extend(data.chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0],b[1],b[2],b[3]]) as f32 / 2_147_483_648.0));
+            out.extend(
+                data.chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0),
+            );
         }
         Sample::F64(SampleType::Packed) => {
-            out.extend(data.chunks_exact(8).step_by(channels.max(1))
-                .map(|b| f64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]) as f32)
-                .map(|s| s.clamp(-1.0, 1.0)));
+            out.extend(
+                data.chunks_exact(8)
+                    .step_by(channels.max(1))
+                    .map(|b| {
+                        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+                    })
+                    .map(|s| s.clamp(-1.0, 1.0)),
+            );
         }
         Sample::F64(SampleType::Planar) => {
-            out.extend(data.chunks_exact(8)
-                .map(|b| f64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]) as f32)
-                .map(|s| s.clamp(-1.0, 1.0)));
+            out.extend(
+                data.chunks_exact(8)
+                    .map(|b| {
+                        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+                    })
+                    .map(|s| s.clamp(-1.0, 1.0)),
+            );
         }
         Sample::U8(SampleType::Packed) => {
-            out.extend(data.iter().step_by(channels.max(1))
-                .map(|&b| (b as f32 / 128.0) - 1.0));
+            out.extend(
+                data.iter()
+                    .step_by(channels.max(1))
+                    .map(|&b| (b as f32 / 128.0) - 1.0),
+            );
         }
         Sample::U8(SampleType::Planar) => {
             out.extend(data.iter().map(|&b| (b as f32 / 128.0) - 1.0));

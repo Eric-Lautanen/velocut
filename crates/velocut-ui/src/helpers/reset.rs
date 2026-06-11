@@ -20,19 +20,19 @@
 // Neither filesystem function panics. All errors are logged via eprintln! and
 // treated as non-fatal; a failed delete is always better than a crashed app.
 
-use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 use crate::context::AppContext;
+use eframe::egui::{self, Color32, Margin, RichText, Stroke};
 use std::collections::HashMap;
 
 // ── Visual constants (local) ──────────────────────────────────────────────────
 
-const DARK_BG_CARD:  Color32 = Color32::from_rgb(22,  24,  32);
-const DARK_BG_2:     Color32 = Color32::from_rgb(40,  42,  54);
-const DARK_BORDER:   Color32 = Color32::from_rgb(90,  92, 110);
-const DARK_TEXT:     Color32 = Color32::WHITE;
+const DARK_BG_CARD: Color32 = Color32::from_rgb(22, 24, 32);
+const DARK_BG_2: Color32 = Color32::from_rgb(40, 42, 54);
+const DARK_BORDER: Color32 = Color32::from_rgb(90, 92, 110);
+const DARK_TEXT: Color32 = Color32::WHITE;
 const DARK_TEXT_DIM: Color32 = Color32::from_rgb(190, 190, 210);
-const GREEN_DIM:     Color32 = Color32::from_rgb(100, 220, 140);
-const GREEN_BG:      Color32 = Color32::from_rgb(25,  65,  40);
+const GREEN_DIM: Color32 = Color32::from_rgb(100, 220, 140);
+const GREEN_BG: Color32 = Color32::from_rgb(25, 65, 40);
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 
@@ -68,8 +68,14 @@ pub fn delete_app_data_dir() {
         .unwrap_or_else(|| storage_dir.clone());
 
     match std::fs::remove_dir_all(&app_dir) {
-        Ok(()) => eprintln!("[reset] deleted VeloCut app data dir '{}'", app_dir.display()),
-        Err(e) => eprintln!("[reset] could not delete VeloCut app data dir '{}': {e}", app_dir.display()),
+        Ok(()) => eprintln!(
+            "[reset] deleted VeloCut app data dir '{}'",
+            app_dir.display()
+        ),
+        Err(e) => eprintln!(
+            "[reset] could not delete VeloCut app data dir '{}': {e}",
+            app_dir.display()
+        ),
     }
 }
 
@@ -108,10 +114,10 @@ pub fn delete_temp_files() {
         let candidate = match var {
             // LOCALAPPDATA points to the AppData\Local folder; Temp is a
             // well-known subdirectory that always exists alongside it.
-            &"LOCALAPPDATA" => std::env::var(var).ok()
+            &"LOCALAPPDATA" => std::env::var(var)
+                .ok()
                 .map(|v| std::path::PathBuf::from(v).join("Temp")),
-            _ => std::env::var(var).ok()
-                .map(std::path::PathBuf::from),
+            _ => std::env::var(var).ok().map(std::path::PathBuf::from),
         };
         if let Some(path) = candidate {
             if !tmp_dirs.iter().any(|d| d == &path) {
@@ -126,13 +132,16 @@ pub fn delete_temp_files() {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    let is_velocut_file = name_str.starts_with("velocut_")
-                        || name_str == "velocut.log";
+                    let is_velocut_file =
+                        name_str.starts_with("velocut_") || name_str == "velocut.log";
                     if is_velocut_file {
                         let path = entry.path();
                         match std::fs::remove_file(&path) {
                             Ok(()) => eprintln!("[reset] deleted temp file '{}'", path.display()),
-                            Err(e) => eprintln!("[reset] could not delete temp file '{}': {e}", path.display()),
+                            Err(e) => eprintln!(
+                                "[reset] could not delete temp file '{}': {e}",
+                                path.display()
+                            ),
                         }
                     }
                 }
@@ -176,7 +185,7 @@ pub fn reset_context(context: &mut AppContext, ctx: Option<&egui::Context>) {
 
     // Drop rodio Sinks before the OutputStream — order is load-bearing.
     // Sinks hold WAV file handles; stream must outlive them.
-    context.audio_sinks         = HashMap::new();
+    context.audio_sinks = HashMap::new();
     context.audio_overlay_sinks = HashMap::new();
     context.audio_stream = None;
 
@@ -328,9 +337,9 @@ pub fn show_uninstall_modal(ctx: &egui::Context, visible: &mut bool) {
     // ── Card geometry ─────────────────────────────────────────────────────────
     const CARD_W: f32 = 420.0;
     const CARD_H: f32 = 310.0;
-    const PAD:    f32 = 28.0;
+    const PAD: f32 = 28.0;
 
-    let card_rect  = egui::Rect::from_center_size(screen.center(), egui::vec2(CARD_W, CARD_H));
+    let card_rect = egui::Rect::from_center_size(screen.center(), egui::vec2(CARD_W, CARD_H));
     let inner_rect = card_rect.shrink(PAD);
 
     egui::Area::new(egui::Id::new("reset_modal_card"))
@@ -408,7 +417,10 @@ fn show_modal_content(ui: &mut egui::Ui, visible: &mut bool) {
 
         // Primary: close the process entirely
         let close_btn = egui::Button::new(
-            RichText::new("Close VeloCut").size(12.0).strong().color(Color32::BLACK),
+            RichText::new("Close VeloCut")
+                .size(12.0)
+                .strong()
+                .color(Color32::BLACK),
         )
         .fill(GREEN_DIM)
         .stroke(Stroke::NONE)
@@ -422,12 +434,11 @@ fn show_modal_content(ui: &mut egui::Ui, visible: &mut bool) {
         ui.add_space(8.0);
 
         // Secondary: keep the blank app running
-        let keep_btn = egui::Button::new(
-            RichText::new("Keep Using").size(12.0).color(DARK_TEXT_DIM),
-        )
-        .fill(DARK_BG_2)
-        .stroke(Stroke::new(1.0, DARK_BORDER))
-        .min_size(egui::vec2(btn_w, 32.0));
+        let keep_btn =
+            egui::Button::new(RichText::new("Keep Using").size(12.0).color(DARK_TEXT_DIM))
+                .fill(DARK_BG_2)
+                .stroke(Stroke::new(1.0, DARK_BORDER))
+                .min_size(egui::vec2(btn_w, 32.0));
 
         if ui.add(keep_btn).clicked() {
             *visible = false;

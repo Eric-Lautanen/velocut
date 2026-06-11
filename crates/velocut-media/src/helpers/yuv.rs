@@ -27,30 +27,27 @@ pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usiz
 
     // Y plane
     let y_stride = yuv.stride(0);
-    let y_src    = yuv.data(0);
+    let y_src = yuv.data(0);
     for row in 0..h {
-        raw[row * w .. row * w + w]
-            .copy_from_slice(&y_src[row * y_stride .. row * y_stride + w]);
+        raw[row * w..row * w + w].copy_from_slice(&y_src[row * y_stride..row * y_stride + w]);
     }
 
     // U plane
     let u_offset = w * h;
     let u_stride = yuv.stride(1);
-    let u_src    = yuv.data(1);
+    let u_src = yuv.data(1);
     for row in 0..uv_h {
         let dst = u_offset + row * uv_w;
-        raw[dst .. dst + uv_w]
-            .copy_from_slice(&u_src[row * u_stride .. row * u_stride + uv_w]);
+        raw[dst..dst + uv_w].copy_from_slice(&u_src[row * u_stride..row * u_stride + uv_w]);
     }
 
     // V plane
     let v_offset = u_offset + uv_w * uv_h;
     let v_stride = yuv.stride(2);
-    let v_src    = yuv.data(2);
+    let v_src = yuv.data(2);
     for row in 0..uv_h {
         let dst = v_offset + row * uv_w;
-        raw[dst .. dst + uv_w]
-            .copy_from_slice(&v_src[row * v_stride .. row * v_stride + uv_w]);
+        raw[dst..dst + uv_w].copy_from_slice(&v_src[row * v_stride..row * v_stride + uv_w]);
     }
 
     raw
@@ -60,32 +57,36 @@ pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usiz
 ///
 /// The inverse of `extract_yuv` — used when the blended frame needs to be sent
 /// to the encoder (which expects a strided VideoFrame, not a packed buffer).
-pub fn write_yuv(packed: &[u8], yuv: &mut VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usize) {
+pub fn write_yuv(
+    packed: &[u8],
+    yuv: &mut VideoFrame,
+    w: usize,
+    h: usize,
+    uv_w: usize,
+    uv_h: usize,
+) {
     // Y plane
     let y_stride = yuv.stride(0);
-    let y_dst    = yuv.data_mut(0);
+    let y_dst = yuv.data_mut(0);
     for row in 0..h {
-        y_dst[row * y_stride .. row * y_stride + w]
-            .copy_from_slice(&packed[row * w .. row * w + w]);
+        y_dst[row * y_stride..row * y_stride + w].copy_from_slice(&packed[row * w..row * w + w]);
     }
 
     // U plane
     let u_offset = w * h;
     let u_stride = yuv.stride(1);
-    let u_dst    = yuv.data_mut(1);
+    let u_dst = yuv.data_mut(1);
     for row in 0..uv_h {
         let src = u_offset + row * uv_w;
-        u_dst[row * u_stride .. row * u_stride + uv_w]
-            .copy_from_slice(&packed[src .. src + uv_w]);
+        u_dst[row * u_stride..row * u_stride + uv_w].copy_from_slice(&packed[src..src + uv_w]);
     }
 
     // V plane
     let v_offset = u_offset + uv_w * uv_h;
     let v_stride = yuv.stride(2);
-    let v_dst    = yuv.data_mut(2);
+    let v_dst = yuv.data_mut(2);
     for row in 0..uv_h {
         let src = v_offset + row * uv_w;
-        v_dst[row * v_stride .. row * v_stride + uv_w]
-            .copy_from_slice(&packed[src .. src + uv_w]);
+        v_dst[row * v_stride..row * v_stride + uv_w].copy_from_slice(&packed[src..src + uv_w]);
     }
 }

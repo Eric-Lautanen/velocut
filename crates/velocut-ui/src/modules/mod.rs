@@ -5,18 +5,18 @@
 //   2. Add `pub mod mypanel;` below
 //   3. Add one line to the modules vec in app.rs
 
-pub mod timeline;
-pub mod preview_module;
-pub mod library;
-pub mod export_module;
-pub mod video_module;
 pub mod audio_module;
+pub mod export_module;
+pub mod library;
+pub mod preview_module;
+pub mod timeline;
+pub mod video_module;
 
-use velocut_core::state::ProjectState;
-use velocut_core::commands::EditorCommand;
-use egui::{Ui, TextureHandle};
+use egui::{TextureHandle, Ui};
 use std::collections::HashMap;
 use uuid::Uuid;
+use velocut_core::commands::EditorCommand;
+use velocut_core::state::ProjectState;
 
 /// GPU-resident thumbnail cache: LibraryClip ID → loaded texture
 pub type ThumbnailCache = HashMap<Uuid, TextureHandle>;
@@ -34,10 +34,10 @@ pub trait EditorModule {
     fn name(&self) -> &str;
     fn ui(
         &mut self,
-        ui:         &mut Ui,
-        state:      &ProjectState,
+        ui: &mut Ui,
+        state: &ProjectState,
         thumb_cache: &mut ThumbnailCache,
-        cmd:        &mut Vec<EditorCommand>,
+        cmd: &mut Vec<EditorCommand>,
     );
     /// Called every frame after commands are processed.
     /// Non-rendering modules (e.g. AudioModule) use this instead of ui().

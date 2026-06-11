@@ -1,30 +1,32 @@
 // src/app.rs (velocut-ui)
-use velocut_core::state::{ProjectState, TimelineClip, LibraryClip, ClipType};
-use velocut_core::commands::EditorCommand;
-use velocut_media::{MediaWorker, ClipSpec, EncodeSpec};
-use velocut_media::encode::AudioOverlay;
-use velocut_media::audio::cleanup_audio_temp;
-use velocut_core::transitions::{ClipTransition, TimelineTransition, TransitionKind, TransitionType};
 use crate::context::AppContext;
-use crate::theme::configure_style;
 use crate::helpers::clip_query;
-use crate::modules::{
-    EditorModule,  // must be in scope for .ui() calls on concrete module types
-    timeline::TimelineModule,
-    preview_module::PreviewModule,
-    library::LibraryModule,
-    export_module::ExportModule,
-    audio_module::AudioModule,
-    video_module::VideoModule,
-};
-use eframe::egui;
-use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::collections::HashSet;
-use uuid::Uuid;
-use rfd::FileDialog;
-use crate::velocut_log;
 use crate::helpers::memory_manager::MemoryManager;
+use crate::modules::{
+    audio_module::AudioModule,
+    export_module::ExportModule,
+    library::LibraryModule,
+    preview_module::PreviewModule,
+    timeline::TimelineModule,
+    video_module::VideoModule,
+    EditorModule, // must be in scope for .ui() calls on concrete module types
+};
+use crate::theme::configure_style;
+use crate::velocut_log;
+use eframe::egui;
+use rfd::FileDialog;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use uuid::Uuid;
+use velocut_core::commands::EditorCommand;
+use velocut_core::state::{ClipType, LibraryClip, ProjectState, TimelineClip};
+use velocut_core::transitions::{
+    ClipTransition, TimelineTransition, TransitionKind, TransitionType,
+};
+use velocut_media::audio::cleanup_audio_temp;
+use velocut_media::encode::AudioOverlay;
+use velocut_media::{ClipSpec, EncodeSpec, MediaWorker};
 
 #[derive(Serialize, Deserialize)]
 struct AppStorage {
@@ -42,16 +44,16 @@ const MAX_UNDO_DEPTH: usize = 50;
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct VeloCutApp {
-    state:        ProjectState,
-    context:      AppContext,
+    state: ProjectState,
+    context: AppContext,
     // Panel modules as concrete types — eliminates per-frame name-string lookup
     // and makes typos a compile error instead of a silently blank panel.
-    library:      LibraryModule,
-    preview:      PreviewModule,
-    timeline:     TimelineModule,
-    export:       ExportModule,
+    library: LibraryModule,
+    preview: PreviewModule,
+    timeline: TimelineModule,
+    export: ExportModule,
     /// Stored separately so tick() calls the concrete method, not the trait default no-op.
-    audio:        AudioModule,
+    audio: AudioModule,
     /// Commands emitted by modules each frame, processed after the UI pass
     pending_cmds: Vec<EditorCommand>,
 
@@ -85,7 +87,6 @@ pub struct VeloCutApp {
     /// squeezed in an autosave between the button click and the exit.
     reset_done: bool,
 
-
     memory_manager: MemoryManager,
 }
 
@@ -103,7 +104,8 @@ impl VeloCutApp {
         // so EnumThreadWindows would find nothing to patch there. The call is deferred
         // to the first update() frame via the taskbar_icon_fixed flag.
 
-        let state = cc.storage
+        let state = cc
+            .storage
             .and_then(|s| eframe::get_value::<AppStorage>(s, eframe::APP_KEY))
             .map(|d| d.project)
             .unwrap_or_default();
@@ -114,7 +116,7 @@ impl VeloCutApp {
         }
 
         let context = AppContext::new(media_worker);
-        let library  = LibraryModule::new();
+        let library = LibraryModule::new();
         let timeline = TimelineModule::new();
         let memory_manager = MemoryManager::new();
 
@@ -122,16 +124,16 @@ impl VeloCutApp {
             state,
             context,
             library,
-            preview:      PreviewModule::new(),
+            preview: PreviewModule::new(),
             timeline,
-            export:       ExportModule::default(),
-            audio:        AudioModule::new(),
+            export: ExportModule::default(),
+            audio: AudioModule::new(),
             pending_cmds: Vec::new(),
-            undo_stack:   VecDeque::new(),
-            redo_stack:   VecDeque::new(),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
             startup_size_checked: false,
-            taskbar_icon_fixed:   false,
-            reset_done:           false,
+            taskbar_icon_fixed: false,
+            reset_done: false,
             memory_manager,
         }
     }
@@ -173,20 +175,20 @@ impl VeloCutApp {
     /// from the current live state intact.
     fn restore_snapshot(&mut self, mut snapshot: ProjectState) {
         // Preserve runtime-only fields that must not be rewound by undo/redo.
-        snapshot.current_time          = self.state.current_time;
-        snapshot.is_playing            = self.state.is_playing;
-        snapshot.volume                = self.state.volume;
-        snapshot.muted                 = self.state.muted;
-        snapshot.encode_job            = self.state.encode_job;
-        snapshot.encode_progress       = self.state.encode_progress.clone();
-        snapshot.encode_done           = self.state.encode_done.clone();
-        snapshot.encode_error          = self.state.encode_error.clone();
+        snapshot.current_time = self.state.current_time;
+        snapshot.is_playing = self.state.is_playing;
+        snapshot.volume = self.state.volume;
+        snapshot.muted = self.state.muted;
+        snapshot.encode_job = self.state.encode_job;
+        snapshot.encode_progress = self.state.encode_progress;
+        snapshot.encode_done = self.state.encode_done.clone();
+        snapshot.encode_error = self.state.encode_error.clone();
         // Drain pending queues from live state into the snapshot so they aren't lost.
-        snapshot.pending_probes        = std::mem::take(&mut self.state.pending_probes);
-        snapshot.pending_extracts      = std::mem::take(&mut self.state.pending_extracts);
+        snapshot.pending_probes = std::mem::take(&mut self.state.pending_probes);
+        snapshot.pending_extracts = std::mem::take(&mut self.state.pending_extracts);
         snapshot.pending_audio_cleanup = std::mem::take(&mut self.state.pending_audio_cleanup);
-        snapshot.pending_save_pick     = self.state.pending_save_pick.take();
-        snapshot.save_status           = self.state.save_status.take();
+        snapshot.pending_save_pick = self.state.pending_save_pick.take();
+        snapshot.save_status = self.state.save_status.take();
 
         // Re-queue probes for any library clips whose waveform_peaks are empty
         // in the restored snapshot. This happens when the snapshot was taken while
@@ -195,9 +197,14 @@ impl VeloCutApp {
         // leaves the video clip with no waveform even though audio_muted is cleared.
         for lib_clip in &snapshot.library {
             if lib_clip.waveform_peaks.is_empty() {
-                let already_queued = snapshot.pending_probes.iter().any(|(id, _)| *id == lib_clip.id);
+                let already_queued = snapshot
+                    .pending_probes
+                    .iter()
+                    .any(|(id, _)| *id == lib_clip.id);
                 if !already_queued {
-                    snapshot.pending_probes.push((lib_clip.id, lib_clip.path.clone()));
+                    snapshot
+                        .pending_probes
+                        .push((lib_clip.id, lib_clip.path.clone()));
                 }
             }
         }
@@ -241,7 +248,7 @@ impl VeloCutApp {
                 self.state.is_playing = false;
             }
             EditorCommand::Stop => {
-                self.state.is_playing   = false;
+                self.state.is_playing = false;
                 self.state.current_time = 0.0;
             }
             EditorCommand::SetPlayhead(t) => {
@@ -265,7 +272,10 @@ impl VeloCutApp {
             }
             EditorCommand::DeleteLibraryClip(id) => {
                 self.state.selected_library_clip = None;
-                if let Some(apath) = self.state.library.iter()
+                if let Some(apath) = self
+                    .state
+                    .library
+                    .iter()
                     .find(|c| c.id == id)
                     .and_then(|c| c.audio_path.clone())
                 {
@@ -282,13 +292,20 @@ impl VeloCutApp {
             }
 
             // ── Timeline ─────────────────────────────────────────────────────
-            EditorCommand::AddToTimeline { media_id, at_time, track_row } => {
+            EditorCommand::AddToTimeline {
+                media_id,
+                at_time,
+                track_row,
+            } => {
                 // Auto-set aspect ratio from the first clip placed on the timeline.
                 // Check emptiness *before* add_to_timeline mutates the vec.
                 let is_first_clip = self.state.timeline.is_empty();
                 self.state.add_to_timeline(media_id, at_time, track_row);
                 if is_first_clip {
-                    if let Some((width, height)) = self.state.library.iter()
+                    if let Some((width, height)) = self
+                        .state
+                        .library
+                        .iter()
                         .find(|c| c.id == media_id)
                         .and_then(|c| c.video_size)
                     {
@@ -304,18 +321,26 @@ impl VeloCutApp {
             EditorCommand::DeleteTimelineClip(id) => {
                 // If this clip is linked to a partner (extract audio pair),
                 // un-mute the partner so it doesn't silently stay muted.
-                if let Some(partner_id) = self.state.timeline.iter()
+                if let Some(partner_id) = self
+                    .state
+                    .timeline
+                    .iter()
                     .find(|c| c.id == id)
                     .and_then(|c| c.linked_clip_id)
                 {
-                    if let Some(partner) = self.state.timeline.iter_mut().find(|c| c.id == partner_id) {
+                    if let Some(partner) =
+                        self.state.timeline.iter_mut().find(|c| c.id == partner_id)
+                    {
                         partner.linked_clip_id = None;
-                        partner.audio_muted    = false;
+                        partner.audio_muted = false;
                     }
                 }
                 // Capture the deleted clip's media_id before removal so we can
                 // evict its cached frame if no other timeline clip shares it.
-                let deleted_media_id = self.state.timeline.iter()
+                let deleted_media_id = self
+                    .state
+                    .timeline
+                    .iter()
                     .find(|c| c.id == id)
                     .map(|c| c.media_id);
                 self.state.timeline.retain(|c| c.id != id);
@@ -326,7 +351,9 @@ impl VeloCutApp {
                     let still_used = self.state.timeline.iter().any(|c| c.media_id == mid);
                     if !still_used {
                         self.context.cache.frame_cache.remove(&mid);
-                        self.context.cache.frame_bucket_cache
+                        self.context
+                            .cache
+                            .frame_bucket_cache
                             .retain(|(bucket_mid, _), _| *bucket_mid != mid);
                         self.preview.current_frame = None;
                     }
@@ -337,16 +364,21 @@ impl VeloCutApp {
             }
             EditorCommand::ExtractAudioTrack(clip_id) => {
                 // Gather library info BEFORE mutating state.
-                let lib_info = self.state.timeline.iter()
+                let lib_info = self
+                    .state
+                    .timeline
+                    .iter()
                     .find(|c| c.id == clip_id)
                     .and_then(|tc| self.state.library.iter().find(|l| l.id == tc.media_id))
-                    .map(|lib| (
-                        lib.path.clone(),
-                        lib.audio_path.clone(),
-                        lib.waveform_peaks.clone(),
-                        lib.duration,
-                        lib.name.clone(),
-                    ));
+                    .map(|lib| {
+                        (
+                            lib.path.clone(),
+                            lib.audio_path.clone(),
+                            lib.waveform_peaks.clone(),
+                            lib.duration,
+                            lib.name.clone(),
+                        )
+                    });
 
                 if let Some((src_path, wav_path, peaks, duration, src_name)) = lib_info {
                     if let Some(audio_clip_id) = self.state.extract_audio_track(clip_id) {
@@ -355,23 +387,25 @@ impl VeloCutApp {
                         // Use the already-extracted WAV as the source path if ready;
                         // fall back to the original file (audio_module will use it fine).
                         let audio_lib_id = Uuid::new_v4();
-                        let effective_path = wav_path.clone()
-                            .unwrap_or_else(|| src_path.clone());
+                        let effective_path = wav_path.clone().unwrap_or_else(|| src_path.clone());
                         self.state.library.push(LibraryClip {
-                            id:                   audio_lib_id,
-                            path:                 effective_path,
-                            name:                 format!("[Audio] {src_name}"),
+                            id: audio_lib_id,
+                            path: effective_path,
+                            name: format!("[Audio] {src_name}"),
                             duration,
-                            clip_type:            ClipType::Audio,
-                            thumbnail_path:       None,
-                            duration_probed:      true,
-                            waveform_peaks:       peaks,
-                            video_size:           None,
-                            audio_path:           wav_path,
+                            clip_type: ClipType::Audio,
+                            thumbnail_path: None,
+                            duration_probed: true,
+                            waveform_peaks: peaks,
+                            video_size: None,
+                            audio_path: wav_path,
                             audio_trimmed_offset: 0.0,
                         });
                         // Rewire the A-row timeline clip to the audio library entry.
-                        if let Some(tc) = self.state.timeline.iter_mut()
+                        if let Some(tc) = self
+                            .state
+                            .timeline
+                            .iter_mut()
                             .find(|c| c.id == audio_clip_id)
                         {
                             tc.media_id = audio_lib_id;
@@ -408,12 +442,17 @@ impl VeloCutApp {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.filter = filter;
                 }
-                if let Some(mid) = self.state.timeline.iter()
+                if let Some(mid) = self
+                    .state
+                    .timeline
+                    .iter()
                     .find(|c| c.id == id)
                     .map(|c| c.media_id)
                 {
                     self.context.cache.frame_cache.remove(&mid);
-                    self.context.cache.frame_bucket_cache
+                    self.context
+                        .cache
+                        .frame_bucket_cache
                         .retain(|(bid, _), _| *bid != mid);
                 }
                 self.context.playback.last_frame_req = None;
@@ -422,19 +461,25 @@ impl VeloCutApp {
             EditorCommand::SelectTimelineClip(id) => {
                 self.state.selected_timeline_clip = id;
             }
-            EditorCommand::MoveTimelineClip { id, new_start, new_row } => {
+            EditorCommand::MoveTimelineClip {
+                id,
+                new_start,
+                new_row,
+            } => {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.start_time = new_start;
-                    tc.track_row  = new_row;
+                    tc.track_row = new_row;
                 }
             }
             EditorCommand::SplitClipAt(t) => {
                 // Find a clip that contains t with enough room on each side to be
                 // worth splitting (> 2 frames from either edge at 30fps).
                 let min_dur = 2.0 / 30.0;
-                if let Some(clip) = self.state.timeline.iter()
-                    .find(|c| t > c.start_time + min_dur
-                           && t < c.start_time + c.duration - min_dur)
+                if let Some(clip) = self
+                    .state
+                    .timeline
+                    .iter()
+                    .find(|c| t > c.start_time + min_dur && t < c.start_time + c.duration - min_dur)
                     .cloned()
                 {
                     let split_offset = t - clip.start_time; // seconds into clip
@@ -442,26 +487,26 @@ impl VeloCutApp {
                     // Shorten the original clip to become the first half.
                     // Clear its fade_out — that belongs to the new tail segment now.
                     if let Some(c) = self.state.timeline.iter_mut().find(|c| c.id == clip.id) {
-                        c.duration          = split_offset;
-                        c.fade_out_secs     = 0.0;
+                        c.duration = split_offset;
+                        c.fade_out_secs = 0.0;
                         c.fade_out_end_secs = 0.0;
                     }
 
                     // Push the second half as a new clip immediately after.
                     self.state.timeline.push(TimelineClip {
-                        id:             Uuid::new_v4(),
-                        media_id:       clip.media_id,
-                        start_time:     t,
-                        duration:       clip.duration - split_offset,
-                        source_offset:  clip.source_offset + split_offset,
-                        track_row:      clip.track_row,
-                        volume:         clip.volume,
+                        id: Uuid::new_v4(),
+                        media_id: clip.media_id,
+                        start_time: t,
+                        duration: clip.duration - split_offset,
+                        source_offset: clip.source_offset + split_offset,
+                        track_row: clip.track_row,
+                        volume: clip.volume,
                         linked_clip_id: None,
-                        audio_muted:    clip.audio_muted,
-                        fade_in_secs:       0.0,
+                        audio_muted: clip.audio_muted,
+                        fade_in_secs: 0.0,
                         fade_in_start_secs: 0.0,
-                        fade_out_secs:      clip.fade_out_secs,
-                        fade_out_end_secs:  clip.fade_out_end_secs,
+                        fade_out_secs: clip.fade_out_secs,
+                        fade_out_end_secs: clip.fade_out_end_secs,
                         filter: Default::default(),
                     });
                     // Any transition keyed on clip.id (original → its successor)
@@ -470,10 +515,14 @@ impl VeloCutApp {
                     // successor. No transition cleanup needed.
                 }
             }
-            EditorCommand::TrimClipStart { id, new_source_offset, new_duration } => {
+            EditorCommand::TrimClipStart {
+                id,
+                new_source_offset,
+                new_duration,
+            } => {
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.source_offset = new_source_offset;
-                    tc.duration      = new_duration;
+                    tc.duration = new_duration;
                 }
             }
             EditorCommand::TrimClipEnd { id, new_duration } => {
@@ -483,7 +532,12 @@ impl VeloCutApp {
             }
 
             // ── Export ───────────────────────────────────────────────────────
-            EditorCommand::RenderMP4 { filename, width, height, fps } => {
+            EditorCommand::RenderMP4 {
+                filename,
+                width,
+                height,
+                fps,
+            } => {
                 self.begin_render(filename, width, height, fps);
             }
             EditorCommand::CancelEncode(job_id) => {
@@ -493,10 +547,10 @@ impl VeloCutApp {
                 // driven by the same path as a real error (avoids race conditions).
             }
             EditorCommand::ClearEncodeStatus => {
-                self.state.encode_job      = None;
+                self.state.encode_job = None;
                 self.state.encode_progress = None;
-                self.state.encode_done     = None;
-                self.state.encode_error    = None;
+                self.state.encode_done = None;
+                self.state.encode_error = None;
             }
 
             // ── Project reset ─────────────────────────────────────────────────
@@ -512,15 +566,15 @@ impl VeloCutApp {
                 self.state.timeline.clear();
                 self.state.transitions.clear();
                 self.state.selected_timeline_clip = None;
-                self.state.selected_library_clip  = None;
-                self.state.current_time           = 0.0;
-                self.state.is_playing             = false;
+                self.state.selected_library_clip = None;
+                self.state.current_time = 0.0;
+                self.state.is_playing = false;
 
                 // Zero encode state (may have been mid-encode).
-                self.state.encode_job      = None;
+                self.state.encode_job = None;
                 self.state.encode_progress = None;
-                self.state.encode_done     = None;
-                self.state.encode_error    = None;
+                self.state.encode_done = None;
+                self.state.encode_error = None;
 
                 // Clear undo/redo — stale snapshots waste memory and there is
                 // nothing meaningful to undo after a full wipe.
@@ -538,12 +592,12 @@ impl VeloCutApp {
                 // Re-arm the startup size guard so the timeline height is
                 // re-injected on the next frame after egui memory is fresh.
                 self.startup_size_checked = false;
-                self.reset_done           = true;
+                self.reset_done = true;
                 self.preview.current_frame = None;
                 // held_frame is private, so either make it pub or add a reset method on PreviewModule
 
                 self.library.multi_selection = HashSet::new();
-                self.library.visible_ids     = HashSet::new();
+                self.library.visible_ids = HashSet::new();
 
                 self.preview.reset();
             }
@@ -562,9 +616,13 @@ impl VeloCutApp {
                         let a = sorted[i];
                         let b = sorted[i + 1];
                         // Only pair clips on the same track that are touching.
-                        if a.track_row != b.track_row { continue; }
+                        if a.track_row != b.track_row {
+                            continue;
+                        }
                         let gap = b.start_time - (a.start_time + a.duration);
-                        if gap.abs() > 0.1 { continue; }
+                        if gap.abs() > 0.1 {
+                            continue;
+                        }
                         self.state.transitions.push(TimelineTransition {
                             after_clip_id: a.id,
                             kind: TransitionType::new(TransitionKind::Crossfade, secs),
@@ -572,17 +630,28 @@ impl VeloCutApp {
                     }
                 }
             }
-            EditorCommand::SetTransition { after_clip_id, kind } => {
-                if let Some(t) = self.state.transitions.iter_mut()
+            EditorCommand::SetTransition {
+                after_clip_id,
+                kind,
+            } => {
+                if let Some(t) = self
+                    .state
+                    .transitions
+                    .iter_mut()
                     .find(|t| t.after_clip_id == after_clip_id)
                 {
                     t.kind = kind;
                 } else if kind != TransitionType::cut() {
-                    self.state.transitions.push(TimelineTransition { after_clip_id, kind });
+                    self.state.transitions.push(TimelineTransition {
+                        after_clip_id,
+                        kind,
+                    });
                 }
             }
             EditorCommand::RemoveTransition(after_clip_id) => {
-                self.state.transitions.retain(|t| t.after_clip_id != after_clip_id);
+                self.state
+                    .transitions
+                    .retain(|t| t.after_clip_id != after_clip_id);
             }
 
             // ── View / UI ────────────────────────────────────────────────────
@@ -601,7 +670,12 @@ impl VeloCutApp {
             EditorCommand::SaveFrameToDisk { path, timestamp } => {
                 // Direct save (no dialog) — used for programmatic frame export
                 if let Some(lib) = self.state.library.iter().find(|l| l.path == path) {
-                    self.context.media_worker.extract_frame_hq(lib.id, path, timestamp, std::path::PathBuf::new());
+                    self.context.media_worker.extract_frame_hq(
+                        lib.id,
+                        path,
+                        timestamp,
+                        std::path::PathBuf::new(),
+                    );
                 }
             }
         }
@@ -628,7 +702,7 @@ impl VeloCutApp {
             .save_file()
         {
             Some(p) => p,
-            None    => return, // user cancelled the dialog — no-op
+            None => return, // user cancelled the dialog — no-op
         };
 
         // Sort by start_time using refs — avoids cloning all clip data.
@@ -636,8 +710,8 @@ impl VeloCutApp {
         sorted.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
 
         let Some((clip_specs, encode_transitions, audio_overlays)) =
-            build_encode_plan(&self.state, &sorted) else
-        {
+            build_encode_plan(&self.state, &sorted)
+        else {
             velocut_log!("[export] no resolvable clips — aborting render");
             return;
         };
@@ -656,10 +730,11 @@ impl VeloCutApp {
 
         // Arm encode state before handing to the worker so ingest_media_results
         // can route EncodeProgress into the right fields immediately.
-        self.state.encode_job      = Some(job_id);
-        self.state.encode_progress = Some((0, (self.state.total_duration() * fps as f64).ceil() as u64));
-        self.state.encode_done     = None;
-        self.state.encode_error    = None;
+        self.state.encode_job = Some(job_id);
+        self.state.encode_progress =
+            Some((0, (self.state.total_duration() * fps as f64).ceil() as u64));
+        self.state.encode_done = None;
+        self.state.encode_error = None;
 
         self.context.media_worker.start_encode(spec);
     }
@@ -686,7 +761,9 @@ impl VeloCutApp {
         }
         let extracts: Vec<_> = self.state.pending_extracts.drain(..).collect();
         for (id, path, ts, dest) in extracts {
-            self.context.media_worker.extract_frame_hq(id, path, ts, dest);
+            self.context
+                .media_worker
+                .extract_frame_hq(id, path, ts, dest);
         }
 
         // NOTE: The save-frame dialog ideally belongs in ExportModule since it is
@@ -695,7 +772,8 @@ impl VeloCutApp {
         // cannot own or drain pending_save_pick themselves. If the trait is ever
         // widened to &mut ProjectState, move this block to ExportModule::ui().
         if let Some((path, ts)) = self.state.pending_save_pick.take() {
-            let stem = path.file_stem()
+            let stem = path
+                .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
@@ -707,7 +785,9 @@ impl VeloCutApp {
                 .add_filter("PNG", &["png"])
                 .save_file()
             {
-                self.context.media_worker.extract_frame_hq(Uuid::nil(), path, ts, dest);
+                self.context
+                    .media_worker
+                    .extract_frame_hq(Uuid::nil(), path, ts, dest);
             }
         }
 
@@ -809,17 +889,19 @@ impl eframe::App for VeloCutApp {
             const TARGET_H: f32 = 965.0;
             const SETTLE_MIN_H: f32 = 900.0;
 
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                egui::vec2(TARGET_W, TARGET_H),
-            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                TARGET_W, TARGET_H,
+            )));
 
             if screen.height() >= SETTLE_MIN_H {
                 self.startup_size_checked = true;
 
                 let timeline_h = (screen.height() * 0.35).clamp(300.0, 420.0);
                 ctx.memory_mut(|mem| {
-                    mem.data.insert_temp(egui::Id::new("timeline_panel"), timeline_h);
-                    mem.data.insert_persisted(egui::Id::new("timeline_panel"), timeline_h);
+                    mem.data
+                        .insert_temp(egui::Id::new("timeline_panel"), timeline_h);
+                    mem.data
+                        .insert_persisted(egui::Id::new("timeline_panel"), timeline_h);
                 });
             }
 
@@ -852,7 +934,7 @@ impl eframe::App for VeloCutApp {
 // Extracted from begin_render so it's independently testable and so begin_render
 // itself stays focused on I/O (file dialog, worker dispatch, state arming).
 fn build_encode_plan(
-    state:  &velocut_core::state::ProjectState,
+    state: &velocut_core::state::ProjectState,
     sorted: &[&TimelineClip],
 ) -> Option<(Vec<ClipSpec>, Vec<ClipTransition>, Vec<AudioOverlay>)> {
     // Only V-row clips (even track_row) drive the sequential video/audio encode.
@@ -865,15 +947,19 @@ fn build_encode_plan(
     //      here causes encode_clip to open an audio-only file, find no video
     //      stream, and abort the entire export with "no video stream in '...'".
     //      Their audio is handled separately as AudioOverlay entries below.
-    let filtered: Vec<&TimelineClip> = sorted.iter()
+    let filtered: Vec<&TimelineClip> = sorted
+        .iter()
         .copied()
-        .filter(|tc| tc.track_row % 2 == 0)   // V-row clips only
+        .filter(|tc| tc.track_row % 2 == 0) // V-row clips only
         .collect();
 
-    let clip_specs: Vec<ClipSpec> = filtered.iter()
+    let clip_specs: Vec<ClipSpec> = filtered
+        .iter()
         .copied()
         .filter_map(|tc| {
-            state.library.iter()
+            state
+                .library
+                .iter()
                 .find(|lc| lc.id == tc.media_id)
                 .map(|lc| {
                     // When audio was extracted to an A-row partner (audio_muted=true),
@@ -886,18 +972,18 @@ fn build_encode_plan(
                         None
                     };
 
-                    let effective_volume = linked_audio
-                        .map(|ac| ac.volume)
-                        .unwrap_or(tc.volume);
+                    let effective_volume = linked_audio.map(|ac| ac.volume).unwrap_or(tc.volume);
 
                     let (effective_fi, effective_fi_start, effective_fo, effective_fo_end) =
                         linked_audio
-                            .map(|ac| (
-                                ac.fade_in_secs,
-                                ac.fade_in_start_secs,
-                                ac.fade_out_secs,
-                                ac.fade_out_end_secs,
-                            ))
+                            .map(|ac| {
+                                (
+                                    ac.fade_in_secs,
+                                    ac.fade_in_start_secs,
+                                    ac.fade_out_secs,
+                                    ac.fade_out_end_secs,
+                                )
+                            })
                             .unwrap_or((
                                 tc.fade_in_secs,
                                 tc.fade_in_start_secs,
@@ -906,16 +992,16 @@ fn build_encode_plan(
                             ));
 
                     ClipSpec {
-                        path:               lc.path.clone(),
-                        source_offset:      tc.source_offset,
-                        duration:           tc.duration,
-                        volume:             effective_volume,
-                        skip_audio:         false,
-                        fade_in_secs:       effective_fi,
+                        path: lc.path.clone(),
+                        source_offset: tc.source_offset,
+                        duration: tc.duration,
+                        volume: effective_volume,
+                        skip_audio: false,
+                        fade_in_secs: effective_fi,
                         fade_in_start_secs: effective_fi_start,
-                        fade_out_secs:      effective_fo,
-                        fade_out_end_secs:  effective_fo_end,
-                        filter:             tc.filter.clone(),
+                        fade_out_secs: effective_fo,
+                        fade_out_end_secs: effective_fo_end,
+                        filter: tc.filter.clone(),
                     }
                 })
         })
@@ -928,11 +1014,19 @@ fn build_encode_plan(
     // Map TimelineTransitions (UUID-keyed) → ClipTransitions (index-keyed).
     // Uses position in *filtered* vec, not raw timeline, so A-row clips don't
     // shift transition indices.
-    let encode_transitions: Vec<ClipTransition> = state.transitions.iter()
+    let encode_transitions: Vec<ClipTransition> = state
+        .transitions
+        .iter()
         .filter_map(|t| {
-            let idx = filtered.iter().copied().position(|tc| tc.id == t.after_clip_id)?;
+            let idx = filtered
+                .iter()
+                .copied()
+                .position(|tc| tc.id == t.after_clip_id)?;
             if idx + 1 < clip_specs.len() {
-                Some(ClipTransition { after_clip_index: idx, kind: t.kind.clone() })
+                Some(ClipTransition {
+                    after_clip_index: idx,
+                    kind: t.kind.clone(),
+                })
             } else {
                 None
             }
@@ -950,22 +1044,25 @@ fn build_encode_plan(
     //
     // Note: `sorted` contains ALL timeline clips, so we iterate it directly
     // rather than `filtered` (which only contains V-row clips).
-    let audio_overlays: Vec<AudioOverlay> = sorted.iter()
+    let audio_overlays: Vec<AudioOverlay> = sorted
+        .iter()
         .copied()
         .filter(|tc| tc.track_row % 2 == 1 && tc.linked_clip_id.is_none())
         .filter_map(|tc| {
-            state.library.iter()
+            state
+                .library
+                .iter()
                 .find(|lc| lc.id == tc.media_id)
                 .map(|lc| AudioOverlay {
-                    path:           lc.path.clone(),
-                    source_offset:  tc.source_offset,
+                    path: lc.path.clone(),
+                    source_offset: tc.source_offset,
                     timeline_start: tc.start_time,
-                    duration:       tc.duration,
-                    volume:         tc.volume,
-                    fade_in_secs:       tc.fade_in_secs,
+                    duration: tc.duration,
+                    volume: tc.volume,
+                    fade_in_secs: tc.fade_in_secs,
                     fade_in_start_secs: tc.fade_in_start_secs,
-                    fade_out_secs:      tc.fade_out_secs,
-                    fade_out_end_secs:  tc.fade_out_end_secs,
+                    fade_out_secs: tc.fade_out_secs,
+                    fade_out_end_secs: tc.fade_out_end_secs,
                 })
         })
         .collect();
@@ -993,7 +1090,12 @@ impl VeloCutApp {
             .min_size(340.0)
             .default_size(340.0)
             .show_inside(ui, |ui| {
-                self.timeline.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
+                self.timeline.ui(
+                    ui,
+                    &self.state,
+                    &mut self.context.cache.thumbnail_cache,
+                    &mut self.pending_cmds,
+                );
             });
 
         egui::Panel::left("library_panel")
@@ -1001,7 +1103,12 @@ impl VeloCutApp {
             .min_size(240.0)
             .default_size(240.0)
             .show_inside(ui, |ui| {
-                self.library.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
+                self.library.ui(
+                    ui,
+                    &self.state,
+                    &mut self.context.cache.thumbnail_cache,
+                    &mut self.pending_cmds,
+                );
             });
 
         egui::Panel::right("export_panel")
@@ -1009,18 +1116,29 @@ impl VeloCutApp {
             .default_size(220.0)
             .min_size(220.0)
             .show_inside(ui, |ui| {
-                self.export.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
+                self.export.ui(
+                    ui,
+                    &self.state,
+                    &mut self.context.cache.thumbnail_cache,
+                    &mut self.pending_cmds,
+                );
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let active_id = VideoModule::active_media_id(&self.state);
-            self.preview.current_frame = active_id
-                .and_then(|id| self.context.cache.frame_cache.get(&id).cloned());
+            self.preview.current_frame =
+                active_id.and_then(|id| self.context.cache.frame_cache.get(&id).cloned());
 
-            self.preview.ui(ui, &self.state, &mut self.context.cache.thumbnail_cache, &mut self.pending_cmds);
+            self.preview.ui(
+                ui,
+                &self.state,
+                &mut self.context.cache.thumbnail_cache,
+                &mut self.pending_cmds,
+            );
         });
 
-        self.export.show_render_modal(&ctx, &self.state, &mut self.pending_cmds);
+        self.export
+            .show_render_modal(&ctx, &self.state, &mut self.pending_cmds);
         crate::helpers::reset::show_uninstall_modal(&ctx, &mut self.export.show_reset_complete);
     }
 
@@ -1030,16 +1148,22 @@ impl VeloCutApp {
     fn tick_modules(&mut self, ctx: &egui::Context) {
         // preview.last_canvas_size is written by preview.ui() inside render_panels(),
         // which runs before tick_modules() — so this is always the current panel size.
-        VideoModule::tick(&self.state, &mut self.context, ctx, self.preview.last_canvas_size);
+        VideoModule::tick(
+            &self.state,
+            &mut self.context,
+            ctx,
+            self.preview.last_canvas_size,
+        );
         self.audio.tick(&self.state, &mut self.context);
-        self.memory_manager.tick(ctx, &self.state, &mut self.context);
+        self.memory_manager
+            .tick(ctx, &self.state, &mut self.context);
         if self.state.is_playing {
             let dt = ctx.input(|i| i.stable_dt as f64);
             self.state.current_time += dt;
             let total = self.state.total_duration();
             if total > 0.0 && self.state.current_time >= total {
                 self.state.current_time = total - 0.001;
-                self.state.is_playing   = false;
+                self.state.is_playing = false;
             }
             ctx.request_repaint();
         }

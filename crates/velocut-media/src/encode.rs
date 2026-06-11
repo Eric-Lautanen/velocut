@@ -64,32 +64,35 @@
 //   error path.
 
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crossbeam_channel::Sender;
 use uuid::Uuid;
 
-use ffmpeg_the_third as ffmpeg;
-use ffmpeg::packet::Mut as PacketMut;
 use ffmpeg::codec::{self, Id as CodecId};
 use ffmpeg::encoder;
-use ffmpeg::format::{Pixel, Sample, input as open_input, output as open_output};
 use ffmpeg::format::sample::Type as SampleType;
+use ffmpeg::format::{input as open_input, output as open_output, Pixel, Sample};
 use ffmpeg::media::Type as MediaType;
-use ffmpeg::software::scaling::{Context as ScaleCtx, Flags as ScaleFlags};
+use ffmpeg::packet::Mut as PacketMut;
 use ffmpeg::software::resampling;
+use ffmpeg::software::scaling::{Context as ScaleCtx, Flags as ScaleFlags};
 use ffmpeg::util::channel_layout::{ChannelLayout, ChannelLayoutMask};
-use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::util::frame::audio::Audio as AudioFrame;
+use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
+use ffmpeg_the_third as ffmpeg;
 
-use velocut_core::media_types::MediaResult;
-use velocut_core::transitions::{ClipTransition, TransitionKind, VideoTransition, registry};
-use velocut_core::filters::FilterParams;
-use velocut_core::filters::helpers::apply_filter_yuv;
-use crate::helpers::yuv::{extract_yuv, write_yuv};
 use crate::helpers::seek::seek_to_secs;
+use crate::helpers::yuv::{extract_yuv, write_yuv};
+use velocut_core::filters::helpers::apply_filter_yuv;
+use velocut_core::filters::FilterParams;
+use velocut_core::media_types::MediaResult;
+use velocut_core::transitions::{registry, ClipTransition, TransitionKind, VideoTransition};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -97,48 +100,48 @@ use crate::helpers::seek::seek_to_secs;
 #[derive(Clone)]
 pub struct ClipSpec {
     /// Absolute path to the source media file.
-    pub path:          PathBuf,
+    pub path: PathBuf,
     /// Seconds into the source file at which this clip begins.
     pub source_offset: f64,
     /// Duration in seconds to include from this clip.
-    pub duration:      f64,
+    pub duration: f64,
     /// Linear gain applied to decoded audio before encoding (1.0 = unity).
-    pub volume:        f32,
+    pub volume: f32,
     /// When true, no audio is decoded or pushed to the FIFO for this clip.
-    pub skip_audio:    bool,
+    pub skip_audio: bool,
     /// Fade-in ramp duration (0.0 = none). Ramp starts after `fade_in_start_secs` of silence.
-    pub fade_in_secs:       f32,
+    pub fade_in_secs: f32,
     /// Silence before the fade-in ramp begins (0.0 = ramp starts at clip boundary).
     pub fade_in_start_secs: f32,
     /// Fade-out ramp duration (0.0 = none). After ramp, silence for `fade_out_end_secs`.
-    pub fade_out_secs:      f32,
+    pub fade_out_secs: f32,
     /// Silence after fade-out ramp ends, before clip boundary (0.0 = ramp ends at boundary).
-    pub fade_out_end_secs:  f32,
+    pub fade_out_end_secs: f32,
     pub filter: FilterParams,
 }
 
 /// A standalone audio clip that runs in parallel with the video timeline.
 #[derive(Clone)]
 pub struct AudioOverlay {
-    pub path:           PathBuf,
-    pub source_offset:  f64,
+    pub path: PathBuf,
+    pub source_offset: f64,
     pub timeline_start: f64,
-    pub duration:       f64,
-    pub volume:         f32,
-    pub fade_in_secs:       f32,
+    pub duration: f64,
+    pub volume: f32,
+    pub fade_in_secs: f32,
     pub fade_in_start_secs: f32,
-    pub fade_out_secs:      f32,
-    pub fade_out_end_secs:  f32,
+    pub fade_out_secs: f32,
+    pub fade_out_end_secs: f32,
 }
 
 /// Complete description of an encode job.
 pub struct EncodeSpec {
-    pub job_id:  Uuid,
-    pub clips:   Vec<ClipSpec>,
-    pub width:   u32,
-    pub height:  u32,
-    pub fps:     u32,
-    pub output:  PathBuf,
+    pub job_id: Uuid,
+    pub clips: Vec<ClipSpec>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub output: PathBuf,
     pub transitions: Vec<ClipTransition>,
     pub audio_overlays: Vec<AudioOverlay>,
 }
@@ -155,7 +158,7 @@ pub struct EncodeSpec {
 pub struct HwEncodeCapabilities {
     /// True when no HW encoder is available and libx264 will be used.
     /// The UI shows an informational note but does not restrict resolutions.
-    pub sw_only:      bool,
+    pub sw_only: bool,
     /// Human-readable name of the winning backend, e.g. "AMF", "NVENC",
     /// "VAAPI", "VideoToolbox", or "Software (libx264)".
     pub backend_name: &'static str,
@@ -176,7 +179,10 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     if encoder::find_by_name("h264_amf").is_some() {
         if probe_d3d11_device(1920, 1080) {
             eprintln!("[encode] probe: AMF available");
-            return HwEncodeCapabilities { sw_only: false, backend_name: "AMF" };
+            return HwEncodeCapabilities {
+                sw_only: false,
+                backend_name: "AMF",
+            };
         } else {
             eprintln!("[encode] probe: h264_amf found but D3D11 device init failed — skipping AMF");
         }
@@ -188,9 +194,14 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     if encoder::find_by_name("h264_nvenc").is_some() {
         if probe_cuda_device(1920, 1080) {
             eprintln!("[encode] probe: NVENC available");
-            return HwEncodeCapabilities { sw_only: false, backend_name: "NVENC" };
+            return HwEncodeCapabilities {
+                sw_only: false,
+                backend_name: "NVENC",
+            };
         } else {
-            eprintln!("[encode] probe: h264_nvenc found but CUDA device init failed — skipping NVENC");
+            eprintln!(
+                "[encode] probe: h264_nvenc found but CUDA device init failed — skipping NVENC"
+            );
         }
     } else {
         eprintln!("[encode] probe: h264_nvenc not found in FFmpeg build — skipping NVENC");
@@ -199,17 +210,26 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
     // VAAPI — Linux (AMD/Intel)
     if encoder::find_by_name("h264_vaapi").is_some() && probe_vaapi_device(1920, 1080) {
         eprintln!("[encode] probe: VAAPI available");
-        return HwEncodeCapabilities { sw_only: false, backend_name: "VAAPI" };
+        return HwEncodeCapabilities {
+            sw_only: false,
+            backend_name: "VAAPI",
+        };
     }
 
     // VideoToolbox — macOS
     if encoder::find_by_name("h264_videotoolbox").is_some() {
         eprintln!("[encode] probe: VideoToolbox available");
-        return HwEncodeCapabilities { sw_only: false, backend_name: "VideoToolbox" };
+        return HwEncodeCapabilities {
+            sw_only: false,
+            backend_name: "VideoToolbox",
+        };
     }
 
     eprintln!("[encode] probe: no HW encoder available — SW only, throttled at all resolutions");
-    HwEncodeCapabilities { sw_only: true, backend_name: "Software (libx264)" }
+    HwEncodeCapabilities {
+        sw_only: true,
+        backend_name: "Software (libx264)",
+    }
 }
 
 /// Try to create a D3D11VA device + NV12 frames context. Returns true on success.
@@ -219,23 +239,33 @@ fn probe_d3d11_device(width: u32, height: u32) -> bool {
         ffmpeg::ffi::av_hwdevice_ctx_create(
             &mut device_ctx,
             ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-            std::ptr::null(), std::ptr::null_mut(), 0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
         )
     };
-    if ret < 0 { return false; }
+    if ret < 0 {
+        return false;
+    }
 
     let ok = unsafe {
         match build_hw_frames_ctx(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Ok(f) => {
+                ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _));
+                true
+            }
             Err(_) => false,
         }
     };
-    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    unsafe {
+        ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+    }
     ok
 }
 
@@ -246,23 +276,33 @@ fn probe_cuda_device(width: u32, height: u32) -> bool {
         ffmpeg::ffi::av_hwdevice_ctx_create(
             &mut device_ctx,
             ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
-            std::ptr::null(), std::ptr::null_mut(), 0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
         )
     };
-    if ret < 0 { return false; }
+    if ret < 0 {
+        return false;
+    }
 
     let ok = unsafe {
         match build_hw_frames_ctx(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Ok(f) => {
+                ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _));
+                true
+            }
             Err(_) => false,
         }
     };
-    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    unsafe {
+        ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+    }
     ok
 }
 
@@ -273,23 +313,33 @@ fn probe_vaapi_device(width: u32, height: u32) -> bool {
         ffmpeg::ffi::av_hwdevice_ctx_create(
             &mut device_ctx,
             ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            std::ptr::null(), std::ptr::null_mut(), 0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
         )
     };
-    if ret < 0 { return false; }
+    if ret < 0 {
+        return false;
+    }
 
     let ok = unsafe {
         match build_hw_frames_ctx(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f) => { ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _)); true }
+            Ok(f) => {
+                ffmpeg::ffi::av_buffer_unref(&mut (f as *mut _));
+                true
+            }
             Err(_) => false,
         }
     };
-    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+    unsafe {
+        ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+    }
     ok
 }
 
@@ -326,11 +376,11 @@ enum HwBackend {
 /// software frames in YUV420P are uploaded by `upload_frame_to_hw` before
 /// calling send_frame.
 fn try_open_hw_encoder(
-    width:   u32,
-    height:  u32,
-    fps:     u32,
-    out_tb:  Rational,
-    octx:    &ffmpeg::format::context::Output,
+    width: u32,
+    height: u32,
+    fps: u32,
+    out_tb: Rational,
+    octx: &ffmpeg::format::context::Output,
 ) -> (ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>) {
     // ── AMF (D3D11 — Windows native, AMD/Intel/NVIDIA) ───────────────────────
     eprintln!("[encode] trying AMF (D3D11)...");
@@ -384,7 +434,9 @@ unsafe impl Sync for HwDeviceContext {}
 impl Drop for HwDeviceContext {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffmpeg::ffi::av_buffer_unref(&mut self.ptr); }
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut self.ptr);
+            }
         }
     }
 }
@@ -398,7 +450,7 @@ impl Drop for HwDeviceContext {
 /// Returns the HW frame ready for send_frame, or the original sw_frame on
 /// any error (the encoder will reject it, but we log and move on).
 unsafe fn upload_frame_to_hw(
-    sw_frame:   &VideoFrame,
+    sw_frame: &VideoFrame,
     hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
 ) -> Result<VideoFrame, String> {
     // Allocate a fresh HW surface.
@@ -437,7 +489,7 @@ unsafe fn build_hw_frames_ctx(
     device_ctx: *mut ffmpeg::ffi::AVBufferRef,
     hw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
     sw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
-    width:  u32,
+    width: u32,
     height: u32,
 ) -> Result<*mut ffmpeg::ffi::AVBufferRef, String> {
     let frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(device_ctx);
@@ -446,10 +498,10 @@ unsafe fn build_hw_frames_ctx(
     }
 
     let frames_ctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
-    (*frames_ctx).format    = hw_pix_fmt;
+    (*frames_ctx).format = hw_pix_fmt;
     (*frames_ctx).sw_format = sw_pix_fmt;
-    (*frames_ctx).width     = width as i32;
-    (*frames_ctx).height    = height as i32;
+    (*frames_ctx).width = width as i32;
+    (*frames_ctx).height = height as i32;
     (*frames_ctx).initial_pool_size = 20;
 
     let ret = ffmpeg::ffi::av_hwframe_ctx_init(frames_ref);
@@ -462,11 +514,11 @@ unsafe fn build_hw_frames_ctx(
 }
 
 fn try_amf_encoder(
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
+    fps: u32,
     out_tb: Rational,
-    octx:   &ffmpeg::format::context::Output,
+    octx: &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
     let codec = match encoder::find_by_name("h264_amf") {
         Some(c) => c,
@@ -482,7 +534,7 @@ fn try_amf_encoder(
         ffmpeg::ffi::av_hwdevice_ctx_create(
             &mut device_ctx,
             ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-            std::ptr::null(),       // NULL = use default adapter
+            std::ptr::null(), // NULL = use default adapter
             std::ptr::null_mut(),
             0,
         )
@@ -497,9 +549,10 @@ fn try_amf_encoder(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12, // D3D11 requires NV12, not YUV420P
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => {
                 eprintln!("[encode] AMF frames ctx: {e}");
                 ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
@@ -518,23 +571,27 @@ fn try_amf_encoder(
     enc.set_bit_rate(0);
 
     unsafe {
-        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+        (*enc.as_mut_ptr()).pix_fmt = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
         (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
         ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
     }
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
     // AMF quality options: quality preset + CQP equivalent to CRF 18.
     let mut opts = ffmpeg::Dictionary::new();
-    opts.set("quality",  "quality");   // slow preset — balanced quality/speed
-    opts.set("rc",       "cqp");       // constant QP, analogous to CRF
-    opts.set("qp_i",     "18");
-    opts.set("qp_p",     "20");
-    opts.set("qp_b",     "22");
-    opts.set("g",        &fps.to_string());
+    opts.set("quality", "quality"); // slow preset — balanced quality/speed
+    opts.set("rc", "cqp"); // constant QP, analogous to CRF
+    opts.set("qp_i", "18");
+    opts.set("qp_p", "20");
+    opts.set("qp_b", "22");
+    opts.set("g", &fps.to_string());
 
     match enc.open_as_with(codec, opts) {
         Ok(opened) => {
@@ -543,18 +600,20 @@ fn try_amf_encoder(
         }
         Err(e) => {
             eprintln!("[encode] h264_amf open failed: {e}, skipping AMF");
-            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+            }
             None
         }
     }
 }
 
 fn try_nvenc_encoder(
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
+    fps: u32,
     out_tb: Rational,
-    octx:   &ffmpeg::format::context::Output,
+    octx: &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
     let codec = match encoder::find_by_name("h264_nvenc") {
         Some(c) => c,
@@ -585,9 +644,10 @@ fn try_nvenc_encoder(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => {
                 eprintln!("[encode] NVENC frames ctx: {e}");
                 ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
@@ -608,21 +668,25 @@ fn try_nvenc_encoder(
 
     unsafe {
         // pix_fmt and hw_frames_ctx must be set via raw pointer — no safe wrappers.
-        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+        (*enc.as_mut_ptr()).pix_fmt = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
         (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
         ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
     }
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
     // NVENC options: rc=constqp, qp=18, preset=p4 (balanced quality/speed).
     let mut opts = ffmpeg::Dictionary::new();
-    opts.set("rc",     "constqp");
-    opts.set("qp",     "18");
+    opts.set("rc", "constqp");
+    opts.set("qp", "18");
     opts.set("preset", "p4");
-    opts.set("g",      &fps.to_string());
+    opts.set("g", &fps.to_string());
 
     match enc.open_as_with(codec, opts) {
         Ok(opened) => {
@@ -631,18 +695,20 @@ fn try_nvenc_encoder(
         }
         Err(e) => {
             eprintln!("[encode] h264_nvenc open failed: {e}, skipping");
-            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+            }
             None
         }
     }
 }
 
 fn try_vaapi_encoder(
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
+    fps: u32,
     out_tb: Rational,
-    octx:   &ffmpeg::format::context::Output,
+    octx: &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
     let codec = match encoder::find_by_name("h264_vaapi") {
         Some(c) => c,
@@ -672,9 +738,10 @@ fn try_vaapi_encoder(
             device_ctx,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
             ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-            width, height,
+            width,
+            height,
         ) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => {
                 eprintln!("[encode] VAAPI frames ctx: {e}");
                 ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
@@ -693,20 +760,24 @@ fn try_vaapi_encoder(
     enc.set_bit_rate(0);
 
     unsafe {
-        (*enc.as_mut_ptr()).pix_fmt       = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*enc.as_mut_ptr()).pix_fmt = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
         (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ctx);
         ffmpeg::ffi::av_buffer_unref(&mut (frames_ctx as *mut _));
     }
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
     // VAAPI uses qp-based rate control; ~18 ≈ CRF 18 visually.
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("rc_mode", "CQP");
-    opts.set("qp",      "18");
-    opts.set("g",       &fps.to_string());
+    opts.set("qp", "18");
+    opts.set("g", &fps.to_string());
 
     match enc.open_as_with(codec, opts) {
         Ok(opened) => {
@@ -715,25 +786,29 @@ fn try_vaapi_encoder(
         }
         Err(e) => {
             eprintln!("[encode] h264_vaapi open failed: {e}, skipping");
-            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ctx); }
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(&mut device_ctx);
+            }
             None
         }
     }
 }
 
 fn try_videotoolbox_encoder(
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
+    fps: u32,
     out_tb: Rational,
-    octx:   &ffmpeg::format::context::Output,
+    octx: &ffmpeg::format::context::Output,
 ) -> Option<(ffmpeg::encoder::Video, HwBackend, Option<HwDeviceContext>)> {
     // VideoToolbox accepts YUV420P input directly (no explicit HW upload needed);
     // it manages the IOSurface pool internally.
     let codec = match encoder::find_by_name("h264_videotoolbox") {
         Some(c) => c,
         None => {
-            eprintln!("[encode] h264_videotoolbox not found in ffmpeg build, skipping VideoToolbox");
+            eprintln!(
+                "[encode] h264_videotoolbox not found in ffmpeg build, skipping VideoToolbox"
+            );
             return None;
         }
     };
@@ -743,22 +818,26 @@ fn try_videotoolbox_encoder(
 
     enc.set_width(width);
     enc.set_height(height);
-    enc.set_format(Pixel::YUV420P);  // VT accepts sw frames in yuv420p
+    enc.set_format(Pixel::YUV420P); // VT accepts sw frames in yuv420p
     enc.set_time_base(out_tb);
     enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
     enc.set_bit_rate(0);
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
     let mut opts = ffmpeg::Dictionary::new();
     // VideoToolbox doesn't have CRF; use a high average bitrate for near-lossless quality.
-    opts.set("b:v",            "0");           // let profile control quality
-    opts.set("allow_sw",       "1");           // fall back to SW if GPU busy
-    opts.set("realtime",       "0");           // prefer quality over real-time
+    opts.set("b:v", "0"); // let profile control quality
+    opts.set("allow_sw", "1"); // fall back to SW if GPU busy
+    opts.set("realtime", "0"); // prefer quality over real-time
     let gop = fps.to_string();
-    opts.set("g",              &gop);
+    opts.set("g", &gop);
 
     match enc.open_as_with(codec, opts) {
         Ok(opened) => {
@@ -773,17 +852,19 @@ fn try_videotoolbox_encoder(
 }
 
 fn open_software_encoder(
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
+    fps: u32,
     out_tb: Rational,
-    octx:   &ffmpeg::format::context::Output,
+    octx: &ffmpeg::format::context::Output,
 ) -> Result<ffmpeg::encoder::Video, String> {
     let h264 = encoder::find(CodecId::H264)
         .ok_or_else(|| "H.264 encoder not found — is libx264 available?".to_string())?;
 
     let enc_ctx = codec::context::Context::new_with_codec(h264);
-    let mut enc = enc_ctx.encoder().video()
+    let mut enc = enc_ctx
+        .encoder()
+        .video()
         .map_err(|e| format!("create video encoder context: {e}"))?;
 
     enc.set_width(width);
@@ -793,7 +874,11 @@ fn open_software_encoder(
     enc.set_frame_rate(Some(Rational::new(fps as i32, 1)));
     enc.set_bit_rate(0);
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
@@ -808,14 +893,14 @@ fn open_software_encoder(
         .unwrap_or(2);
 
     let mut opts = ffmpeg::Dictionary::new();
-    opts.set("crf",     "18");
+    opts.set("crf", "18");
     // "medium" is more CPU-efficient per thread than "fast" — it does more work
     // per encode pass, so the total core-seconds consumed for equivalent quality
     // is lower.  Combined with the thread cap and per-frame yield_now() below,
     // this keeps peak CPU usage manageable at any resolution on any hardware.
-    opts.set("preset",  "medium");
+    opts.set("preset", "medium");
     opts.set("threads", &thread_cap.to_string());
-    opts.set("g",       &fps.to_string());
+    opts.set("g", &fps.to_string());
 
     enc.open_as_with(h264, opts)
         .map_err(|e| format!("open H.264 encoder: {e}"))
@@ -824,20 +909,14 @@ fn open_software_encoder(
 // ── Center-crop scaler ────────────────────────────────────────────────────────
 
 struct CropScaler {
-    ctx:    ScaleCtx,
+    ctx: ScaleCtx,
     crop_x: u32,
     crop_y: u32,
     crop_h: u32,
 }
 
 impl CropScaler {
-    fn build(
-        src_fmt: Pixel,
-        src_w:   u32,
-        src_h:   u32,
-        out_w:   u32,
-        out_h:   u32,
-    ) -> Self {
+    fn build(src_fmt: Pixel, src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> Self {
         let src_ar = src_w as f64 / src_h.max(1) as f64;
         let out_ar = out_w as f64 / out_h.max(1) as f64;
 
@@ -854,12 +933,22 @@ impl CropScaler {
         };
 
         let ctx = ScaleCtx::get(
-            src_fmt, crop_w.max(2), crop_h.max(2),
-            Pixel::YUV420P, out_w, out_h,
+            src_fmt,
+            crop_w.max(2),
+            crop_h.max(2),
+            Pixel::YUV420P,
+            out_w,
+            out_h,
             ScaleFlags::BILINEAR,
-        ).expect("CropScaler: SwsContext");
+        )
+        .expect("CropScaler: SwsContext");
 
-        Self { ctx, crop_x, crop_y, crop_h }
+        Self {
+            ctx,
+            crop_x,
+            crop_y,
+            crop_h,
+        }
     }
 
     fn run(&mut self, src: &VideoFrame, dst: &mut VideoFrame) -> Result<(), String> {
@@ -868,8 +957,7 @@ impl CropScaler {
             let df = dst.as_mut_ptr();
 
             let (off_y, off_uv): (usize, usize) = match src.format() {
-                Pixel::YUV420P | Pixel::YUVJ420P |
-                Pixel::YUV422P | Pixel::YUVJ422P => {
+                Pixel::YUV420P | Pixel::YUVJ420P | Pixel::YUV422P | Pixel::YUVJ422P => {
                     (self.crop_x as usize, self.crop_x as usize / 2)
                 }
                 Pixel::YUV444P | Pixel::YUVJ444P => {
@@ -880,13 +968,21 @@ impl CropScaler {
             };
 
             let ls = &(*sf).linesize;
-            let y_row_off  = self.crop_y as usize * ls[0] as usize;
+            let y_row_off = self.crop_y as usize * ls[0] as usize;
             let uv_row_off = (self.crop_y as usize / 2) * ls[1] as usize;
 
             let src_planes: [*const u8; 4] = [
                 (*sf).data[0].add(off_y + y_row_off),
-                if (*sf).data[1].is_null() { std::ptr::null() } else { (*sf).data[1].add(off_uv + uv_row_off) },
-                if (*sf).data[2].is_null() { std::ptr::null() } else { (*sf).data[2].add(off_uv + uv_row_off) },
+                if (*sf).data[1].is_null() {
+                    std::ptr::null()
+                } else {
+                    (*sf).data[1].add(off_uv + uv_row_off)
+                },
+                if (*sf).data[2].is_null() {
+                    std::ptr::null()
+                } else {
+                    (*sf).data[2].add(off_uv + uv_row_off)
+                },
                 std::ptr::null(),
             ];
 
@@ -903,7 +999,6 @@ impl CropScaler {
             if ret <= 0 {
                 return Err(format!("CropScaler::run sws_scale returned {ret}"));
             }
-
         }
         Ok(())
     }
@@ -911,12 +1006,10 @@ impl CropScaler {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn encode_timeline(
-    spec:   EncodeSpec,
-    cancel: Arc<AtomicBool>,
-    tx:     Sender<MediaResult>,
-) {
-    let total_frames: u64 = spec.clips.iter()
+pub fn encode_timeline(spec: EncodeSpec, cancel: Arc<AtomicBool>, tx: Sender<MediaResult>) {
+    let total_frames: u64 = spec
+        .clips
+        .iter()
         .map(|c| (c.duration * spec.fps as f64).ceil() as u64)
         .sum::<u64>()
         .max(1);
@@ -925,13 +1018,13 @@ pub fn encode_timeline(
         Ok(()) => {
             let _ = tx.send(MediaResult::EncodeDone {
                 job_id: spec.job_id,
-                path:   spec.output.clone(),
+                path: spec.output.clone(),
             });
         }
         Err(e) => {
             let _ = tx.send(MediaResult::EncodeError {
                 job_id: spec.job_id,
-                msg:    e,
+                msg: e,
             });
         }
     }
@@ -940,40 +1033,63 @@ pub fn encode_timeline(
 // ── Audio FIFO ────────────────────────────────────────────────────────────────
 
 struct AudioFifo {
-    left:  Vec<f32>,
+    left: Vec<f32>,
     right: Vec<f32>,
 }
 
 impl AudioFifo {
-    fn new() -> Self { Self { left: Vec::new(), right: Vec::new() } }
-    fn len(&self) -> usize { self.left.len() }
+    fn new() -> Self {
+        Self {
+            left: Vec::new(),
+            right: Vec::new(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.left.len()
+    }
 
     /// Like `push_scaled` but discards the first `skip` samples (pre-roll trim).
     fn push_scaled_from(&mut self, frame: &AudioFrame, volume: f32, skip: usize) {
         let n = frame.samples();
-        if n <= skip { return; }
+        if n <= skip {
+            return;
+        }
         unsafe {
             let l_bytes = frame.data(0);
             let l_f32 = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
-            self.left.extend(l_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+            self.left
+                .extend(l_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
 
-            let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
+            let r_bytes = if frame.ch_layout().channels() >= 2 {
+                frame.data(1)
+            } else {
+                frame.data(0)
+            };
             let r_f32 = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
-            self.right.extend(r_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+            self.right
+                .extend(r_f32[skip..].iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
         }
     }
 
     fn push_scaled(&mut self, frame: &AudioFrame, volume: f32) {
         let n = frame.samples();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         unsafe {
             let l_bytes = frame.data(0);
             let l_f32 = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
-            self.left.extend(l_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+            self.left
+                .extend(l_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
 
-            let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
+            let r_bytes = if frame.ch_layout().channels() >= 2 {
+                frame.data(1)
+            } else {
+                frame.data(0)
+            };
             let r_f32 = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
-            self.right.extend(r_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
+            self.right
+                .extend(r_f32.iter().map(|s| (s * volume).clamp(-1.0, 1.0)));
         }
     }
 
@@ -990,14 +1106,18 @@ impl AudioFifo {
 
         unsafe {
             let ldata = frame.data_mut(0);
-            let ldst  = std::slice::from_raw_parts_mut(ldata.as_mut_ptr() as *mut f32, n);
+            let ldst = std::slice::from_raw_parts_mut(ldata.as_mut_ptr() as *mut f32, n);
             ldst[..available].copy_from_slice(&self.left[..available]);
-            if available < n { ldst[available..].fill(0.0); }
+            if available < n {
+                ldst[available..].fill(0.0);
+            }
 
             let rdata = frame.data_mut(1);
-            let rdst  = std::slice::from_raw_parts_mut(rdata.as_mut_ptr() as *mut f32, n);
+            let rdst = std::slice::from_raw_parts_mut(rdata.as_mut_ptr() as *mut f32, n);
             rdst[..available].copy_from_slice(&self.right[..available]);
-            if available < n { rdst[available..].fill(0.0); }
+            if available < n {
+                rdst[available..].fill(0.0);
+            }
         }
 
         self.left.drain(..available);
@@ -1009,20 +1129,20 @@ impl AudioFifo {
 // ── Audio encoder state ───────────────────────────────────────────────────────
 
 struct DecodedOverlay {
-    left:         Vec<f32>,
-    right:        Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
     start_sample: i64,
     sample_count: usize,
 }
 
 struct AudioEncState {
-    encoder:        ffmpeg::encoder::Audio,
+    encoder: ffmpeg::encoder::Audio,
     out_sample_idx: i64,
-    frame_size:     usize,
-    fifo:           AudioFifo,
-    audio_tb:       Rational,
-    ost_audio_tb:   Rational,
-    overlays:       Vec<DecodedOverlay>,
+    frame_size: usize,
+    fifo: AudioFifo,
+    audio_tb: Rational,
+    ost_audio_tb: Rational,
+    overlays: Vec<DecodedOverlay>,
     /// Counts FIFO overrun events; used to throttle log spam at 1080p SW encode.
     fifo_overrun_count: u64,
 }
@@ -1030,7 +1150,7 @@ struct AudioEncState {
 impl AudioEncState {
     fn drain_fifo(
         &mut self,
-        octx:  &mut ffmpeg::format::context::Output,
+        octx: &mut ffmpeg::format::context::Output,
         flush: bool,
     ) -> Result<(), String> {
         if !flush && self.fifo.len() > 2 * self.frame_size {
@@ -1039,17 +1159,17 @@ impl AudioEncState {
             // (the encoder is slow; the demuxer keeps feeding audio).  Logging every
             // occurrence floods the terminal with hundreds of identical lines.
             // Print the first event so the developer sees it, then every 500th.
-            if self.fifo_overrun_count == 1 || self.fifo_overrun_count % 500 == 0 {
+            if self.fifo_overrun_count == 1 || self.fifo_overrun_count.is_multiple_of(500) {
                 eprintln!(
                     "[encode] audio FIFO overrun: {} samples buffered (threshold={}); \
                      audio running ahead of video (occurrence #{})",
-                    self.fifo.len(), 2 * self.frame_size, self.fifo_overrun_count,
+                    self.fifo.len(),
+                    2 * self.frame_size,
+                    self.fifo_overrun_count,
                 );
             }
         }
-        while self.fifo.len() >= self.frame_size
-            || (flush && self.fifo.len() > 0)
-        {
+        while self.fifo.len() >= self.frame_size || (flush && self.fifo.len() > 0) {
             let mut frame = self.fifo.pop_frame(self.frame_size, self.out_sample_idx);
 
             if !self.overlays.is_empty() {
@@ -1077,17 +1197,15 @@ impl AudioEncState {
 
             self.out_sample_idx += self.frame_size as i64;
 
-            self.encoder.send_frame(&frame)
+            self.encoder
+                .send_frame(&frame)
                 .map_err(|e| format!("send audio frame to encoder: {e}"))?;
             self.drain_packets(octx)?;
         }
         Ok(())
     }
 
-    fn drain_packets(
-        &mut self,
-        octx: &mut ffmpeg::format::context::Output,
-    ) -> Result<(), String> {
+    fn drain_packets(&mut self, octx: &mut ffmpeg::format::context::Output) -> Result<(), String> {
         let mut pkt = Packet::empty();
         while self.encoder.receive_packet(&mut pkt).is_ok() {
             pkt.set_stream(1);
@@ -1098,11 +1216,9 @@ impl AudioEncState {
         Ok(())
     }
 
-    fn flush_encoder(
-        &mut self,
-        octx: &mut ffmpeg::format::context::Output,
-    ) -> Result<(), String> {
-        self.encoder.send_eof()
+    fn flush_encoder(&mut self, octx: &mut ffmpeg::format::context::Output) -> Result<(), String> {
+        self.encoder
+            .send_eof()
             .map_err(|e| format!("send EOF to audio encoder: {e}"))?;
         self.drain_packets(octx)
     }
@@ -1122,11 +1238,7 @@ impl AudioEncState {
 /// encoder is slow enough that the packet loop's send_packet/receive_frame
 /// interleaving leaves the resampler partially filled at clip_end, and without
 /// this flush those samples are silently discarded.
-fn flush_audio_resampler(
-    resampler: &mut resampling::Context,
-    fifo:      &mut AudioFifo,
-    volume:    f32,
-) {
+fn flush_audio_resampler(resampler: &mut resampling::Context, fifo: &mut AudioFifo, volume: f32) {
     // A null-frame flush: allocate an output frame, call swr_convert with
     // null input, repeat until the resampler reports zero output samples.
     loop {
@@ -1142,12 +1254,14 @@ fn flush_audio_resampler(
         unsafe {
             let n_out = ffmpeg::ffi::swr_convert(
                 resampler.as_mut_ptr(),
-                (*out_frame.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                (*out_frame.as_mut_ptr()).data.as_mut_ptr(),
                 4096,
                 std::ptr::null_mut(), // null input = flush
                 0,
             );
-            if n_out <= 0 { break; }
+            if n_out <= 0 {
+                break;
+            }
             // Manually set the sample count so push_scaled reads the right slice.
             (*out_frame.as_mut_ptr()).nb_samples = n_out;
         }
@@ -1160,12 +1274,12 @@ fn flush_audio_resampler(
 
 fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
+    use ffmpeg::media::Type as MediaType;
     use ffmpeg::software::resampling;
     use ffmpeg::util::channel_layout::ChannelLayout;
     use ffmpeg::util::frame::audio::Audio as AudioFrame;
-    use ffmpeg::media::Type as MediaType;
 
-    let target_fmt    = Sample::F32(SampleType::Planar);
+    let target_fmt = Sample::F32(SampleType::Planar);
     const OUT_RATE: u32 = 44_100;
 
     let mut ictx = open_input(&overlay.path)
@@ -1177,11 +1291,13 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
         .ok_or_else(|| format!("no audio stream in overlay '{}'", overlay.path.display()))?
         .index();
 
-    let ast   = ictx.stream(audio_idx).unwrap();
+    let ast = ictx.stream(audio_idx).unwrap();
     let in_tb = ast.time_base();
     let adec_ctx = ffmpeg::codec::context::Context::from_parameters(ast.parameters())
         .map_err(|e| format!("overlay codec ctx: {e}"))?;
-    let mut adec = adec_ctx.decoder().audio()
+    let mut adec = adec_ctx
+        .decoder()
+        .audio()
         .map_err(|e| format!("overlay audio decoder: {e}"))?;
 
     let seek_ts = {
@@ -1191,21 +1307,24 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     let _ = ictx.seek(seek_ts, ..=seek_ts);
 
     let mut resampler: Option<resampling::Context> = None;
-    let mut left:  Vec<f32> = Vec::new();
+    let mut left: Vec<f32> = Vec::new();
     let mut right: Vec<f32> = Vec::new();
 
     let clip_end = overlay.source_offset + overlay.duration;
 
-    let push_frame = |frame: &AudioFrame,
-                      left:  &mut Vec<f32>,
-                      right: &mut Vec<f32>,
-                      vol:   f32| {
+    let push_frame = |frame: &AudioFrame, left: &mut Vec<f32>, right: &mut Vec<f32>, vol: f32| {
         let n = frame.samples();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         unsafe {
             let l = std::slice::from_raw_parts(frame.data(0).as_ptr() as *const f32, n);
             let channels = frame.ch_layout().channels();
-            let r_plane  = if channels >= 2 { frame.data(1) } else { frame.data(0) };
+            let r_plane = if channels >= 2 {
+                frame.data(1)
+            } else {
+                frame.data(0)
+            };
             let r = std::slice::from_raw_parts(r_plane.as_ptr() as *const f32, n);
             left.extend(l.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
             right.extend(r.iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
@@ -1214,25 +1333,33 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
 
     for result in ictx.packets() {
         let (stream, packet) = match result {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => continue,
         };
-        if stream.index() != audio_idx { continue; }
-        if adec.send_packet(&packet).is_err() { continue; }
+        if stream.index() != audio_idx {
+            continue;
+        }
+        if adec.send_packet(&packet).is_err() {
+            continue;
+        }
 
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
-            let pts_secs = raw.pts()
+            let pts_secs = raw
+                .pts()
                 .map(|p| p as f64 * f64::from(in_tb))
                 .unwrap_or(0.0);
 
-            if pts_secs < overlay.source_offset - 0.05 { continue; }
-            if pts_secs >= clip_end { break; }
+            if pts_secs < overlay.source_offset - 0.05 {
+                continue;
+            }
+            if pts_secs >= clip_end {
+                break;
+            }
 
-            let src_channels  = raw.ch_layout().channels();
-            let needs_resample = raw.format() != target_fmt
-                || raw.rate()             != OUT_RATE
-                || src_channels           != 2;
+            let src_channels = raw.ch_layout().channels();
+            let needs_resample =
+                raw.format() != target_fmt || raw.rate() != OUT_RATE || src_channels != 2;
 
             if needs_resample {
                 let rs = resampler.get_or_insert_with(|| {
@@ -1242,9 +1369,14 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
                         ChannelLayout::MONO
                     };
                     resampling::Context::get2(
-                        raw.format(), src_layout,           raw.rate(),
-                        target_fmt,   ChannelLayout::STEREO, OUT_RATE,
-                    ).expect("overlay resampler")
+                        raw.format(),
+                        src_layout,
+                        raw.rate(),
+                        target_fmt,
+                        ChannelLayout::STEREO,
+                        OUT_RATE,
+                    )
+                    .expect("overlay resampler")
                 });
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
@@ -1260,9 +1392,15 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
                     push_frame(&resampled, &mut left, &mut right, overlay.volume * fg);
                 }
             } else {
-                let fg = fade_gain(pts_secs, overlay.source_offset, overlay.duration,
-                    overlay.fade_in_secs, overlay.fade_in_start_secs,
-                    overlay.fade_out_secs, overlay.fade_out_end_secs);
+                let fg = fade_gain(
+                    pts_secs,
+                    overlay.source_offset,
+                    overlay.duration,
+                    overlay.fade_in_secs,
+                    overlay.fade_in_start_secs,
+                    overlay.fade_out_secs,
+                    overlay.fade_out_end_secs,
+                );
                 push_frame(&raw, &mut left, &mut right, overlay.volume * fg);
             }
         }
@@ -1271,15 +1409,17 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     let _ = adec.send_eof();
     let mut raw = AudioFrame::empty();
     while adec.receive_frame(&mut raw).is_ok() {
-        let pts_secs = raw.pts()
+        let pts_secs = raw
+            .pts()
             .map(|p| p as f64 * f64::from(in_tb))
             .unwrap_or(0.0);
-        if pts_secs >= clip_end { break; }
+        if pts_secs >= clip_end {
+            break;
+        }
 
-        let src_channels  = raw.ch_layout().channels();
-        let needs_resample = raw.format() != target_fmt
-            || raw.rate()             != OUT_RATE
-            || src_channels           != 2;
+        let src_channels = raw.ch_layout().channels();
+        let needs_resample =
+            raw.format() != target_fmt || raw.rate() != OUT_RATE || src_channels != 2;
 
         if needs_resample {
             if let Some(rs) = &mut resampler {
@@ -1298,9 +1438,15 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
                 }
             }
         } else {
-            let fg = fade_gain(pts_secs, overlay.source_offset, overlay.duration,
-                overlay.fade_in_secs, overlay.fade_in_start_secs,
-                overlay.fade_out_secs, overlay.fade_out_end_secs);
+            let fg = fade_gain(
+                pts_secs,
+                overlay.source_offset,
+                overlay.duration,
+                overlay.fade_in_secs,
+                overlay.fade_in_start_secs,
+                overlay.fade_out_secs,
+                overlay.fade_out_end_secs,
+            );
             push_frame(&raw, &mut left, &mut right, overlay.volume * fg);
         }
     }
@@ -1313,17 +1459,22 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     if let Some(ref mut rs) = resampler {
         loop {
             let mut tmp = AudioFrame::new(
-                Sample::F32(SampleType::Planar), 4096, ChannelLayoutMask::STEREO,
+                Sample::F32(SampleType::Planar),
+                4096,
+                ChannelLayoutMask::STEREO,
             );
             tmp.set_rate(OUT_RATE);
             unsafe {
                 let n_out = ffmpeg::ffi::swr_convert(
                     rs.as_mut_ptr(),
-                    (*tmp.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                    (*tmp.as_mut_ptr()).data.as_mut_ptr(),
                     4096,
-                    std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(),
+                    0,
                 );
-                if n_out <= 0 { break; }
+                if n_out <= 0 {
+                    break;
+                }
                 (*tmp.as_mut_ptr()).nb_samples = n_out;
             }
             push_frame(&tmp, &mut left, &mut right, overlay.volume);
@@ -1331,11 +1482,14 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
     }
 
     if left.is_empty() {
-        return Err(format!("overlay '{}': no audio decoded", overlay.path.display()));
+        return Err(format!(
+            "overlay '{}': no audio decoded",
+            overlay.path.display()
+        ));
     }
 
-    let sample_count  = left.len();
-    let start_sample  = (overlay.timeline_start * OUT_RATE as f64).round() as i64;
+    let sample_count = left.len();
+    let start_sample = (overlay.timeline_start * OUT_RATE as f64).round() as i64;
 
     eprintln!(
         "[encode] overlay decoded: {} samples ({:.2}s) start_sample={} ← {}",
@@ -1345,16 +1499,21 @@ fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, String> {
         overlay.path.display(),
     );
 
-    Ok(DecodedOverlay { left, right, start_sample, sample_count })
+    Ok(DecodedOverlay {
+        left,
+        right,
+        start_sample,
+        sample_count,
+    })
 }
 
 // ── Internal implementation ───────────────────────────────────────────────────
 
 fn run_encode(
-    spec:         &EncodeSpec,
-    cancel:       Arc<AtomicBool>,
+    spec: &EncodeSpec,
+    cancel: Arc<AtomicBool>,
     total_frames: u64,
-    tx:           &Sender<MediaResult>,
+    tx: &Sender<MediaResult>,
 ) -> Result<(), String> {
     if spec.clips.is_empty() {
         return Err("nothing to encode: timeline is empty".into());
@@ -1365,17 +1524,18 @@ fn run_encode(
         .map_err(|e| format!("could not open output '{}': {e}", spec.output.display()))?;
 
     // ── Video encoder (stream 0) ──────────────────────────────────────────────
-    let out_tb   = Rational::new(1, spec.fps as i32);
+    let out_tb = Rational::new(1, spec.fps as i32);
     let frame_tb = Rational::new(1, spec.fps as i32);
 
     // Determine which codec we'll be registering for the stream.  HW encoders
     // expose themselves under their own codec ID (hevc_nvenc, h264_nvenc, etc.)
     // but we always want stream 0 to carry H.264, so use the H264 codec ID for
     // the output stream regardless of which actual encoder won.
-    let h264_for_stream = encoder::find(CodecId::H264)
-        .ok_or_else(|| "H.264 codec not registered".to_string())?;
+    let h264_for_stream =
+        encoder::find(CodecId::H264).ok_or_else(|| "H.264 codec not registered".to_string())?;
 
-    let mut ost_video = octx.add_stream(h264_for_stream)
+    let mut ost_video = octx
+        .add_stream(h264_for_stream)
         .map_err(|e| format!("add video stream: {e}"))?;
     ost_video.set_time_base(out_tb);
 
@@ -1388,13 +1548,12 @@ fn run_encode(
 
     // For HW backends we need the hw_frames_ctx pointer to upload frames later.
     // It lives inside the opened encoder's AVCodecContext.
-    let hw_frames_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef = if hw_backend != HwBackend::Software
-        && hw_backend != HwBackend::VideoToolbox
-    {
-        unsafe { (*video_encoder.as_ptr()).hw_frames_ctx }
-    } else {
-        std::ptr::null_mut()
-    };
+    let hw_frames_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef =
+        if hw_backend != HwBackend::Software && hw_backend != HwBackend::VideoToolbox {
+            unsafe { (*video_encoder.as_ptr()).hw_frames_ctx }
+        } else {
+            std::ptr::null_mut()
+        };
 
     // Force square pixels — same as the original code path.
     video_encoder.set_aspect_ratio(Rational::new(1, 1));
@@ -1405,22 +1564,26 @@ fn run_encode(
             video_encoder.as_ptr() as *mut ffmpeg::ffi::AVCodecContext,
         );
         if ret < 0 {
-            return Err(format!("avcodec_parameters_from_context (video) failed: {ret}"));
+            return Err(format!(
+                "avcodec_parameters_from_context (video) failed: {ret}"
+            ));
         }
     }
 
     // ── Audio encoder (stream 1) ──────────────────────────────────────────────
     let audio_tb = Rational::new(1, AUDIO_RATE);
 
-    let aac = encoder::find(CodecId::AAC)
-        .ok_or_else(|| "AAC encoder not found".to_string())?;
+    let aac = encoder::find(CodecId::AAC).ok_or_else(|| "AAC encoder not found".to_string())?;
 
-    let mut ost_audio = octx.add_stream(aac)
+    let mut ost_audio = octx
+        .add_stream(aac)
         .map_err(|e| format!("add audio stream: {e}"))?;
     ost_audio.set_time_base(audio_tb);
 
     let audio_enc_ctx = codec::context::Context::new_with_codec(aac);
-    let mut audio_enc = audio_enc_ctx.encoder().audio()
+    let mut audio_enc = audio_enc_ctx
+        .encoder()
+        .audio()
         .map_err(|e| format!("create audio encoder context: {e}"))?;
 
     audio_enc.set_rate(AUDIO_RATE);
@@ -1428,11 +1591,16 @@ fn run_encode(
     audio_enc.set_format(Sample::F32(SampleType::Planar));
     audio_enc.set_bit_rate(128_000);
 
-    if octx.format().flags().contains(ffmpeg::format::Flags::GLOBAL_HEADER) {
+    if octx
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER)
+    {
         audio_enc.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
     }
 
-    let audio_encoder = audio_enc.open_as_with(aac, ffmpeg::Dictionary::new())
+    let audio_encoder = audio_enc
+        .open_as_with(aac, ffmpeg::Dictionary::new())
         .map_err(|e| format!("open AAC encoder: {e}"))?;
 
     let audio_frame_size = (audio_encoder.frame_size() as usize).max(1024);
@@ -1443,7 +1611,9 @@ fn run_encode(
             audio_encoder.as_ptr() as *mut ffmpeg::ffi::AVCodecContext,
         );
         if ret < 0 {
-            return Err(format!("avcodec_parameters_from_context (audio) failed: {ret}"));
+            return Err(format!(
+                "avcodec_parameters_from_context (audio) failed: {ret}"
+            ));
         }
     }
 
@@ -1455,15 +1625,17 @@ fn run_encode(
     let ost_audio_tb = octx.stream(1).unwrap().time_base();
 
     let mut audio_state = AudioEncState {
-        encoder:        audio_encoder,
+        encoder: audio_encoder,
         out_sample_idx: 0,
-        frame_size:     audio_frame_size,
-        fifo:           AudioFifo::new(),
+        frame_size: audio_frame_size,
+        fifo: AudioFifo::new(),
         audio_tb,
         ost_audio_tb,
-        overlays: spec.audio_overlays.iter()
+        overlays: spec
+            .audio_overlays
+            .iter()
             .filter_map(|ov| match decode_overlay(ov) {
-                Ok(d)  => Some(d),
+                Ok(d) => Some(d),
                 Err(e) => {
                     eprintln!("[encode] overlay decode failed: {e}");
                     // Surface to the UI — a silent drop here means the render
@@ -1494,7 +1666,8 @@ fn run_encode(
         incoming_skip_secs = 0.0;
 
         let transition_entry = if clip_idx + 1 < spec.clips.len() {
-            spec.transitions.iter()
+            spec.transitions
+                .iter()
                 .find(|t| t.after_clip_index == clip_idx)
                 .filter(|t| t.kind.kind != TransitionKind::Cut)
         } else {
@@ -1506,15 +1679,15 @@ fn run_encode(
             .unwrap_or(0.0);
 
         let effective = ClipSpec {
-            path:          clip.path.clone(),
+            path: clip.path.clone(),
             source_offset: clip.source_offset + skip,
-            duration:      (clip.duration - skip - transition_secs).max(0.0),
-            volume:        clip.volume,
-            skip_audio:    clip.skip_audio,
-            fade_in_secs:       clip.fade_in_secs,
+            duration: (clip.duration - skip - transition_secs).max(0.0),
+            volume: clip.volume,
+            skip_audio: clip.skip_audio,
+            fade_in_secs: clip.fade_in_secs,
             fade_in_start_secs: clip.fade_in_start_secs,
-            fade_out_secs:      clip.fade_out_secs,
-            fade_out_end_secs:  clip.fade_out_end_secs,
+            fade_out_secs: clip.fade_out_secs,
+            fade_out_end_secs: clip.fade_out_end_secs,
             filter: clip.filter.clone(),
         };
 
@@ -1538,28 +1711,28 @@ fn run_encode(
             let next_clip = &spec.clips[clip_idx + 1];
 
             let tail_spec = ClipSpec {
-                path:          clip.path.clone(),
+                path: clip.path.clone(),
                 source_offset: effective.source_offset + effective.duration,
-                duration:      transition_secs,
-                volume:        clip.volume,
-                skip_audio:    false,
-                fade_in_secs:       0.0,
+                duration: transition_secs,
+                volume: clip.volume,
+                skip_audio: false,
+                fade_in_secs: 0.0,
                 fade_in_start_secs: 0.0,
-                fade_out_secs:      0.0,
-                fade_out_end_secs:  0.0,
-                filter: clip.filter.clone(),   // inherit the outgoing clip's filter
+                fade_out_secs: 0.0,
+                fade_out_end_secs: 0.0,
+                filter: clip.filter.clone(), // inherit the outgoing clip's filter
             };
             let head_spec = ClipSpec {
-                path:          next_clip.path.clone(),
+                path: next_clip.path.clone(),
                 source_offset: next_clip.source_offset,
-                duration:      transition_secs,
-                volume:        next_clip.volume,
-                skip_audio:    false,
-                fade_in_secs:       0.0,
+                duration: transition_secs,
+                volume: next_clip.volume,
+                skip_audio: false,
+                fade_in_secs: 0.0,
                 fade_in_start_secs: 0.0,
-                fade_out_secs:      0.0,
-                fade_out_end_secs:  0.0,
-                filter: next_clip.filter.clone(),   // inherit the incoming clip's filter
+                fade_out_secs: 0.0,
+                fade_out_end_secs: 0.0,
+                filter: next_clip.filter.clone(), // inherit the incoming clip's filter
             };
 
             if let Some(transition_impl) = transition_registry.get(&entry.kind.kind) {
@@ -1598,8 +1771,10 @@ fn run_encode(
     // video ends.  The FIFO is silence-padded each frame so drain_fifo mixes
     // the overlay in normally.
     {
-        let video_end_sample = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-        let overlay_end_sample = audio_state.overlays.iter()
+        let video_end_sample = output_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+        let overlay_end_sample = audio_state
+            .overlays
+            .iter()
             .map(|ov| ov.start_sample + ov.sample_count as i64)
             .max()
             .unwrap_or(0);
@@ -1607,9 +1782,8 @@ fn run_encode(
         if overlay_end_sample > video_end_sample {
             let extra_samples = overlay_end_sample - video_end_sample;
             // Round up so the last partial AAC frame is always included.
-            let extra_frames = ((extra_samples as f64 * spec.fps as f64 / AUDIO_RATE as f64)
-                .ceil() as i64)
-                .max(0);
+            let extra_frames =
+                ((extra_samples as f64 * spec.fps as f64 / AUDIO_RATE as f64).ceil() as i64).max(0);
 
             eprintln!(
                 "[encode] overlay tail: {:.3}s past video end — appending {} blank frame(s)",
@@ -1624,7 +1798,7 @@ fn run_encode(
             let mut blank = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
             unsafe {
                 let ptr = blank.as_mut_ptr();
-                let y_stride  = (*ptr).linesize[0] as usize;
+                let y_stride = (*ptr).linesize[0] as usize;
                 let uv_stride = (*ptr).linesize[1] as usize;
                 for row in 0..spec.height as usize {
                     let p = (*ptr).data[0].add(row * y_stride);
@@ -1654,14 +1828,16 @@ fn run_encode(
                     let raw_dts = pkt.dts().unwrap_or(0);
                     if last_video_dts != i64::MIN {
                         let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
-                        let dts_s  = raw_dts          as f64 * f64::from(ost_video_tb);
+                        let dts_s = raw_dts as f64 * f64::from(ost_video_tb);
                         if dts_s < prev_s {
                             let clamped = last_video_dts + 1;
                             eprintln!(
                                 "[encode] blank-frame non-monotonic DTS \
                                  ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
                             );
-                            unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                            unsafe {
+                                (*pkt.as_mut_ptr()).dts = clamped;
+                            }
                         }
                     }
                     last_video_dts = pkt.dts().unwrap_or(raw_dts);
@@ -1681,20 +1857,26 @@ fn run_encode(
                 std::thread::yield_now();
 
                 // Pad silence into the FIFO so drain_fifo can mix the overlay tail.
-                let expected = output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-                let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
-                let gap      = (expected - have).max(0) as usize;
+                let expected = output_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+                let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                let gap = (expected - have).max(0) as usize;
                 if gap > 0 {
-                    audio_state.fifo.left .extend(std::iter::repeat(0.0f32).take(gap));
-                    audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                    audio_state
+                        .fifo
+                        .left
+                        .extend(std::iter::repeat_n(0.0f32, gap));
+                    audio_state
+                        .fifo
+                        .right
+                        .extend(std::iter::repeat_n(0.0f32, gap));
                 }
 
                 audio_state.drain_fifo(&mut octx, false)?;
 
-                if output_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+                if (output_frame_idx as u64).is_multiple_of(PROGRESS_INTERVAL) {
                     let _ = tx.send(MediaResult::EncodeProgress {
-                        job_id:       spec.job_id,
-                        frame:        output_frame_idx as u64,
+                        job_id: spec.job_id,
+                        frame: output_frame_idx as u64,
                         total_frames,
                     });
                 }
@@ -1703,7 +1885,8 @@ fn run_encode(
     }
 
     // ── Flush video encoder ───────────────────────────────────────────────────
-    video_encoder.send_eof()
+    video_encoder
+        .send_eof()
         .map_err(|e| format!("send EOF to video encoder: {e}"))?;
 
     let ost_video_tb = octx.stream(0).unwrap().time_base();
@@ -1715,14 +1898,16 @@ fn run_encode(
         let raw_dts = pkt.dts().unwrap_or(0);
         if last_video_dts != i64::MIN {
             let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
-            let dts_s  = raw_dts       as f64 * f64::from(ost_video_tb);
+            let dts_s = raw_dts as f64 * f64::from(ost_video_tb);
             if dts_s < prev_s {
                 let clamped = last_video_dts + 1;
                 eprintln!(
                     "[encode] encoder-flush non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
                      clamping {raw_dts} → {clamped}"
                 );
-                unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                unsafe {
+                    (*pkt.as_mut_ptr()).dts = clamped;
+                }
             }
         }
         last_video_dts = pkt.dts().unwrap_or(raw_dts);
@@ -1742,10 +1927,8 @@ fn run_encode(
     // is a sub-frame rounding artifact (< frame_size samples) that is safe to
     // trim or flush.
     {
-        let target_audio_samples =
-            output_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-        let total_audio =
-            audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+        let target_audio_samples = output_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+        let total_audio = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
         let excess = (total_audio - target_audio_samples).max(0) as usize;
         if excess > 0 {
             eprintln!(
@@ -1794,10 +1977,10 @@ fn run_encode(
 /// This helper centralises the upload logic so encode_clip and apply_transition
 /// both call a single function rather than duplicating the unsafe block.
 fn send_video_frame(
-    yuv:              &VideoFrame,
-    video_encoder:    &mut ffmpeg::encoder::Video,
-    hw_frames_ctx:    *mut ffmpeg::ffi::AVBufferRef,
-    hw_backend:       HwBackend,
+    yuv: &VideoFrame,
+    video_encoder: &mut ffmpeg::encoder::Video,
+    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend: HwBackend,
 ) -> Result<(), String> {
     if !hw_frames_ctx.is_null()
         && hw_backend != HwBackend::Software
@@ -1806,17 +1989,21 @@ fn send_video_frame(
         // CUDA / VAAPI / AMF: upload SW frame to HW surface before encoding.
         let hw_frame = unsafe { upload_frame_to_hw(yuv, hw_frames_ctx) }
             .map_err(|e| format!("HW frame upload: {e}"))?;
-        video_encoder.send_frame(&hw_frame)
+        video_encoder
+            .send_frame(&hw_frame)
             .map_err(|e| format!("send HW video frame to encoder: {e}"))
     } else {
         // Software or VideoToolbox: pass frame directly.
-        video_encoder.send_frame(yuv)
+        video_encoder
+            .send_frame(yuv)
             .map_err(|e| format!("send video frame to encoder: {e}"))
     }
 }
 
 fn apply_filter_to_yuv_frame(yuv: &mut VideoFrame, filter: &FilterParams, w: u32, h: u32) {
-    if filter.is_identity() { return; }
+    if filter.is_identity() {
+        return;
+    }
     unsafe {
         let ptr = yuv.as_mut_ptr();
         let y_size = (w * h) as usize;
@@ -1834,42 +2021,55 @@ fn apply_filter_to_yuv_frame(yuv: &mut VideoFrame, filter: &FilterParams, w: u32
 /// Fade-out: sqrt-ramp over `fade_out_secs`, then silence for `fade_out_end_secs`.
 #[inline]
 fn fade_gain(
-    pts_secs:           f64,
-    source_offset:      f64,
-    duration:           f64,
-    fade_in_secs:       f32,
+    pts_secs: f64,
+    source_offset: f64,
+    duration: f64,
+    fade_in_secs: f32,
     fade_in_start_secs: f32,
-    fade_out_secs:      f32,
-    fade_out_end_secs:  f32,
+    fade_out_secs: f32,
+    fade_out_end_secs: f32,
 ) -> f32 {
     let elapsed = (pts_secs - source_offset).max(0.0) as f32;
-    let remain  = (duration as f32 - elapsed).max(0.0);
-    let in_gain = if elapsed < fade_in_start_secs { 0.0 }
-        else if fade_in_secs > 0.0 { ((elapsed - fade_in_start_secs) / fade_in_secs).clamp(0.0, 1.0).sqrt() }
-        else { 1.0 };
-    let out_gain = if remain < fade_out_end_secs { 0.0 }
-        else if fade_out_secs > 0.0 { ((remain - fade_out_end_secs) / fade_out_secs).clamp(0.0, 1.0).sqrt() }
-        else { 1.0 };
+    let remain = (duration as f32 - elapsed).max(0.0);
+    let in_gain = if elapsed < fade_in_start_secs {
+        0.0
+    } else if fade_in_secs > 0.0 {
+        ((elapsed - fade_in_start_secs) / fade_in_secs)
+            .clamp(0.0, 1.0)
+            .sqrt()
+    } else {
+        1.0
+    };
+    let out_gain = if remain < fade_out_end_secs {
+        0.0
+    } else if fade_out_secs > 0.0 {
+        ((remain - fade_out_end_secs) / fade_out_secs)
+            .clamp(0.0, 1.0)
+            .sqrt()
+    } else {
+        1.0
+    };
     in_gain.min(out_gain)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_clip(
-    clip:               &ClipSpec,
-    spec:               &EncodeSpec,
-    octx:               &mut ffmpeg::format::context::Output,
-    video_encoder:      &mut ffmpeg::encoder::Video,
-    hw_frames_ctx:      *mut ffmpeg::ffi::AVBufferRef,
-    hw_backend:         HwBackend,
-    audio_state:        &mut AudioEncState,
-    mut out_frame_idx:  i64,
-    total_frames:       u64,
-    frame_tb:           Rational,
-    cancel:             &Arc<AtomicBool>,
-    tx:                 &Sender<MediaResult>,
-    last_video_dts:     &mut i64,
+    clip: &ClipSpec,
+    spec: &EncodeSpec,
+    octx: &mut ffmpeg::format::context::Output,
+    video_encoder: &mut ffmpeg::encoder::Video,
+    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend: HwBackend,
+    audio_state: &mut AudioEncState,
+    mut out_frame_idx: i64,
+    total_frames: u64,
+    frame_tb: Rational,
+    cancel: &Arc<AtomicBool>,
+    tx: &Sender<MediaResult>,
+    last_video_dts: &mut i64,
 ) -> Result<i64, String> {
-    let mut ictx = open_input(&clip.path)
-        .map_err(|e| format!("open '{}': {e}", clip.path.display()))?;
+    let mut ictx =
+        open_input(&clip.path).map_err(|e| format!("open '{}': {e}", clip.path.display()))?;
 
     let video_stream_idx = ictx
         .streams()
@@ -1877,18 +2077,18 @@ fn encode_clip(
         .ok_or_else(|| format!("no video stream in '{}'", clip.path.display()))?
         .index();
 
-    let audio_stream_idx: Option<usize> = ictx
-        .streams()
-        .best(MediaType::Audio)
-        .map(|s| s.index());
+    let audio_stream_idx: Option<usize> = ictx.streams().best(MediaType::Audio).map(|s| s.index());
 
     let in_video_tb = ictx.stream(video_stream_idx).unwrap().time_base();
 
     let vdec_ctx = codec::context::Context::from_parameters(
         ictx.stream(video_stream_idx).unwrap().parameters(),
-    ).map_err(|e| format!("video decoder context: {e}"))?;
+    )
+    .map_err(|e| format!("video decoder context: {e}"))?;
 
-    let mut video_decoder = vdec_ctx.decoder().video()
+    let mut video_decoder = vdec_ctx
+        .decoder()
+        .video()
         .map_err(|e| format!("open video decoder: {e}"))?;
 
     let mut audio_decoder: Option<ffmpeg::decoder::audio::Audio> = None;
@@ -1900,10 +2100,22 @@ fn encode_clip(
             in_audio_tb = ast.time_base();
             match codec::context::Context::from_parameters(ast.parameters()) {
                 Ok(ctx) => match ctx.decoder().audio() {
-                    Ok(dec) => { audio_decoder = Some(dec); }
-                    Err(e)  => { eprintln!("[encode] audio decoder open failed for '{}': {e}", clip.path.display()); }
+                    Ok(dec) => {
+                        audio_decoder = Some(dec);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[encode] audio decoder open failed for '{}': {e}",
+                            clip.path.display()
+                        );
+                    }
                 },
-                Err(e) => { eprintln!("[encode] audio decoder params failed for '{}': {e}", clip.path.display()); }
+                Err(e) => {
+                    eprintln!(
+                        "[encode] audio decoder params failed for '{}': {e}",
+                        clip.path.display()
+                    );
+                }
             }
         } else {
             eprintln!(
@@ -1919,20 +2131,24 @@ fn encode_clip(
         let params = stream.parameters();
         let w = params.width() as u32;
         let h = params.height() as u32;
-        if w > 0 && h > 0 { (w, h) } else { (video_decoder.width(), video_decoder.height()) }
+        if w > 0 && h > 0 {
+            (w, h)
+        } else {
+            (video_decoder.width(), video_decoder.height())
+        }
     };
 
     seek_to_secs(&mut ictx, clip.source_offset, "encode_clip");
 
-    let mut video_scaler:    Option<CropScaler>          = None;
+    let mut video_scaler: Option<CropScaler> = None;
     let mut audio_resampler: Option<resampling::Context> = None;
 
-    let clip_end   = clip.source_offset + clip.duration;
-    let ost_tb     = octx.stream(0).unwrap().time_base();
+    let clip_end = clip.source_offset + clip.duration;
+    let ost_tb = octx.stream(0).unwrap().time_base();
     let half_frame = 0.5 / spec.fps as f64;
 
     let clip_start_frame_idx = out_frame_idx;
-    let mut video_clip_done  = false;
+    let mut video_clip_done = false;
     // True once the first real audio frame has been pushed to the FIFO.
     // Used to gate the silence gap padding: before audio starts we must NOT
     // pre-fill zeros, because real audio samples are arriving in the very next
@@ -1946,8 +2162,8 @@ fn encode_clip(
     let mut audio_has_started = false;
 
     for result in ictx.packets() {
-        let (stream, packet) = result
-            .map_err(|e| format!("read packet from '{}': {e}", clip.path.display()))?;
+        let (stream, packet) =
+            result.map_err(|e| format!("read packet from '{}': {e}", clip.path.display()))?;
 
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -1957,7 +2173,8 @@ fn encode_clip(
 
         // ── Video packet ──────────────────────────────────────────────────────
         if sidx == video_stream_idx {
-            video_decoder.send_packet(&packet)
+            video_decoder
+                .send_packet(&packet)
                 .map_err(|e| format!("send video packet to decoder: {e}"))?;
 
             if video_clip_done {
@@ -1968,11 +2185,14 @@ fn encode_clip(
 
             let mut decoded = VideoFrame::empty();
             while video_decoder.receive_frame(&mut decoded).is_ok() {
-                let frame_pts_secs = decoded.pts()
+                let frame_pts_secs = decoded
+                    .pts()
                     .map(|pts| pts as f64 * f64::from(in_video_tb))
                     .unwrap_or(0.0);
 
-                if frame_pts_secs < clip.source_offset - half_frame { continue; }
+                if frame_pts_secs < clip.source_offset - half_frame {
+                    continue;
+                }
 
                 if frame_pts_secs >= clip_end {
                     video_clip_done = true;
@@ -1981,8 +2201,11 @@ fn encode_clip(
 
                 let sc = video_scaler.get_or_insert_with(|| {
                     CropScaler::build(
-                        decoded.format(), src_display_w, src_display_h,
-                        spec.width, spec.height,
+                        decoded.format(),
+                        src_display_w,
+                        src_display_h,
+                        spec.width,
+                        spec.height,
                     )
                 });
 
@@ -1996,8 +2219,8 @@ fn encode_clip(
                 }
 
                 let src_rel_secs = (frame_pts_secs - clip.source_offset).max(0.0);
-                let target_out_pts = clip_start_frame_idx
-                    + (src_rel_secs * spec.fps as f64).round() as i64;
+                let target_out_pts =
+                    clip_start_frame_idx + (src_rel_secs * spec.fps as f64).round() as i64;
 
                 if target_out_pts >= out_frame_idx {
                     loop {
@@ -2012,14 +2235,16 @@ fn encode_clip(
                             let raw_dts = pkt.dts().unwrap_or(0);
                             if *last_video_dts != i64::MIN {
                                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
-                                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
+                                let dts_s = raw_dts as f64 * f64::from(ost_tb);
                                 if dts_s < prev_s {
                                     let clamped = *last_video_dts + 1;
                                     eprintln!(
                                         "[encode] non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
                                          clamping {raw_dts} → {clamped}"
                                     );
-                                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                                    unsafe {
+                                        (*pkt.as_mut_ptr()).dts = clamped;
+                                    }
                                 }
                             }
                             *last_video_dts = pkt.dts().unwrap_or(raw_dts);
@@ -2051,51 +2276,65 @@ fn encode_clip(
                         // clip. Real audio arrives in the very next demux packet,
                         // so no padding is needed — it will fill the gap itself.
                         if audio_decoder.is_none() || audio_has_started {
-                            let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-                            let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
-                            let gap      = (expected - have).max(0) as usize;
+                            let expected = out_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+                            let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                            let gap = (expected - have).max(0) as usize;
                             if gap > 0 {
-                                audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
-                                audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                                audio_state
+                                    .fifo
+                                    .left
+                                    .extend(std::iter::repeat_n(0.0f32, gap));
+                                audio_state
+                                    .fifo
+                                    .right
+                                    .extend(std::iter::repeat_n(0.0f32, gap));
                             }
                         }
 
-                        if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+                        if (out_frame_idx as u64).is_multiple_of(PROGRESS_INTERVAL) {
                             let _ = tx.send(MediaResult::EncodeProgress {
-                                job_id:       spec.job_id,
-                                frame:        out_frame_idx as u64,
+                                job_id: spec.job_id,
+                                frame: out_frame_idx as u64,
                                 total_frames,
                             });
                         }
 
-                        if out_frame_idx > target_out_pts { break; }
+                        if out_frame_idx > target_out_pts {
+                            break;
+                        }
                     }
                 }
             }
         }
-
         // ── Audio packet ──────────────────────────────────────────────────────
         else if Some(sidx) == audio_stream_idx {
             if let Some(ref mut adec) = audio_decoder {
-                if adec.send_packet(&packet).is_err() { continue; }
+                if adec.send_packet(&packet).is_err() {
+                    continue;
+                }
 
                 let mut raw = AudioFrame::empty();
                 while adec.receive_frame(&mut raw).is_ok() {
-                    let pts_secs = raw.pts()
+                    let pts_secs = raw
+                        .pts()
                         .map(|pts| pts as f64 * f64::from(in_audio_tb))
                         .unwrap_or(0.0);
 
-                    if pts_secs < clip.source_offset - 0.05 { continue; }
-                    if pts_secs >= clip_end { continue; }
+                    if pts_secs < clip.source_offset - 0.05 {
+                        continue;
+                    }
+                    if pts_secs >= clip_end {
+                        continue;
+                    }
 
-                    let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
-                        * AUDIO_RATE as f64).round() as usize;
+                    let pre_roll = ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64)
+                        .round() as usize;
 
                     let target_fmt = Sample::F32(SampleType::Planar);
                     let raw_channels = raw.ch_layout().channels();
-                    let needs_resample = raw.format()  != target_fmt
-                        || raw.rate()                  != AUDIO_RATE as u32
-                        || raw_channels                != 2;
+                    let needs_resample = raw.format() != target_fmt
+                        || raw.rate() != AUDIO_RATE as u32
+                        || raw_channels != 2;
 
                     if needs_resample {
                         let rs = audio_resampler.get_or_insert_with(|| {
@@ -2105,20 +2344,47 @@ fn encode_clip(
                                 ChannelLayout::MONO
                             };
                             resampling::Context::get2(
-                                raw.format(), src_layout,            raw.rate(),
-                                target_fmt,   ChannelLayout::STEREO, AUDIO_RATE as u32,
-                            ).expect("create audio resampler")
+                                raw.format(),
+                                src_layout,
+                                raw.rate(),
+                                target_fmt,
+                                ChannelLayout::STEREO,
+                                AUDIO_RATE as u32,
+                            )
+                            .expect("create audio resampler")
                         });
 
                         let mut resampled = AudioFrame::empty();
                         if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                            let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
-                            audio_state.fifo.push_scaled_from(&resampled, clip.volume * fg, pre_roll);
+                            let fg = fade_gain(
+                                pts_secs,
+                                clip.source_offset,
+                                clip.duration,
+                                clip.fade_in_secs,
+                                clip.fade_in_start_secs,
+                                clip.fade_out_secs,
+                                clip.fade_out_end_secs,
+                            );
+                            audio_state.fifo.push_scaled_from(
+                                &resampled,
+                                clip.volume * fg,
+                                pre_roll,
+                            );
                             audio_has_started = true;
                         }
                     } else {
-                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
-                        audio_state.fifo.push_scaled_from(&raw, clip.volume * fg, pre_roll);
+                        let fg = fade_gain(
+                            pts_secs,
+                            clip.source_offset,
+                            clip.duration,
+                            clip.fade_in_secs,
+                            clip.fade_in_start_secs,
+                            clip.fade_out_secs,
+                            clip.fade_out_end_secs,
+                        );
+                        audio_state
+                            .fifo
+                            .push_scaled_from(&raw, clip.volume * fg, pre_roll);
                         audio_has_started = true;
                     }
                     // Do NOT drain here — draining after every audio frame causes
@@ -2140,14 +2406,18 @@ fn encode_clip(
     }
 
     // ── Drain video decoder at clip end ───────────────────────────────────────
-    video_decoder.send_eof()
+    video_decoder
+        .send_eof()
         .map_err(|e| format!("send EOF to video decoder '{}': {e}", clip.path.display()))?;
     let mut decoded = VideoFrame::empty();
     while video_decoder.receive_frame(&mut decoded).is_ok() {
-        let pts_secs = decoded.pts()
+        let pts_secs = decoded
+            .pts()
             .map(|pts| pts as f64 * f64::from(in_video_tb))
             .unwrap_or(0.0);
-        if pts_secs >= clip_end { break; }
+        if pts_secs >= clip_end {
+            break;
+        }
 
         if let Some(sc) = &mut video_scaler {
             let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
@@ -2158,8 +2428,8 @@ fn encode_clip(
                         ffmpeg::ffi::AVRational { num: 1, den: 1 };
                 }
                 let src_rel_secs = (pts_secs - clip.source_offset).max(0.0);
-                let target_out_pts = clip_start_frame_idx
-                    + (src_rel_secs * spec.fps as f64).round() as i64;
+                let target_out_pts =
+                    clip_start_frame_idx + (src_rel_secs * spec.fps as f64).round() as i64;
                 if target_out_pts >= out_frame_idx {
                     loop {
                         yuv.set_pts(Some(out_frame_idx));
@@ -2171,14 +2441,16 @@ fn encode_clip(
                             let raw_dts = pkt.dts().unwrap_or(0);
                             if *last_video_dts != i64::MIN {
                                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
-                                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
+                                let dts_s = raw_dts as f64 * f64::from(ost_tb);
                                 if dts_s < prev_s {
                                     let clamped = *last_video_dts + 1;
                                     eprintln!(
                                         "[encode] decoder-flush non-monotonic DTS \
                                          ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
                                     );
-                                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                                    unsafe {
+                                        (*pkt.as_mut_ptr()).dts = clamped;
+                                    }
                                 }
                             }
                             *last_video_dts = pkt.dts().unwrap_or(raw_dts);
@@ -2192,15 +2464,23 @@ fn encode_clip(
                         std::thread::yield_now();
                         // Same silence-padding logic as the main packet loop.
                         if audio_decoder.is_none() || audio_has_started {
-                            let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-                            let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
-                            let gap      = (expected - have).max(0) as usize;
+                            let expected = out_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+                            let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+                            let gap = (expected - have).max(0) as usize;
                             if gap > 0 {
-                                audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
-                                audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+                                audio_state
+                                    .fifo
+                                    .left
+                                    .extend(std::iter::repeat_n(0.0f32, gap));
+                                audio_state
+                                    .fifo
+                                    .right
+                                    .extend(std::iter::repeat_n(0.0f32, gap));
                             }
                         }
-                        if out_frame_idx > target_out_pts { break; }
+                        if out_frame_idx > target_out_pts {
+                            break;
+                        }
                     }
                 }
             }
@@ -2212,31 +2492,53 @@ fn encode_clip(
         let _ = adec.send_eof();
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
-            let pts_secs = raw.pts()
+            let pts_secs = raw
+                .pts()
                 .map(|pts| pts as f64 * f64::from(in_audio_tb))
                 .unwrap_or(0.0);
-            if pts_secs >= clip_end { break; }
+            if pts_secs >= clip_end {
+                break;
+            }
 
-            let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
-                * AUDIO_RATE as f64).round() as usize;
+            let pre_roll =
+                ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64).round() as usize;
 
             let target_fmt = Sample::F32(SampleType::Planar);
             let raw_channels = raw.ch_layout().channels();
-            let needs_resample = raw.format()  != target_fmt
-                || raw.rate()                  != AUDIO_RATE as u32
-                || raw_channels                != 2;
+            let needs_resample =
+                raw.format() != target_fmt || raw.rate() != AUDIO_RATE as u32 || raw_channels != 2;
 
             if needs_resample {
                 if let Some(rs) = &mut audio_resampler {
                     let mut resampled = AudioFrame::empty();
                     if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
-                        let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
-                        audio_state.fifo.push_scaled_from(&resampled, clip.volume * fg, pre_roll);
+                        let fg = fade_gain(
+                            pts_secs,
+                            clip.source_offset,
+                            clip.duration,
+                            clip.fade_in_secs,
+                            clip.fade_in_start_secs,
+                            clip.fade_out_secs,
+                            clip.fade_out_end_secs,
+                        );
+                        audio_state
+                            .fifo
+                            .push_scaled_from(&resampled, clip.volume * fg, pre_roll);
                     }
                 }
             } else {
-                let fg = fade_gain(pts_secs, clip.source_offset, clip.duration, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs);
-                audio_state.fifo.push_scaled_from(&raw, clip.volume * fg, pre_roll);
+                let fg = fade_gain(
+                    pts_secs,
+                    clip.source_offset,
+                    clip.duration,
+                    clip.fade_in_secs,
+                    clip.fade_in_start_secs,
+                    clip.fade_out_secs,
+                    clip.fade_out_end_secs,
+                );
+                audio_state
+                    .fifo
+                    .push_scaled_from(&raw, clip.volume * fg, pre_roll);
             }
         }
 
@@ -2262,12 +2564,18 @@ fn encode_clip(
     //              same clip_end position.  Without the trim the FIFO contains a
     //              ~23ms duplicate of the transition-start audio → crackle.
     {
-        let expected = out_frame_idx as i64 * AUDIO_RATE as i64 / spec.fps as i64;
-        let have     = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+        let expected = out_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+        let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
         if have < expected {
             let gap = (expected - have) as usize;
-            audio_state.fifo.left.extend(std::iter::repeat(0.0f32).take(gap));
-            audio_state.fifo.right.extend(std::iter::repeat(0.0f32).take(gap));
+            audio_state
+                .fifo
+                .left
+                .extend(std::iter::repeat_n(0.0f32, gap));
+            audio_state
+                .fifo
+                .right
+                .extend(std::iter::repeat_n(0.0f32, gap));
         } else if have > expected {
             let excess = (have - expected) as usize;
             let new_len = audio_state.fifo.left.len().saturating_sub(excess);
@@ -2283,14 +2591,13 @@ fn encode_clip(
 
 // ── Crossfade helpers ─────────────────────────────────────────────────────────
 
-fn decode_clip_frames(
-    clip: &ClipSpec,
-    spec: &EncodeSpec,
-) -> Result<Vec<Vec<u8>>, String> {
+fn decode_clip_frames(clip: &ClipSpec, spec: &EncodeSpec) -> Result<Vec<Vec<u8>>, String> {
     let mut ictx = open_input(&clip.path)
         .map_err(|e| format!("crossfade open '{}': {e}", clip.path.display()))?;
 
-    let video_stream_idx = ictx.streams().best(MediaType::Video)
+    let video_stream_idx = ictx
+        .streams()
+        .best(MediaType::Video)
         .ok_or_else(|| format!("no video stream in '{}' for crossfade", clip.path.display()))?
         .index();
 
@@ -2306,17 +2613,20 @@ fn decode_clip_frames(
 
     let vdec_ctx = codec::context::Context::from_parameters(
         ictx.stream(video_stream_idx).unwrap().parameters(),
-    ).map_err(|e| format!("crossfade video decoder context: {e}"))?;
+    )
+    .map_err(|e| format!("crossfade video decoder context: {e}"))?;
 
-    let mut video_decoder = vdec_ctx.decoder().video()
+    let mut video_decoder = vdec_ctx
+        .decoder()
+        .video()
         .map_err(|e| format!("crossfade open video decoder: {e}"))?;
 
     seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_frames");
 
     let mut video_scaler: Option<CropScaler> = None;
-    let clip_end   = clip.source_offset + clip.duration;
+    let clip_end = clip.source_offset + clip.duration;
     let half_frame = 0.5 / spec.fps as f64;
-    let w = spec.width  as usize;
+    let w = spec.width as usize;
     let h = spec.height as usize;
     let uv_w = w / 2;
     let uv_h = h / 2;
@@ -2324,27 +2634,37 @@ fn decode_clip_frames(
     let mut frames: Vec<Vec<u8>> = Vec::new();
 
     'packet_loop: for result in ictx.packets() {
-        let (stream, packet) = result
-            .map_err(|e| format!("crossfade read packet: {e}"))?;
+        let (stream, packet) = result.map_err(|e| format!("crossfade read packet: {e}"))?;
 
-        if stream.index() != video_stream_idx { continue; }
+        if stream.index() != video_stream_idx {
+            continue;
+        }
 
-        video_decoder.send_packet(&packet)
+        video_decoder
+            .send_packet(&packet)
             .map_err(|e| format!("crossfade send packet: {e}"))?;
 
         let mut decoded = VideoFrame::empty();
         while video_decoder.receive_frame(&mut decoded).is_ok() {
-            let pts_secs = decoded.pts()
+            let pts_secs = decoded
+                .pts()
                 .map(|pts| pts as f64 * f64::from(in_video_tb))
                 .unwrap_or(0.0);
 
-            if pts_secs < clip.source_offset - half_frame { continue; }
-            if pts_secs >= clip_end { break 'packet_loop; }
+            if pts_secs < clip.source_offset - half_frame {
+                continue;
+            }
+            if pts_secs >= clip_end {
+                break 'packet_loop;
+            }
 
             let sc = video_scaler.get_or_insert_with(|| {
                 CropScaler::build(
-                    decoded.format(), src_display_w, src_display_h,
-                    spec.width, spec.height,
+                    decoded.format(),
+                    src_display_w,
+                    src_display_h,
+                    spec.width,
+                    spec.height,
                 )
             });
 
@@ -2360,10 +2680,13 @@ fn decode_clip_frames(
     let _ = video_decoder.send_eof();
     let mut decoded = VideoFrame::empty();
     while video_decoder.receive_frame(&mut decoded).is_ok() {
-        let pts_secs = decoded.pts()
+        let pts_secs = decoded
+            .pts()
             .map(|pts| pts as f64 * f64::from(in_video_tb))
             .unwrap_or(0.0);
-        if pts_secs >= clip_end { break; }
+        if pts_secs >= clip_end {
+            break;
+        }
 
         if let Some(sc) = &mut video_scaler {
             let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
@@ -2376,69 +2699,94 @@ fn decode_clip_frames(
     Ok(frames)
 }
 
-fn decode_clip_audio(
-    clip: &ClipSpec,
-) -> Result<(Vec<f32>, Vec<f32>), String> {
+fn decode_clip_audio(clip: &ClipSpec) -> Result<(Vec<f32>, Vec<f32>), String> {
     let mut ictx = open_input(&clip.path)
         .map_err(|e| format!("transition audio open '{}': {e}", clip.path.display()))?;
 
     let audio_stream_idx = match ictx.streams().best(MediaType::Audio) {
         Some(s) => s.index(),
-        None    => return Ok((Vec::new(), Vec::new())),
+        None => return Ok((Vec::new(), Vec::new())),
     };
 
-    let ast         = ictx.stream(audio_stream_idx).unwrap();
+    let ast = ictx.stream(audio_stream_idx).unwrap();
     let in_audio_tb = ast.time_base();
 
-    let adec_ctx = codec::context::Context::from_parameters(ast.parameters())
-        .map_err(|e| format!("transition audio decoder ctx '{}': {e}", clip.path.display()))?;
-    let mut adec = adec_ctx.decoder().audio()
-        .map_err(|e| format!("transition audio decoder open '{}': {e}", clip.path.display()))?;
+    let adec_ctx = codec::context::Context::from_parameters(ast.parameters()).map_err(|e| {
+        format!(
+            "transition audio decoder ctx '{}': {e}",
+            clip.path.display()
+        )
+    })?;
+    let mut adec = adec_ctx.decoder().audio().map_err(|e| {
+        format!(
+            "transition audio decoder open '{}': {e}",
+            clip.path.display()
+        )
+    })?;
 
     seek_to_secs(&mut ictx, clip.source_offset, "decode_clip_audio");
 
-    let clip_end    = clip.source_offset + clip.duration;
-    let target_fmt  = Sample::F32(SampleType::Planar);
+    let clip_end = clip.source_offset + clip.duration;
+    let target_fmt = Sample::F32(SampleType::Planar);
     let mut audio_resampler: Option<resampling::Context> = None;
-    let mut left  = Vec::<f32>::new();
+    let mut left = Vec::<f32>::new();
     let mut right = Vec::<f32>::new();
 
-    fn push_frame(frame: &AudioFrame, vol: f32, left: &mut Vec<f32>, right: &mut Vec<f32>, skip: usize) {
+    fn push_frame(
+        frame: &AudioFrame,
+        vol: f32,
+        left: &mut Vec<f32>,
+        right: &mut Vec<f32>,
+        skip: usize,
+    ) {
         let n = frame.samples();
-        if n <= skip { return; }
+        if n <= skip {
+            return;
+        }
         unsafe {
             let l_bytes = frame.data(0);
-            let l_f32   = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
+            let l_f32 = std::slice::from_raw_parts(l_bytes.as_ptr() as *const f32, n);
             left.extend(l_f32[skip..].iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
 
-            let r_bytes = if frame.ch_layout().channels() >= 2 { frame.data(1) } else { frame.data(0) };
-            let r_f32   = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
+            let r_bytes = if frame.ch_layout().channels() >= 2 {
+                frame.data(1)
+            } else {
+                frame.data(0)
+            };
+            let r_f32 = std::slice::from_raw_parts(r_bytes.as_ptr() as *const f32, n);
             right.extend(r_f32[skip..].iter().map(|s| (s * vol).clamp(-1.0, 1.0)));
         }
     }
 
     'pkt: for result in ictx.packets() {
-        let (stream, packet) = result
-            .map_err(|e| format!("transition audio read packet: {e}"))?;
-        if stream.index() != audio_stream_idx { continue; }
+        let (stream, packet) = result.map_err(|e| format!("transition audio read packet: {e}"))?;
+        if stream.index() != audio_stream_idx {
+            continue;
+        }
 
-        if adec.send_packet(&packet).is_err() { continue; }
+        if adec.send_packet(&packet).is_err() {
+            continue;
+        }
 
         let mut raw = AudioFrame::empty();
         while adec.receive_frame(&mut raw).is_ok() {
-            let pts_secs = raw.pts()
+            let pts_secs = raw
+                .pts()
                 .map(|pts| pts as f64 * f64::from(in_audio_tb))
                 .unwrap_or(0.0);
-            if pts_secs < clip.source_offset - 0.05 { continue; }
-            if pts_secs >= clip_end { break 'pkt; }
+            if pts_secs < clip.source_offset - 0.05 {
+                continue;
+            }
+            if pts_secs >= clip_end {
+                break 'pkt;
+            }
 
-            let pre_roll = ((clip.source_offset - pts_secs).max(0.0)
-                * AUDIO_RATE as f64).round() as usize;
+            let pre_roll =
+                ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64).round() as usize;
 
-            let raw_channels   = raw.ch_layout().channels();
-            let needs_resample = raw.format() != target_fmt
-                || raw.rate()               != AUDIO_RATE as u32
-                || raw_channels             != 2;
+            let raw_channels = raw.ch_layout().channels();
+            let needs_resample =
+                raw.format() != target_fmt || raw.rate() != AUDIO_RATE as u32 || raw_channels != 2;
 
             if needs_resample {
                 let rs = audio_resampler.get_or_insert_with(|| {
@@ -2448,9 +2796,14 @@ fn decode_clip_audio(
                         ChannelLayout::MONO
                     };
                     resampling::Context::get2(
-                        raw.format(), src_layout,            raw.rate(),
-                        target_fmt,   ChannelLayout::STEREO, AUDIO_RATE as u32,
-                    ).expect("create audio resampler (transition)")
+                        raw.format(),
+                        src_layout,
+                        raw.rate(),
+                        target_fmt,
+                        ChannelLayout::STEREO,
+                        AUDIO_RATE as u32,
+                    )
+                    .expect("create audio resampler (transition)")
                 });
                 let mut resampled = AudioFrame::empty();
                 if rs.run(&raw, &mut resampled).is_ok() && resampled.samples() > 0 {
@@ -2465,15 +2818,17 @@ fn decode_clip_audio(
     let _ = adec.send_eof();
     let mut raw = AudioFrame::empty();
     while adec.receive_frame(&mut raw).is_ok() {
-        let pts_secs = raw.pts()
+        let pts_secs = raw
+            .pts()
             .map(|pts| pts as f64 * f64::from(in_audio_tb))
             .unwrap_or(0.0);
-        if pts_secs >= clip_end { break; }
+        if pts_secs >= clip_end {
+            break;
+        }
 
-        let raw_channels   = raw.ch_layout().channels();
-        let needs_resample = raw.format() != target_fmt
-            || raw.rate()               != AUDIO_RATE as u32
-            || raw_channels             != 2;
+        let raw_channels = raw.ch_layout().channels();
+        let needs_resample =
+            raw.format() != target_fmt || raw.rate() != AUDIO_RATE as u32 || raw_channels != 2;
 
         if needs_resample {
             if let Some(rs) = &mut audio_resampler {
@@ -2492,14 +2847,18 @@ fn decode_clip_audio(
         let n_buffered = unsafe { ffmpeg::ffi::swr_get_delay(rs.as_mut_ptr(), AUDIO_RATE as i64) };
         if n_buffered > 0 {
             let mut tmp_frame = AudioFrame::new(
-                Sample::F32(SampleType::Planar), 4096, ChannelLayoutMask::STEREO);
+                Sample::F32(SampleType::Planar),
+                4096,
+                ChannelLayoutMask::STEREO,
+            );
             tmp_frame.set_rate(AUDIO_RATE as u32);
             unsafe {
                 let n_out = ffmpeg::ffi::swr_convert(
                     rs.as_mut_ptr(),
-                    (*tmp_frame.as_mut_ptr()).data.as_mut_ptr() as *mut *mut u8,
+                    (*tmp_frame.as_mut_ptr()).data.as_mut_ptr(),
                     4096,
-                    std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(),
+                    0,
                 );
                 if n_out > 0 {
                     (*tmp_frame.as_mut_ptr()).nb_samples = n_out;
@@ -2512,21 +2871,22 @@ fn decode_clip_audio(
     Ok((left, right))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_transition(
-    transition:    &dyn VideoTransition,
-    tail_spec:     &ClipSpec,
-    head_spec:     &ClipSpec,
-    spec:          &EncodeSpec,
-    octx:          &mut ffmpeg::format::context::Output,
+    transition: &dyn VideoTransition,
+    tail_spec: &ClipSpec,
+    head_spec: &ClipSpec,
+    spec: &EncodeSpec,
+    octx: &mut ffmpeg::format::context::Output,
     video_encoder: &mut ffmpeg::encoder::Video,
     hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
-    hw_backend:    HwBackend,
-    audio_state:   &mut AudioEncState,
+    hw_backend: HwBackend,
+    audio_state: &mut AudioEncState,
     mut out_frame_idx: i64,
-    total_frames:  u64,
-    frame_tb:      Rational,
-    cancel:        &Arc<AtomicBool>,
-    tx:            &Sender<MediaResult>,
+    total_frames: u64,
+    frame_tb: Rational,
+    cancel: &Arc<AtomicBool>,
+    tx: &Sender<MediaResult>,
     last_video_dts: &mut i64,
 ) -> Result<i64, String> {
     let tail_frames = decode_clip_frames(tail_spec, spec)?;
@@ -2542,8 +2902,8 @@ fn apply_transition(
         return Ok(out_frame_idx);
     }
 
-    let w    = spec.width  as usize;
-    let h    = spec.height as usize;
+    let w = spec.width as usize;
+    let h = spec.height as usize;
     let uv_w = w / 2;
     let uv_h = h / 2;
     let ost_tb = octx.stream(0).unwrap().time_base();
@@ -2553,7 +2913,7 @@ fn apply_transition(
             return Err("cancelled".into());
         }
 
-        let alpha   = velocut_core::transitions::helpers::frame_alpha(i, n);
+        let alpha = velocut_core::transitions::helpers::frame_alpha(i, n);
         let blended = transition.apply(
             &tail_frames[i],
             &head_frames[i],
@@ -2565,8 +2925,7 @@ fn apply_transition(
         let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
         yuv.set_pts(Some(out_frame_idx));
         unsafe {
-            (*yuv.as_mut_ptr()).sample_aspect_ratio =
-                ffmpeg::ffi::AVRational { num: 1, den: 1 };
+            (*yuv.as_mut_ptr()).sample_aspect_ratio = ffmpeg::ffi::AVRational { num: 1, den: 1 };
         }
 
         write_yuv(&blended, &mut yuv, w, h, uv_w, uv_h);
@@ -2580,14 +2939,16 @@ fn apply_transition(
             let raw_dts = pkt.dts().unwrap_or(0);
             if *last_video_dts != i64::MIN {
                 let prev_s = *last_video_dts as f64 * f64::from(ost_tb);
-                let dts_s  = raw_dts         as f64 * f64::from(ost_tb);
+                let dts_s = raw_dts as f64 * f64::from(ost_tb);
                 if dts_s < prev_s {
                     let clamped = *last_video_dts + 1;
                     eprintln!(
                         "[transition] non-monotonic DTS ({prev_s:.4}s → {dts_s:.4}s); \
                          clamping {raw_dts} → {clamped}"
                     );
-                    unsafe { (*pkt.as_mut_ptr()).dts = clamped; }
+                    unsafe {
+                        (*pkt.as_mut_ptr()).dts = clamped;
+                    }
                 }
             }
             *last_video_dts = pkt.dts().unwrap_or(raw_dts);
@@ -2595,8 +2956,8 @@ fn apply_transition(
                 .map_err(|e| format!("transition write packet: {e}"))?;
         }
 
-        let sample_start = (i       as f64 * samples_per_frame_f).round() as usize;
-        let sample_end   = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
+        let sample_start = (i as f64 * samples_per_frame_f).round() as usize;
+        let sample_end = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
         let af = alpha as f32;
 
         // Clamp tail/head vec access: if AAC frame alignment leaves the vec a few
@@ -2614,8 +2975,14 @@ fn apply_transition(
             let t_r = tail_audio_r.get(s).copied().unwrap_or(tail_last_r);
             let h_l = head_audio_l.get(s).copied().unwrap_or(head_last_l);
             let h_r = head_audio_r.get(s).copied().unwrap_or(head_last_r);
-            audio_state.fifo.left .push((t_l * (1.0 - af) + h_l * af).clamp(-1.0, 1.0));
-            audio_state.fifo.right.push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
+            audio_state
+                .fifo
+                .left
+                .push((t_l * (1.0 - af) + h_l * af).clamp(-1.0, 1.0));
+            audio_state
+                .fifo
+                .right
+                .push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
         }
 
         audio_state.drain_fifo(octx, false)?;
@@ -2627,10 +2994,10 @@ fn apply_transition(
         // HW: yield lets UI/audio preempt the decode+scale hot loop.
         std::thread::yield_now();
 
-        if out_frame_idx as u64 % PROGRESS_INTERVAL == 0 {
+        if (out_frame_idx as u64).is_multiple_of(PROGRESS_INTERVAL) {
             let _ = tx.send(MediaResult::EncodeProgress {
-                job_id:       spec.job_id,
-                frame:        out_frame_idx as u64,
+                job_id: spec.job_id,
+                frame: out_frame_idx as u64,
                 total_frames,
             });
         }

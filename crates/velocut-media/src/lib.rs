@@ -3,11 +3,11 @@
 pub mod audio;
 pub mod decode;
 pub mod encode;
+mod helpers;
 pub mod probe;
 pub mod waveform;
-pub mod worker;
-mod helpers;   // internal — not pub, not re-exported
+pub mod worker; // internal — not pub, not re-exported
 
 pub use encode::{ClipSpec, EncodeSpec};
-pub use worker::MediaWorker;
 pub use velocut_core::media_types::{MediaResult, PlaybackFrame};
+pub use worker::MediaWorker;

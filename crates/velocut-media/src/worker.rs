@@ -8,49 +8,73 @@ extern crate libc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use uuid::Uuid;
 
-use velocut_core::media_types::{MediaResult, PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
+use velocut_core::media_types::{
+    MediaResult, PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest,
+};
 
-use crate::decode::{LiveDecoder, decode_frame, decode_one_frame_rgba};
-use crate::encode::{EncodeSpec, encode_timeline};
+use crate::audio::extract_audio;
+use crate::decode::{decode_frame, decode_one_frame_rgba, LiveDecoder};
+use crate::encode::{encode_timeline, EncodeSpec};
 use crate::probe::{probe_duration, probe_video_size_and_thumbnail};
 use crate::waveform::extract_waveform;
-use crate::audio::extract_audio;
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
 struct FrameRequest {
-    id:        Uuid,
-    path:      PathBuf,
+    id: Uuid,
+    path: PathBuf,
     timestamp: f64,
-    aspect:    f32,
+    aspect: f32,
 }
 
 enum PlaybackCmd {
-    Start { id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)> },
+    Start {
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        preview_size: Option<(u32, u32)>,
+    },
     /// Like Start but also carries blend info so the pb thread can open a second
     /// decoder for clip_b and blend frames during the transition zone.
-    StartBlend { id: Uuid, path: PathBuf, ts: f64, aspect: f32, blend: PlaybackTransitionSpec, preview_size: Option<(u32, u32)> },
+    StartBlend {
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        blend: PlaybackTransitionSpec,
+        preview_size: Option<(u32, u32)>,
+    },
     Stop,
     /// Pre-open and start burning a decoder for the next clip so the transition
     /// at the clip boundary is instant.  Sent ~500 ms before the current clip
     /// ends.  The pb thread opens the decoder, sets skip_until_pts, and advances
     /// the burn incrementally (10 packets per primary frame) so the decoder is
     /// ready by the time Start / StartBlend arrives.
-    PreBuffer { id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)> },
+    PreBuffer {
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        preview_size: Option<(u32, u32)>,
+    },
 }
 
 // ── MediaWorker ───────────────────────────────────────────────────────────────
 
 pub struct MediaWorker {
     /// Shared result channel: probes, waveforms, audio, encode progress, HQ frames.
-    pub rx:    Receiver<MediaResult>,
-    tx:        Sender<MediaResult>,
+    pub rx: Receiver<MediaResult>,
+    tx: Sender<MediaResult>,
 
     /// [Opt 3] Dedicated channel for on-demand scrub VideoFrame results.
     ///
@@ -69,14 +93,14 @@ pub struct MediaWorker {
     pub scrub_rx: Receiver<MediaResult>,
     /// Sender half kept alive so the channel stays open and cloned into
     /// `request_transition_frame` threads that need to send blended frames.
-    scrub_tx:    Sender<MediaResult>,
+    scrub_tx: Sender<MediaResult>,
 
     /// Latest-wins slot for on-demand scrub frames.
     frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)>,
     /// Dedicated playback pipeline.
-    pb_tx:     Sender<PlaybackCmd>,
+    pb_tx: Sender<PlaybackCmd>,
     pub pb_rx: Receiver<PlaybackFrame>,
-    shutdown:  Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     /// Limits concurrent probe threads: (active_count, Condvar). Max = PROBE_CONCURRENCY.
     probe_sem: Arc<(Mutex<u32>, Condvar)>,
     /// Per-job cancel flags. Keyed by job_id so cancellation is targeted.
@@ -97,9 +121,15 @@ pub struct MediaWorker {
     transition_scrub_req: Arc<(Mutex<Option<TransitionScrubRequest>>, Condvar)>,
 }
 
+impl Default for MediaWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MediaWorker {
     pub fn new() -> Self {
-        let (tx, rx)           = bounded(512);
+        let (tx, rx) = bounded(512);
         let (scrub_tx, scrub_rx) = bounded(8); // [Opt 3] dedicated scrub channel
 
         let frame_req: Arc<(Mutex<Option<FrameRequest>>, Condvar)> =
@@ -110,7 +140,7 @@ impl MediaWorker {
         // [Opt 3] Sends VideoFrame on scrub_tx (not tx) so scrub results bypass
         // the shared channel and are consumed with lower latency under probe load.
         let scrub_result_tx = scrub_tx.clone();
-        let slot             = Arc::clone(&frame_req);
+        let slot = Arc::clone(&frame_req);
         thread::spawn(move || {
             let mut live: Option<LiveDecoder> = None;
             loop {
@@ -124,7 +154,9 @@ impl MediaWorker {
                 };
 
                 // Poison-pill: a request with a nil id signals shutdown.
-                if req.id == Uuid::nil() { return; }
+                if req.id == Uuid::nil() {
+                    return;
+                }
 
                 // Reset (re-open + seek to keyframe) when:
                 //   a) different file
@@ -132,23 +164,27 @@ impl MediaWorker {
                 //   c) forward jump > 2 s — advance_to() would decode 60+ frames
                 //      (~300-800 ms), blocking the thread. Re-open is instant and
                 //      Layer 3 (150 ms debounce) fires the exact frame once idle.
-                let needs_reset = live.as_ref().map(|d| {
-                    let tpts     = d.ts_to_pts(req.timestamp);
-                    let two_secs = d.ts_to_pts(2.0);
-                    d.path != req.path
+                let needs_reset = live
+                    .as_ref()
+                    .map(|d| {
+                        let tpts = d.ts_to_pts(req.timestamp);
+                        let two_secs = d.ts_to_pts(2.0);
+                        d.path != req.path
                         || tpts <= d.last_pts               // any backward seek
-                        || tpts > d.last_pts + two_secs     // large forward jump
-                }).unwrap_or(true);
+                        || tpts > d.last_pts + two_secs // large forward jump
+                    })
+                    .unwrap_or(true);
 
                 if needs_reset {
                     // [Opt #1] Move the old decoder's SwsContext out before dropping it.
                     // If the new clip has the same source format/dimensions the context
                     // is reused instead of calling SwsContext::get (which re-runs
                     // internal lookup-table init — measurable cost on the scrub path).
-                    let cached_sws = live.take().map(|d| {
-                        (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h)
-                    });
-                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws, None) {
+                    let cached_sws = live
+                        .take()
+                        .map(|d| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
+                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws, None)
+                    {
                         Ok(mut d) => {
                             // Set skip_until_pts so next_frame() burns through the GOP
                             // (decode-only, no scale/alloc) and returns the frame at
@@ -160,7 +196,10 @@ impl MediaWorker {
                             d.skip_until_pts = d.ts_to_pts(req.timestamp);
                             if let Some((data, w, h, _)) = d.next_frame() {
                                 let _ = scrub_result_tx.send(MediaResult::VideoFrame {
-                                    id: req.id, width: w, height: h, data,
+                                    id: req.id,
+                                    width: w,
+                                    height: h,
+                                    data,
                                 });
                             }
                             live = Some(d);
@@ -171,7 +210,10 @@ impl MediaWorker {
                     let tpts = d.ts_to_pts(req.timestamp);
                     if let Some((data, w, h)) = d.advance_to(tpts) {
                         let _ = scrub_result_tx.send(MediaResult::VideoFrame {
-                            id: req.id, width: w, height: h, data,
+                            id: req.id,
+                            width: w,
+                            height: h,
+                            data,
                         });
                     }
                 }
@@ -202,21 +244,21 @@ impl MediaWorker {
                 };
 
                 // Poison-pill: nil clip_a_id signals shutdown.
-                if req.clip_a_id == Uuid::nil() { return; }
+                if req.clip_a_id == Uuid::nil() {
+                    return;
+                }
 
                 // ── Decode clip_a frame ────────────────────────────────────────
-                let frame_a = decode_transition_scrub_frame(
-                    &mut live_a, &req.clip_a_path, req.clip_a_ts,
-                );
+                let frame_a =
+                    decode_transition_scrub_frame(&mut live_a, &req.clip_a_path, req.clip_a_ts);
                 let (data_a, w, h) = match frame_a {
                     Some(f) => f,
                     None => continue,
                 };
 
                 // ── Decode clip_b frame ────────────────────────────────────────
-                let frame_b = decode_transition_scrub_frame(
-                    &mut live_b, &req.clip_b_path, req.clip_b_ts,
-                );
+                let frame_b =
+                    decode_transition_scrub_frame(&mut live_b, &req.clip_b_path, req.clip_b_ts);
                 let data_b = match frame_b {
                     Some((data_b_raw, wb, hb)) if wb == w && hb == h => data_b_raw,
                     Some((data_b_raw, wb, hb)) => crop_rgba(&data_b_raw, wb, hb, w, h),
@@ -225,7 +267,10 @@ impl MediaWorker {
 
                 let blended = blend_rgba_transition(&data_a, &data_b, w, h, req.alpha, req.kind);
                 let _ = transition_scrub_result_tx.send(MediaResult::VideoFrame {
-                    id: req.clip_a_id, width: w, height: h, data: blended,
+                    id: req.clip_a_id,
+                    width: w,
+                    height: h,
+                    data: blended,
                 });
             }
         });
@@ -263,11 +308,11 @@ impl MediaWorker {
             // Instead of going idle (blocking on recv()), we keep sending held_blend frames at ~30fps
             // so pb_rx stays fed and the UI doesn't freeze while clip_changed fires.
             // The last-frame metadata fields provide the id/dims/ts for the synthetic coast frames.
-            let mut coasting:        bool = false;
-            let mut coast_id:        Uuid = Uuid::nil();
-            let mut coast_w:         u32  = 0;
-            let mut coast_h:         u32  = 0;
-            let mut coast_ts:        f64  = 0.0;
+            let mut coasting: bool = false;
+            let mut coast_id: Uuid = Uuid::nil();
+            let mut coast_w: u32 = 0;
+            let mut coast_h: u32 = 0;
+            let mut coast_ts: f64 = 0.0;
             // Last alpha value from the outgoing blend phase. Set when entering coast mode.
             // Used to correct alpha_start on the incoming StartBlend so the wipe/iris/etc.
             // resumes from where clip_a's decoder actually stopped, not from the hardcoded 0.5
@@ -290,9 +335,15 @@ impl MediaWorker {
             loop {
                 if let Some((id, ref mut d)) = decoder {
                     match pb_cmd_rx.try_recv() {
-                        Ok(PlaybackCmd::Start { id: new_id, path, ts, aspect, preview_size }) => {
-                            blend            = None;
-                            held_blend       = None;
+                        Ok(PlaybackCmd::Start {
+                            id: new_id,
+                            path,
+                            ts,
+                            aspect,
+                            preview_size,
+                        }) => {
+                            blend = None;
+                            held_blend = None;
                             last_blend_alpha = 0.0;
                             coast_last_alpha = 0.5;
                             // [P0-3] Try prebuffered decoder first.
@@ -315,14 +366,27 @@ impl MediaWorker {
                                 Ok(mut nd) => {
                                     let tpts = nd.ts_to_pts(ts);
                                     nd.burn_to_pts(tpts);
-                                    eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                    eprintln!(
+                                        "[pb] primary burn done in {}ms",
+                                        t0.elapsed().as_millis()
+                                    );
                                     decoder = Some((new_id, nd));
                                 }
-                                Err(e) => { eprintln!("[pb] open: {e}"); decoder = None; }
+                                Err(e) => {
+                                    eprintln!("[pb] open: {e}");
+                                    decoder = None;
+                                }
                             }
                             continue;
                         }
-                        Ok(PlaybackCmd::StartBlend { id: new_id, path, ts, aspect, blend: spec, preview_size }) => {
+                        Ok(PlaybackCmd::StartBlend {
+                            id: new_id,
+                            path,
+                            ts,
+                            aspect,
+                            blend: spec,
+                            preview_size,
+                        }) => {
                             let invert = spec.invert_ab;
 
                             let recycled_decoder_b = if invert {
@@ -338,8 +402,14 @@ impl MediaWorker {
                                 None
                             };
 
-                            blend = Some(ActiveBlend { spec, aspect, decoder_b: recycled_decoder_b });
-                            if !invert { held_blend = None; }
+                            blend = Some(ActiveBlend {
+                                spec,
+                                aspect,
+                                decoder_b: recycled_decoder_b,
+                            });
+                            if !invert {
+                                held_blend = None;
+                            }
                             let t0 = std::time::Instant::now();
                             eprintln!("[pb] StartBlend received (active), ts={ts:.3}, recycled_decoder_b={invert}");
                             eprintln!("[pb] StartBlend spec: blend_start_ts={:.3} duration={:.3} alpha_start={:.3} invert={invert}",
@@ -347,7 +417,8 @@ impl MediaWorker {
                                 blend.as_ref().map(|b| b.spec.duration as f64).unwrap_or(0.0),
                                 blend.as_ref().map(|b| b.spec.alpha_start as f64).unwrap_or(0.0),
                             );
-                            held_streak = 0; blend_frame_count = 0;
+                            held_streak = 0;
+                            blend_frame_count = 0;
                             // [P0-3] Try prebuffered decoder for the primary.
                             if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                 if pb_id == new_id {
@@ -365,39 +436,66 @@ impl MediaWorker {
                                     Ok(mut nd) => {
                                         let tpts = nd.ts_to_pts(ts);
                                         nd.burn_to_pts(tpts);
-                                        eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                        eprintln!(
+                                            "[pb] primary burn done in {}ms",
+                                            t0.elapsed().as_millis()
+                                        );
                                         decoder = Some((new_id, nd));
                                     }
                                     Err(e) => {
                                         eprintln!("[pb] open (blend): {e}");
                                         decoder = None;
-                                        blend   = None;
+                                        blend = None;
                                     }
                                 }
                             }
                             if !invert {
-                                let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
+                                let primary_size =
+                                    decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
                                 if let Some(ref mut b) = blend {
-                                    let db_path   = b.spec.clip_b_path.clone();
-                                    let db_start  = b.spec.clip_b_source_start;
+                                    let db_path = b.spec.clip_b_path.clone();
+                                    let db_start = b.spec.clip_b_source_start;
                                     let db_aspect = b.aspect;
                                     let t_db = std::time::Instant::now();
                                     eprintln!("[pb] pre-opening decoder_b for outgoing blend: clip_b_start={db_start:.3}");
-                                    match LiveDecoder::open(&db_path, db_start, db_aspect, None, primary_size) {
+                                    match LiveDecoder::open(
+                                        &db_path,
+                                        db_start,
+                                        db_aspect,
+                                        None,
+                                        primary_size,
+                                    ) {
                                         Ok(mut db) => {
                                             db.skip_until_pts = db.ts_to_pts(db_start);
                                             eprintln!("[pb] decoder_b pre-opened in {}ms, lazy burn started (skip_until_pts={})",
                                                 t_db.elapsed().as_millis(), db.skip_until_pts);
                                             b.decoder_b = Some(db);
                                         }
-                                        Err(e) => eprintln!("[pb] decoder_b pre-open (outgoing): {e}"),
+                                        Err(e) => {
+                                            eprintln!("[pb] decoder_b pre-open (outgoing): {e}")
+                                        }
                                     }
                                 }
                             }
                             continue;
                         }
-                        Ok(PlaybackCmd::Stop) => { decoder = None; blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; prebuffered = None; continue; }
-                        Ok(PlaybackCmd::PreBuffer { id: pb_id, path: pb_path, ts: pb_ts, aspect: pb_aspect, preview_size: pb_ps }) => {
+                        Ok(PlaybackCmd::Stop) => {
+                            decoder = None;
+                            blend = None;
+                            held_blend = None;
+                            last_blend_alpha = 0.0;
+                            coast_last_alpha = 0.5;
+                            coast_last_primary = None;
+                            prebuffered = None;
+                            continue;
+                        }
+                        Ok(PlaybackCmd::PreBuffer {
+                            id: pb_id,
+                            path: pb_path,
+                            ts: pb_ts,
+                            aspect: pb_aspect,
+                            preview_size: pb_ps,
+                        }) => {
                             // [P0-3] Open decoder for the next clip and start lazy burn.
                             let t0 = std::time::Instant::now();
                             match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
@@ -451,32 +549,54 @@ impl MediaWorker {
                                 coast_last_primary = Some(data.clone());
                             }
 
-                            let blend_params = if blend_params.as_ref().map(|(_, _, a, _, _)| *a >= 1.0).unwrap_or(false) {
-                                blend      = None;
+                            let blend_params = if blend_params
+                                .as_ref()
+                                .map(|(_, _, a, _, _)| *a >= 1.0)
+                                .unwrap_or(false)
+                            {
+                                blend = None;
                                 held_blend = None;
-                                eprintln!("[blend] alpha=1.0 — transition complete, dropping blend");
+                                eprintln!(
+                                    "[blend] alpha=1.0 — transition complete, dropping blend"
+                                );
                                 None
                             } else {
                                 blend_params
                             };
 
                             let mut decoder_b_exhausted = false;
-                            let send_data = if let Some((clip_b_path, clip_b_start, alpha, kind, decoder_b_aspect)) = blend_params {
+                            let send_data = if let Some((
+                                clip_b_path,
+                                clip_b_start,
+                                alpha,
+                                kind,
+                                decoder_b_aspect,
+                            )) = blend_params
+                            {
                                 let blended = (|| -> Option<Vec<u8>> {
                                     if let Some(b) = blend.as_mut() {
                                         let invert = b.spec.invert_ab;
                                         if b.decoder_b.is_none() {
                                             eprintln!("[blend] decoder_b is None — opening lazily, clip_b_start={clip_b_start:.3}");
                                             let t_open = std::time::Instant::now();
-                                            let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
-                                            match LiveDecoder::open(&clip_b_path, clip_b_start, decoder_b_aspect, None, primary_size) {
+                                            let primary_size =
+                                                decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
+                                            match LiveDecoder::open(
+                                                &clip_b_path,
+                                                clip_b_start,
+                                                decoder_b_aspect,
+                                                None,
+                                                primary_size,
+                                            ) {
                                                 Ok(mut db) => {
                                                     let tpts = db.ts_to_pts(clip_b_start);
                                                     db.skip_until_pts = tpts;
                                                     eprintln!("[blend] decoder_b opened in {}ms, skip_until_pts={tpts}", t_open.elapsed().as_millis());
                                                     b.decoder_b = Some(db);
                                                 }
-                                                Err(e) => eprintln!("[pb] blend decoder_b open: {e}"),
+                                                Err(e) => {
+                                                    eprintln!("[pb] blend decoder_b open: {e}")
+                                                }
                                             }
                                         }
                                         if let Some(db) = b.decoder_b.as_mut() {
@@ -493,7 +613,12 @@ impl MediaWorker {
                                                     if invert {
                                                         if let Some(hb) = held_blend.as_ref() {
                                                             if hb.len() == data.len() {
-                                                                return Some(blend_rgba_transition(hb, &data, w, h, alpha, kind));
+                                                                return Some(
+                                                                    blend_rgba_transition(
+                                                                        hb, &data, w, h, alpha,
+                                                                        kind,
+                                                                    ),
+                                                                );
                                                             }
                                                         }
                                                     }
@@ -501,7 +626,8 @@ impl MediaWorker {
                                                 }
                                             }
                                             if let Some((data_b, wb, hb, _)) = db.next_frame() {
-                                                if data_b.len() != data.len() || wb != w || hb != h {
+                                                if data_b.len() != data.len() || wb != w || hb != h
+                                                {
                                                     eprintln!(
                                                         "[pb] blend size mismatch — primary {}×{} ({} B) \
                                                          vs decoder_b {}×{} ({} B); skipping blend",
@@ -510,13 +636,19 @@ impl MediaWorker {
                                                     return None;
                                                 }
                                                 let blended = if invert {
-                                                    blend_rgba_transition(&data_b, &data, w, h, alpha, kind)
+                                                    blend_rgba_transition(
+                                                        &data_b, &data, w, h, alpha, kind,
+                                                    )
                                                 } else {
-                                                    blend_rgba_transition(&data, &data_b, w, h, alpha, kind)
+                                                    blend_rgba_transition(
+                                                        &data, &data_b, w, h, alpha, kind,
+                                                    )
                                                 };
                                                 return Some(blended);
                                             } else {
-                                                let still_burning = b.decoder_b.as_ref()
+                                                let still_burning = b
+                                                    .decoder_b
+                                                    .as_ref()
                                                     .map(|db| db.skip_until_pts > 0)
                                                     .unwrap_or(false);
                                                 if still_burning {
@@ -527,7 +659,12 @@ impl MediaWorker {
                                                         if let Some(hb) = held_blend.as_ref() {
                                                             if hb.len() == data.len() {
                                                                 eprintln!("[blend] still_burning animated: alpha={alpha:.3}");
-                                                                return Some(blend_rgba_transition(hb, &data, w, h, alpha, kind));
+                                                                return Some(
+                                                                    blend_rgba_transition(
+                                                                        hb, &data, w, h, alpha,
+                                                                        kind,
+                                                                    ),
+                                                                );
                                                             }
                                                         }
                                                     }
@@ -539,7 +676,9 @@ impl MediaWorker {
                                     }
                                     None
                                 })();
-                                if decoder_b_exhausted { blend = None; }
+                                if decoder_b_exhausted {
+                                    blend = None;
+                                }
                                 // [Fix 2] Avoid double-allocation in the blend hot path.
                                 // Previously: held_blend = Some(b.clone()); b
                                 // — two Vec<u8> of equal size lived simultaneously.
@@ -569,8 +708,8 @@ impl MediaWorker {
                             };
 
                             coast_id = id;
-                            coast_w  = w;
-                            coast_h  = h;
+                            coast_w = w;
+                            coast_h = h;
                             coast_ts = ts_secs;
                             // Save last frame for hard-cut coast when prebuffered is ready.
                             // At EOF, this lets coast mode re-send the last frame of clip_a
@@ -578,12 +717,20 @@ impl MediaWorker {
                             if prebuffered.is_some() && blend.is_none() {
                                 held_blend = Some(send_data.clone());
                             }
-                            let f = PlaybackFrame { id, timestamp: ts_secs, width: w, height: h, data: send_data };
+                            let f = PlaybackFrame {
+                                id,
+                                timestamp: ts_secs,
+                                width: w,
+                                height: h,
+                                data: send_data,
+                            };
                             frame_count += 1;
-                            if frame_count % 60 == 0 {
+                            if frame_count.is_multiple_of(60) {
                                 eprintln!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
                             }
-                            if pb_frame_tx.send(f).is_err() { return; }
+                            if pb_frame_tx.send(f).is_err() {
+                                return;
+                            }
                             // [P0-3] Interleave prebuffer burn between primary frames.
                             // Advance by 10 packets (~5ms) per frame so the prebuffered
                             // decoder is ready by the time Start arrives (~15 frames later).
@@ -594,12 +741,15 @@ impl MediaWorker {
                             }
                         }
                         None => {
-                            let outgoing_blend = blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false);
+                            let outgoing_blend =
+                                blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false);
                             if outgoing_blend && held_blend.is_some() {
                                 coast_last_alpha = last_blend_alpha;
-                                eprintln!("[pb] primary EOF during outgoing blend — entering coast mode \
+                                eprintln!(
+                                    "[pb] primary EOF during outgoing blend — entering coast mode \
                                            (ts={coast_ts:.3}, alpha={coast_last_alpha:.3}, \
-                                           decoder_b preserved for animated coast)");
+                                           decoder_b preserved for animated coast)"
+                                );
                                 coasting = true;
                                 decoder = None;
                             } else if prebuffered.is_some() && held_blend.is_some() {
@@ -610,17 +760,19 @@ impl MediaWorker {
                                 // the Start is picked up immediately — no blocking recv()
                                 // delay.  The prebuffered decoder is consumed instantly by
                                 // the Start handler.
-                                blend             = None;
+                                blend = None;
                                 coast_last_primary = None;
                                 coasting = true;
-                                decoder  = None;
-                                eprintln!("[pb] primary EOF → hard-cut coast (prebuffered ready, \
-                                           held last frame for bridge)");
+                                decoder = None;
+                                eprintln!(
+                                    "[pb] primary EOF → hard-cut coast (prebuffered ready, \
+                                           held last frame for bridge)"
+                                );
                             } else {
                                 eprintln!("[pb] primary decoder EOF, clearing decoder + blend");
-                                held_blend        = None;
+                                held_blend = None;
                                 coast_last_primary = None;
-                                blend             = None;
+                                blend = None;
                                 decoder = None;
                             }
                         }
@@ -629,14 +781,14 @@ impl MediaWorker {
                     // Idle branch: no primary decoder.
                     let cmd_opt = if coasting {
                         match pb_cmd_rx.try_recv() {
-                            Ok(cmd)                         => Some(cmd),
-                            Err(TryRecvError::Empty)        => None,
+                            Ok(cmd) => Some(cmd),
+                            Err(TryRecvError::Empty) => None,
                             Err(TryRecvError::Disconnected) => return,
                         }
                     } else {
                         match pb_cmd_rx.recv() {
                             Ok(cmd) => Some(cmd),
-                            Err(_)  => return,
+                            Err(_) => return,
                         }
                     };
 
@@ -644,9 +796,15 @@ impl MediaWorker {
                         let was_coasting = coasting;
                         coasting = false;
                         match cmd {
-                            PlaybackCmd::Start { id, path, ts, aspect, preview_size } => {
-                                blend            = None;
-                                held_blend       = None;
+                            PlaybackCmd::Start {
+                                id,
+                                path,
+                                ts,
+                                aspect,
+                                preview_size,
+                            } => {
+                                blend = None;
+                                held_blend = None;
                                 last_blend_alpha = 0.0;
                                 coast_last_alpha = 0.5;
                                 // [P0-3] Try prebuffered decoder first.
@@ -668,19 +826,31 @@ impl MediaWorker {
                                     Ok(mut d) => {
                                         let tpts = d.ts_to_pts(ts);
                                         d.burn_to_pts(tpts);
-                                        eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                        eprintln!(
+                                            "[pb] primary burn done in {}ms",
+                                            t0.elapsed().as_millis()
+                                        );
                                         decoder = Some((id, d));
                                     }
                                     Err(e) => eprintln!("[pb] open: {e}"),
                                 }
                             }
-                            PlaybackCmd::StartBlend { id, path, ts, aspect, blend: mut spec, preview_size } => {
+                            PlaybackCmd::StartBlend {
+                                id,
+                                path,
+                                ts,
+                                aspect,
+                                blend: mut spec,
+                                preview_size,
+                            } => {
                                 let invert = spec.invert_ab;
 
                                 if invert && was_coasting {
-                                    eprintln!("[pb] incoming StartBlend while coasting: overriding \
+                                    eprintln!(
+                                        "[pb] incoming StartBlend while coasting: overriding \
                                                alpha_start {:.3} → {:.3} (coast_last_alpha)",
-                                               spec.alpha_start, coast_last_alpha);
+                                        spec.alpha_start, coast_last_alpha
+                                    );
                                     spec.alpha_start = coast_last_alpha;
                                 }
 
@@ -692,18 +862,30 @@ impl MediaWorker {
                                 };
 
                                 let prebuilt_db = if was_coasting && invert {
-                                    let db_path  = spec.clip_b_path.clone();
+                                    let db_path = spec.clip_b_path.clone();
                                     let db_start = spec.clip_b_source_start;
-                                    let t_db     = std::time::Instant::now();
+                                    let t_db = std::time::Instant::now();
                                     eprintln!("[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}");
-                                    match LiveDecoder::open(&db_path, db_start, aspect, None, preview_size) {
+                                    match LiveDecoder::open(
+                                        &db_path,
+                                        db_start,
+                                        aspect,
+                                        None,
+                                        preview_size,
+                                    ) {
                                         Ok(mut db) => {
                                             let tpts = db.ts_to_pts(db_start);
                                             db.burn_to_pts(tpts);
-                                            eprintln!("[pb] decoder_b pre-burn done in {}ms", t_db.elapsed().as_millis());
+                                            eprintln!(
+                                                "[pb] decoder_b pre-burn done in {}ms",
+                                                t_db.elapsed().as_millis()
+                                            );
                                             Some(db)
                                         }
-                                        Err(e) => { eprintln!("[pb] decoder_b pre-open: {e}"); None }
+                                        Err(e) => {
+                                            eprintln!("[pb] decoder_b pre-open: {e}");
+                                            None
+                                        }
                                     }
                                 } else {
                                     None
@@ -714,8 +896,8 @@ impl MediaWorker {
                                 if let Some(mut bridge_db) = coast_blend_db {
                                     coast_id = id;
                                     let bridge_duration = spec.duration;
-                                    let bridge_kind     = spec.kind;
-                                    let mut bridge_ts   = ts;
+                                    let bridge_kind = spec.kind;
+                                    let mut bridge_ts = ts;
                                     // [Fix 1] BRIDGE_TARGET reduced from 28 → 4 to match
                                     // the new channel size of 6. The old 28/32 fill ratio
                                     // is preserved (4/6 ≈ 67%), ensuring the channel stays
@@ -724,19 +906,25 @@ impl MediaWorker {
                                     while pb_frame_tx.len() < BRIDGE_TARGET {
                                         let fa = match coast_last_primary.as_ref() {
                                             Some(f) => f,
-                                            None    => break,
+                                            None => break,
                                         };
                                         let (data_b, _, _, _) = match bridge_db.next_frame() {
                                             Some(f) => f,
-                                            None    => break,
+                                            None => break,
                                         };
-                                        if data_b.len() != (coast_w * coast_h * 4) as usize { break; }
+                                        if data_b.len() != (coast_w * coast_h * 4) as usize {
+                                            break;
+                                        }
                                         let step = (1.0_f32 / 30.0) / bridge_duration;
                                         coast_last_alpha = (coast_last_alpha + step).min(1.0);
                                         bridge_ts += 1.0 / 30.0;
                                         let blended = blend_rgba_transition(
-                                            fa, &data_b, coast_w, coast_h,
-                                            coast_last_alpha, bridge_kind,
+                                            fa,
+                                            &data_b,
+                                            coast_w,
+                                            coast_h,
+                                            coast_last_alpha,
+                                            bridge_kind,
                                         );
                                         eprintln!("[pb] bridge: ts={bridge_ts:.3} alpha={coast_last_alpha:.3} chan={}", pb_frame_tx.len());
                                         // [Fix 2] Move blended into held_blend, clone for send.
@@ -745,18 +933,29 @@ impl MediaWorker {
                                         let send = blended.clone();
                                         held_blend = Some(blended);
                                         let f = PlaybackFrame {
-                                            id, timestamp: bridge_ts,
-                                            width: coast_w, height: coast_h, data: send,
+                                            id,
+                                            timestamp: bridge_ts,
+                                            width: coast_w,
+                                            height: coast_h,
+                                            data: send,
                                         };
-                                        if pb_frame_tx.send(f).is_err() { return; }
+                                        if pb_frame_tx.send(f).is_err() {
+                                            return;
+                                        }
                                     }
                                     spec.alpha_start = coast_last_alpha;
                                     burn_ts = bridge_ts;
                                     eprintln!("[pb] bridge done: alpha_start updated to {:.3}, burn_ts={burn_ts:.3}, chan_filled={}", spec.alpha_start, pb_frame_tx.len());
                                 }
 
-                                blend = Some(ActiveBlend { spec, aspect, decoder_b: prebuilt_db });
-                                if !invert { held_blend = None; }
+                                blend = Some(ActiveBlend {
+                                    spec,
+                                    aspect,
+                                    decoder_b: prebuilt_db,
+                                });
+                                if !invert {
+                                    held_blend = None;
+                                }
                                 // [P0-3] Try prebuffered decoder for the primary.
                                 if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                     if pb_id == id {
@@ -775,11 +974,20 @@ impl MediaWorker {
                                 if decoder.is_none() {
                                     let t0 = std::time::Instant::now();
                                     eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
-                                    match LiveDecoder::open(&path, burn_ts, aspect, None, preview_size) {
+                                    match LiveDecoder::open(
+                                        &path,
+                                        burn_ts,
+                                        aspect,
+                                        None,
+                                        preview_size,
+                                    ) {
                                         Ok(mut d) => {
                                             let tpts = d.ts_to_pts(burn_ts);
                                             d.burn_to_pts(tpts);
-                                            eprintln!("[pb] primary burn done in {}ms", t0.elapsed().as_millis());
+                                            eprintln!(
+                                                "[pb] primary burn done in {}ms",
+                                                t0.elapsed().as_millis()
+                                            );
                                             decoder = Some((id, d));
                                         }
                                         Err(e) => {
@@ -789,8 +997,21 @@ impl MediaWorker {
                                     }
                                 }
                             }
-                            PlaybackCmd::Stop => { blend = None; held_blend = None; last_blend_alpha = 0.0; coast_last_alpha = 0.5; coast_last_primary = None; prebuffered = None; }
-                            PlaybackCmd::PreBuffer { id: pb_id, path: pb_path, ts: pb_ts, aspect: pb_aspect, preview_size: pb_ps } => {
+                            PlaybackCmd::Stop => {
+                                blend = None;
+                                held_blend = None;
+                                last_blend_alpha = 0.0;
+                                coast_last_alpha = 0.5;
+                                coast_last_primary = None;
+                                prebuffered = None;
+                            }
+                            PlaybackCmd::PreBuffer {
+                                id: pb_id,
+                                path: pb_path,
+                                ts: pb_ts,
+                                aspect: pb_aspect,
+                                preview_size: pb_ps,
+                            } => {
                                 // [P0-3] Open decoder for the next clip and start lazy burn.
                                 let t0 = std::time::Instant::now();
                                 match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
@@ -812,15 +1033,24 @@ impl MediaWorker {
                             std::thread::sleep(std::time::Duration::from_millis(4));
                         } else {
                             let animated = (|| -> Option<Vec<u8>> {
-                                let b  = blend.as_mut()?;
+                                let b = blend.as_mut()?;
                                 let fa = coast_last_primary.as_ref()?;
                                 let db = b.decoder_b.as_mut()?;
                                 let (data_b, _, _, _) = db.next_frame()?;
-                                if data_b.len() != fa.len() { return None; }
+                                if data_b.len() != fa.len() {
+                                    return None;
+                                }
                                 let step = (1.0_f32 / 30.0) / b.spec.duration;
                                 coast_last_alpha = (coast_last_alpha + step).min(1.0);
                                 coast_ts += 1.0 / 30.0;
-                                Some(blend_rgba_transition(fa, &data_b, coast_w, coast_h, coast_last_alpha, b.spec.kind))
+                                Some(blend_rgba_transition(
+                                    fa,
+                                    &data_b,
+                                    coast_w,
+                                    coast_h,
+                                    coast_last_alpha,
+                                    b.spec.kind,
+                                ))
                             })();
 
                             let send_data = if let Some(blended) = animated {
@@ -835,15 +1065,19 @@ impl MediaWorker {
 
                             if let Some(data) = send_data {
                                 let f = PlaybackFrame {
-                                    id:        coast_id,
+                                    id: coast_id,
                                     timestamp: coast_ts,
-                                    width:     coast_w,
-                                    height:    coast_h,
+                                    width: coast_w,
+                                    height: coast_h,
                                     data,
                                 };
-                                if pb_frame_tx.send(f).is_err() { return; }
+                                if pb_frame_tx.send(f).is_err() {
+                                    return;
+                                }
                             } else {
-                                eprintln!("[pb] coast: both animated and held_blend None — exiting coast");
+                                eprintln!(
+                                    "[pb] coast: both animated and held_blend None — exiting coast"
+                                );
                                 coasting = false;
                             }
                         }
@@ -853,11 +1087,17 @@ impl MediaWorker {
         });
 
         Self {
-            rx, tx, scrub_rx, scrub_tx, frame_req, pb_tx, pb_rx,
-            shutdown:       Arc::new(AtomicBool::new(false)),
-            probe_sem:      Arc::new((Mutex::new(0), Condvar::new())),
+            rx,
+            tx,
+            scrub_rx,
+            scrub_tx,
+            frame_req,
+            pb_tx,
+            pb_rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            probe_sem: Arc::new((Mutex::new(0), Condvar::new())),
             encode_cancels: Arc::new(Mutex::new(HashMap::new())),
-            hq_sem:         Arc::new((Mutex::new(0), Condvar::new())),
+            hq_sem: Arc::new((Mutex::new(0), Condvar::new())),
             transition_scrub_req,
         }
     }
@@ -871,32 +1111,32 @@ impl MediaWorker {
         // Poison-pill the regular scrub thread.
         let (lock, cvar) = &*self.frame_req;
         *lock.lock().unwrap() = Some(FrameRequest {
-            id:        Uuid::nil(),
-            path:      std::path::PathBuf::new(),
+            id: Uuid::nil(),
+            path: std::path::PathBuf::new(),
             timestamp: 0.0,
-            aspect:    0.0,
+            aspect: 0.0,
         });
         cvar.notify_one();
         // Poison-pill the transition scrub thread.
         {
             let (lock, cvar) = &*self.transition_scrub_req;
             *lock.lock().unwrap() = Some(TransitionScrubRequest {
-                clip_a_id:   Uuid::nil(),
+                clip_a_id: Uuid::nil(),
                 clip_a_path: std::path::PathBuf::new(),
-                clip_a_ts:   0.0,
-                clip_b_id:   Uuid::nil(),
+                clip_a_ts: 0.0,
+                clip_b_id: Uuid::nil(),
                 clip_b_path: std::path::PathBuf::new(),
-                clip_b_ts:   0.0,
-                alpha:       0.0,
-                kind:        velocut_core::transitions::TransitionKind::Cut,
+                clip_b_ts: 0.0,
+                alpha: 0.0,
+                kind: velocut_core::transitions::TransitionKind::Cut,
             });
             cvar.notify_one();
         }
     }
 
     pub fn probe_clip(&self, id: Uuid, path: PathBuf) {
-        let tx  = self.tx.clone();
-        let sd  = self.shutdown.clone();
+        let tx = self.tx.clone();
+        let sd = self.shutdown.clone();
         let sem = self.probe_sem.clone();
 
         std::thread::spawn(move || {
@@ -925,16 +1165,24 @@ impl MediaWorker {
             }
             let _guard = SemGuard(sem);
 
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             let dur = probe_duration(&path, id, &tx);
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             probe_video_size_and_thumbnail(&path, id, dur, &tx);
 
             // NOTE: do NOT drop(_guard) here. extract_waveform and extract_audio
             // must run under the semaphore — they are the expensive operations.
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             extract_waveform(&path, id, &tx);
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             if dur > 0.0 {
                 extract_audio(&path, id, 0.0, f64::MAX, &tx);
             }
@@ -955,28 +1203,41 @@ impl MediaWorker {
     /// 28 seconds this reduces the temp WAV from ~55 MB to ~10 MB.
     pub fn extract_audio_trimmed(
         &self,
-        id:            Uuid,
-        path:          PathBuf,
+        id: Uuid,
+        path: PathBuf,
         source_offset: f64,
-        duration:      f64,
+        duration: f64,
     ) {
         let tx = self.tx.clone();
         let sd = self.shutdown.clone();
         thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             extract_audio(&path, id, source_offset, duration, &tx);
         });
     }
 
     pub fn request_frame(&self, id: Uuid, path: PathBuf, timestamp: f64, aspect: f32) {
         let (lock, cvar) = &*self.frame_req;
-        *lock.lock().unwrap() = Some(FrameRequest { id, path, timestamp, aspect });
+        *lock.lock().unwrap() = Some(FrameRequest {
+            id,
+            path,
+            timestamp,
+            aspect,
+        });
         cvar.notify_one();
     }
 
-    pub fn request_frame_hq(&self, id: Uuid, path: PathBuf, timestamp: f64, preview_size: Option<(u32, u32)>) {
-        let tx  = self.scrub_tx.clone();
-        let sd  = self.shutdown.clone();
+    pub fn request_frame_hq(
+        &self,
+        id: Uuid,
+        path: PathBuf,
+        timestamp: f64,
+        preview_size: Option<(u32, u32)>,
+    ) {
+        let tx = self.scrub_tx.clone();
+        let sd = self.shutdown.clone();
         let sem = self.hq_sem.clone();
         thread::spawn(move || {
             // Acquire the HQ semaphore before opening any FFmpeg context.
@@ -986,7 +1247,9 @@ impl MediaWorker {
             {
                 let (lock, cvar) = &*sem;
                 let mut c = lock.lock().unwrap();
-                while *c >= HQ_CONCURRENCY { c = cvar.wait(c).unwrap(); }
+                while *c >= HQ_CONCURRENCY {
+                    c = cvar.wait(c).unwrap();
+                }
                 *c += 1;
             }
             let _guard = {
@@ -1000,8 +1263,11 @@ impl MediaWorker {
                 }
                 G(sem)
             };
-            if sd.load(Ordering::Relaxed) { return; }
-            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx, preview_size) {
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx, preview_size)
+            {
                 eprintln!("[media] request_frame_hq: {e}");
             }
         });
@@ -1015,15 +1281,17 @@ impl MediaWorker {
 
     pub fn request_transition_frame_hq(&self, req: TransitionScrubRequest) {
         let scrub_tx = self.scrub_tx.clone();
-        let sd       = self.shutdown.clone();
-        let sem      = self.hq_sem.clone();
+        let sd = self.shutdown.clone();
+        let sem = self.hq_sem.clone();
         thread::spawn(move || {
             // Two native-res decoders opened per call — gate on hq_sem.
             const HQ_CONCURRENCY: u32 = 2;
             {
                 let (lock, cvar) = &*sem;
                 let mut c = lock.lock().unwrap();
-                while *c >= HQ_CONCURRENCY { c = cvar.wait(c).unwrap(); }
+                while *c >= HQ_CONCURRENCY {
+                    c = cvar.wait(c).unwrap();
+                }
                 *c += 1;
             }
             let _guard = {
@@ -1037,16 +1305,27 @@ impl MediaWorker {
                 }
                 G(sem)
             };
-            if sd.load(Ordering::Relaxed) { return; }
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
             let (data_a, w, h) = match decode_one_frame_rgba(&req.clip_a_path, req.clip_a_ts, 0.0) {
-                Ok(f)  => f,
-                Err(e) => { eprintln!("[transition_hq] clip_a decode: {e}"); return; }
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[transition_hq] clip_a decode: {e}");
+                    return;
+                }
             };
-            if sd.load(Ordering::Relaxed) { return; }
-            let (data_b_raw, wb, hb) = match decode_one_frame_rgba(&req.clip_b_path, req.clip_b_ts, 0.0) {
-                Ok(f)  => f,
-                Err(e) => { eprintln!("[transition_hq] clip_b decode: {e}"); return; }
-            };
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
+            let (data_b_raw, wb, hb) =
+                match decode_one_frame_rgba(&req.clip_b_path, req.clip_b_ts, 0.0) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[transition_hq] clip_b decode: {e}");
+                        return;
+                    }
+                };
             let data_b = if wb != w || hb != h {
                 eprintln!(
                     "[transition_hq] clip_b size {}x{} differs from clip_a {}x{}; cropping",
@@ -1058,7 +1337,10 @@ impl MediaWorker {
             };
             let blended = blend_rgba_transition(&data_a, &data_b, w, h, req.alpha, req.kind);
             let _ = scrub_tx.send(MediaResult::VideoFrame {
-                id: req.clip_a_id, width: w, height: h, data: blended,
+                id: req.clip_a_id,
+                width: w,
+                height: h,
+                data: blended,
             });
         });
     }
@@ -1069,8 +1351,25 @@ impl MediaWorker {
     ///   • 1080p native: 8 MB/frame × 6 frames = 48 MB in channel, ~8% CPU (swscale)
     ///   • 960×540:      2 MB/frame × 6 frames = 12 MB in channel, ~0.5% CPU
     /// Pass None to decode at native resolution (not recommended for preview).
-    pub fn start_playback(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)>) {
-        if self.pb_tx.try_send(PlaybackCmd::Start { id, path, ts, aspect, preview_size }).is_err() {
+    pub fn start_playback(
+        &self,
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        preview_size: Option<(u32, u32)>,
+    ) {
+        if self
+            .pb_tx
+            .try_send(PlaybackCmd::Start {
+                id,
+                path,
+                ts,
+                aspect,
+                preview_size,
+            })
+            .is_err()
+        {
             eprintln!("[pb] start_playback: command channel full — Start dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
@@ -1078,14 +1377,25 @@ impl MediaWorker {
 
     pub fn start_blend_playback(
         &self,
-        id:           Uuid,
-        path:         PathBuf,
-        ts:           f64,
-        aspect:       f32,
-        blend:        PlaybackTransitionSpec,
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        blend: PlaybackTransitionSpec,
         preview_size: Option<(u32, u32)>,
     ) {
-        if self.pb_tx.try_send(PlaybackCmd::StartBlend { id, path, ts, aspect, blend, preview_size }).is_err() {
+        if self
+            .pb_tx
+            .try_send(PlaybackCmd::StartBlend {
+                id,
+                path,
+                ts,
+                aspect,
+                blend,
+                preview_size,
+            })
+            .is_err()
+        {
             eprintln!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
@@ -1095,8 +1405,21 @@ impl MediaWorker {
     /// reuse it instead of opening fresh.  Best-effort: if the command channel
     /// is full the request is silently dropped — the Start handler falls back
     /// to its normal open+burn path.
-    pub fn prebuffer(&self, id: Uuid, path: PathBuf, ts: f64, aspect: f32, preview_size: Option<(u32, u32)>) {
-        let _ = self.pb_tx.try_send(PlaybackCmd::PreBuffer { id, path, ts, aspect, preview_size });
+    pub fn prebuffer(
+        &self,
+        id: Uuid,
+        path: PathBuf,
+        ts: f64,
+        aspect: f32,
+        preview_size: Option<(u32, u32)>,
+    ) {
+        let _ = self.pb_tx.try_send(PlaybackCmd::PreBuffer {
+            id,
+            path,
+            ts,
+            aspect,
+            preview_size,
+        });
     }
 
     pub fn stop_playback(&self) {
@@ -1110,10 +1433,10 @@ impl MediaWorker {
         let tx = self.tx.clone();
         let sd = self.shutdown.clone();
         thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) { return; }
-            if let Err(e) = decode_frame(
-                &path, id, timestamp, 0.0, true, Some(dest), &tx, None,
-            ) {
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Err(e) = decode_frame(&path, id, timestamp, 0.0, true, Some(dest), &tx, None) {
                 eprintln!("[media] extract_frame_hq: {e}");
             }
         });
@@ -1122,10 +1445,13 @@ impl MediaWorker {
     pub fn start_encode(&self, spec: EncodeSpec) {
         let job_id = spec.job_id;
         let cancel = Arc::new(AtomicBool::new(false));
-        let tx     = self.tx.clone();
-        let sd     = self.shutdown.clone();
+        let tx = self.tx.clone();
+        let sd = self.shutdown.clone();
 
-        self.encode_cancels.lock().unwrap().insert(job_id, Arc::clone(&cancel));
+        self.encode_cancels
+            .lock()
+            .unwrap()
+            .insert(job_id, Arc::clone(&cancel));
 
         let cancels_ref = Arc::clone(&self.encode_cancels);
         thread::spawn(move || {
@@ -1147,10 +1473,7 @@ impl MediaWorker {
             {
                 extern "system" {
                     fn GetCurrentThread() -> *mut core::ffi::c_void;
-                    fn SetThreadPriority(
-                        hThread:   *mut core::ffi::c_void,
-                        nPriority: i32,
-                    ) -> i32;
+                    fn SetThreadPriority(hThread: *mut core::ffi::c_void, nPriority: i32) -> i32;
                 }
                 // THREAD_PRIORITY_BELOW_NORMAL = -1: yields to normal-priority
                 // threads (UI, audio) but still outranks idle/background work.
@@ -1190,8 +1513,8 @@ impl MediaWorker {
 // ── Blend decoder helpers ─────────────────────────────────────────────────────
 
 struct ActiveBlend {
-    spec:      velocut_core::media_types::PlaybackTransitionSpec,
-    aspect:    f32,
+    spec: velocut_core::media_types::PlaybackTransitionSpec,
+    aspect: f32,
     decoder_b: Option<LiveDecoder>,
 }
 
@@ -1207,20 +1530,21 @@ struct ActiveBlend {
 fn decode_transition_scrub_frame(
     live: &mut Option<(PathBuf, LiveDecoder)>,
     path: &PathBuf,
-    ts:   f64,
+    ts: f64,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let needs_reset = live.as_ref().map(|(p, d)| {
-        let tpts     = d.ts_to_pts(ts);
-        let two_secs = d.ts_to_pts(2.0);
-        p != path
-            || tpts <= d.last_pts
-            || tpts > d.last_pts + two_secs
-    }).unwrap_or(true);
+    let needs_reset = live
+        .as_ref()
+        .map(|(p, d)| {
+            let tpts = d.ts_to_pts(ts);
+            let two_secs = d.ts_to_pts(2.0);
+            p != path || tpts <= d.last_pts || tpts > d.last_pts + two_secs
+        })
+        .unwrap_or(true);
 
     if needs_reset {
-        let cached_sws = live.take().map(|(_, d)| {
-            (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h)
-        });
+        let cached_sws = live
+            .take()
+            .map(|(_, d)| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
         match LiveDecoder::open(path, ts, 1.0, cached_sws, None) {
             Ok(mut d) => {
                 d.skip_until_pts = d.ts_to_pts(ts);
@@ -1228,7 +1552,10 @@ fn decode_transition_scrub_frame(
                 *live = Some((path.clone(), d));
                 result
             }
-            Err(e) => { eprintln!("[transition_scrub] LiveDecoder::open: {e}"); None }
+            Err(e) => {
+                eprintln!("[transition_scrub] LiveDecoder::open: {e}");
+                None
+            }
         }
     } else {
         let (_, d) = live.as_mut().unwrap();
@@ -1243,15 +1570,15 @@ fn crop_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<
 
     let (off_x, off_y, used_w, used_h) = if src_ar > dst_ar {
         let used_w = (src_h as f32 * dst_ar) as u32;
-        let off_x  = (src_w - used_w) / 2;
+        let off_x = (src_w - used_w) / 2;
         (off_x, 0u32, used_w, src_h)
     } else {
         let used_h = (src_w as f32 / dst_ar) as u32;
-        let off_y  = (src_h - used_h) / 2;
+        let off_y = (src_h - used_h) / 2;
         (0u32, off_y, src_w, used_h)
     };
 
-    let sx = used_w  as f32 / dst_w.max(1) as f32;
+    let sx = used_w as f32 / dst_w.max(1) as f32;
     let sy = used_h as f32 / dst_h.max(1) as f32;
 
     let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
@@ -1262,8 +1589,8 @@ fn crop_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<
             let src_x = src_x.clamp(0, src_w.saturating_sub(1));
             let src_y = src_y.clamp(0, src_h.saturating_sub(1));
             let si = (src_y * src_w + src_x) as usize * 4;
-            let di = (dy   * dst_w + dx)     as usize * 4;
-            out[di..di+4].copy_from_slice(&src[si..si+4]);
+            let di = (dy * dst_w + dx) as usize * 4;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
         }
     }
     out
@@ -1272,16 +1599,16 @@ fn crop_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<
 // ── RGBA transition blending ──────────────────────────────────────────────────
 
 fn blend_rgba_transition(
-    a:     &[u8],
-    b:     &[u8],
-    w:     u32,
-    h:     u32,
+    a: &[u8],
+    b: &[u8],
+    w: u32,
+    h: u32,
     alpha: f32,
-    kind:  velocut_core::transitions::TransitionKind,
+    kind: velocut_core::transitions::TransitionKind,
 ) -> Vec<u8> {
-    use velocut_core::transitions::{TransitionKind, VideoTransition, registry};
     use std::collections::HashMap;
     use std::sync::OnceLock;
+    use velocut_core::transitions::{registry, TransitionKind, VideoTransition};
 
     if kind == TransitionKind::Cut {
         return a.to_vec();
@@ -1294,6 +1621,8 @@ fn blend_rgba_transition(
     let reg = REGISTRY.get_or_init(registry);
 
     reg.get(&kind)
-        .expect("blend_rgba_transition: unregistered TransitionKind — add it to declare_transitions!")
+        .expect(
+            "blend_rgba_transition: unregistered TransitionKind — add it to declare_transitions!",
+        )
         .apply_rgba(a, b, w, h, alpha)
 }

@@ -24,15 +24,15 @@ use crate::state::AspectRatio;
 /// ```
 pub fn aspect_ratio_value(ar: AspectRatio) -> f32 {
     match ar {
-        AspectRatio::SixteenNine   => 16.0 / 9.0,
-        AspectRatio::NineSixteen   => 9.0  / 16.0,
-        AspectRatio::TwoThree      => 2.0  / 3.0,
-        AspectRatio::ThreeTwo      => 3.0  / 2.0,
-        AspectRatio::FourThree     => 4.0  / 3.0,
-        AspectRatio::OneOne        => 1.0,
-        AspectRatio::FourFive      => 4.0  / 5.0,
+        AspectRatio::SixteenNine => 16.0 / 9.0,
+        AspectRatio::NineSixteen => 9.0 / 16.0,
+        AspectRatio::TwoThree => 2.0 / 3.0,
+        AspectRatio::ThreeTwo => 3.0 / 2.0,
+        AspectRatio::FourThree => 4.0 / 3.0,
+        AspectRatio::OneOne => 1.0,
+        AspectRatio::FourFive => 4.0 / 5.0,
         AspectRatio::TwentyOneNine => 21.0 / 9.0,
-        AspectRatio::Anamorphic    => 2.39,
+        AspectRatio::Anamorphic => 2.39,
     }
 }
 
@@ -41,14 +41,14 @@ pub fn aspect_ratio_value(ar: AspectRatio) -> f32 {
 /// Shown in the export panel ComboBox and in the "Match Project" button hint.
 pub fn aspect_ratio_label(ar: AspectRatio) -> &'static str {
     match ar {
-        AspectRatio::SixteenNine   => "16:9  — Landscape / YouTube",
-        AspectRatio::NineSixteen   => "9:16  — Portrait / Reels / Shorts",
-        AspectRatio::FourThree     => "4:3   — Classic TV",
-        AspectRatio::ThreeTwo      => "3:2   — Landscape photo",
-        AspectRatio::TwoThree      => "2:3   — Portrait photo",
-        AspectRatio::OneOne        => "1:1   — Square",
-        AspectRatio::FourFive      => "4:5   — Instagram portrait",
+        AspectRatio::SixteenNine => "16:9  — Landscape / YouTube",
+        AspectRatio::NineSixteen => "9:16  — Portrait / Reels / Shorts",
+        AspectRatio::FourThree => "4:3   — Classic TV",
+        AspectRatio::ThreeTwo => "3:2   — Landscape photo",
+        AspectRatio::TwoThree => "2:3   — Portrait photo",
+        AspectRatio::OneOne => "1:1   — Square",
+        AspectRatio::FourFive => "4:5   — Instagram portrait",
         AspectRatio::TwentyOneNine => "21:9  — Ultrawide / Cinema",
-        AspectRatio::Anamorphic    => "2.39  — Anamorphic widescreen",
+        AspectRatio::Anamorphic => "2.39  — Anamorphic widescreen",
     }
 }

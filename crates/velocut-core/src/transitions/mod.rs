@@ -37,9 +37,9 @@
 
 pub mod helpers;
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 // ── Drop-in registration ──────────────────────────────────────────────────────
 //
@@ -108,19 +108,28 @@ pub struct TransitionType {
 
 impl Default for TransitionType {
     fn default() -> Self {
-        TransitionType { kind: TransitionKind::Cut, duration_secs: 0.0 }
+        TransitionType {
+            kind: TransitionKind::Cut,
+            duration_secs: 0.0,
+        }
     }
 }
 
 impl TransitionType {
     /// General constructor — used by `VideoTransition::build()` impls.
     pub fn new(kind: TransitionKind, duration_secs: f32) -> Self {
-        TransitionType { kind, duration_secs }
+        TransitionType {
+            kind,
+            duration_secs,
+        }
     }
 
     /// Convenience constructor for a hard cut.
     pub fn cut() -> Self {
-        TransitionType { kind: TransitionKind::Cut, duration_secs: 0.0 }
+        TransitionType {
+            kind: TransitionKind::Cut,
+            duration_secs: 0.0,
+        }
     }
 }
 
@@ -180,7 +189,9 @@ pub trait VideoTransition: Send + Sync {
 
     /// Default overlap duration in seconds pre-filled in the UI when the user
     /// first selects this transition.
-    fn default_duration_secs(&self) -> f32 { 0.5 }
+    fn default_duration_secs(&self) -> f32 {
+        0.5
+    }
 
     /// Construct the serialized `TransitionType` for this transition.
     ///
@@ -192,35 +203,35 @@ pub trait VideoTransition: Send + Sync {
     fn build(&self, duration_secs: f32) -> TransitionType;
 
     /// Shortest meaningful duration in seconds. UI should clamp below this.
-    fn min_duration_secs(&self) -> f32 { 0.2 }
+    fn min_duration_secs(&self) -> f32 {
+        0.2
+    }
 
     /// Longest meaningful duration in seconds. UI should clamp above this.
-    fn max_duration_secs(&self) -> f32 { 5.0 }
+    fn max_duration_secs(&self) -> f32 {
+        5.0
+    }
 
     /// One-sentence description shown in tooltips.
     /// Empty string = no tooltip.
-    fn description(&self) -> &'static str { "" }
+    fn description(&self) -> &'static str {
+        ""
+    }
 
     /// Blend `frame_a` and `frame_b` at `alpha` and return the packed result.
     ///
     /// `width` / `height` are luma plane dimensions in pixels.
     /// UV dims are `(width / 2, height / 2)`.
-    fn apply(
-        &self,
-        frame_a: &[u8],
-        frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
-    ) -> Vec<u8>;
+    fn apply(&self, frame_a: &[u8], frame_b: &[u8], width: u32, height: u32, alpha: f32)
+        -> Vec<u8>;
 
     fn apply_rgba(
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8>;
 }
 

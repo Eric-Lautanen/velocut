@@ -12,15 +12,15 @@
 //     ├── audio_stream        — rodio OutputStream (must outlive all sinks)
 //     └── audio_sinks         — per-clip Sink map (managed by audio_module only)
 
-use velocut_media::{MediaWorker, MediaResult};
-use velocut_core::media_types::PlaybackFrame;
-use velocut_core::state::ProjectState;
 use crate::modules::ThumbnailCache;
 use crate::velocut_log;
 use eframe::egui;
 use rodio::{MixerDeviceSink, Player};
 use std::collections::HashMap;
 use uuid::Uuid;
+use velocut_core::media_types::PlaybackFrame;
+use velocut_core::state::ProjectState;
+use velocut_media::{MediaResult, MediaWorker};
 
 // ── Memory ceiling ────────────────────────────────────────────────────────────
 // Approximate byte budget for GPU-resident frame textures.
@@ -74,12 +74,12 @@ pub struct CacheContext {
 impl CacheContext {
     fn new() -> Self {
         Self {
-            thumbnail_cache:    HashMap::new(),
-            frame_cache:        HashMap::new(),
-            pending_pb_frame:   None,
+            thumbnail_cache: HashMap::new(),
+            frame_cache: HashMap::new(),
+            pending_pb_frame: None,
             frame_bucket_cache: HashMap::new(),
-            frame_cache_bytes:  0,
-            scrub_textures:     HashMap::new(),
+            frame_cache_bytes: 0,
+            scrub_textures: HashMap::new(),
         }
     }
 
@@ -110,10 +110,9 @@ impl CacheContext {
             // [Opt 4] O(N) partial select: puts the 32 furthest entries at keys[..32]
             // without fully sorting the remaining N-32 entries.
             if keys.len() > 32 {
-                keys.select_nth_unstable_by_key(
-                    32,
-                    |(_, b)| std::cmp::Reverse(b.abs_diff(current_bucket)),
-                );
+                keys.select_nth_unstable_by_key(32, |(_, b)| {
+                    std::cmp::Reverse(b.abs_diff(current_bucket))
+                });
             }
             keys.truncate(32);
 
@@ -127,7 +126,8 @@ impl CacheContext {
             }
         }
 
-        self.frame_bucket_cache.insert(key, (tex.clone(), frame_bytes));
+        self.frame_bucket_cache
+            .insert(key, (tex.clone(), frame_bytes));
         self.frame_cache_bytes += frame_bytes;
         tex
     }
@@ -145,8 +145,8 @@ impl CacheContext {
         self.frame_cache.clear();
         self.frame_bucket_cache.clear();
         self.scrub_textures.clear();
-        self.pending_pb_frame   = None;
-        self.frame_cache_bytes  = 0;
+        self.pending_pb_frame = None;
+        self.frame_cache_bytes = 0;
     }
 }
 
@@ -184,13 +184,13 @@ pub struct PlaybackContext {
 impl PlaybackContext {
     fn new() -> Self {
         Self {
-            last_frame_req:      None,
-            scrub_coarse_req:    None,
-            scrub_last_moved:    None,
-            playback_media_id:   None,
-            prev_playing:        false,
-            audio_was_playing:   false,
-            prebuffer_sent_for:  None,
+            last_frame_req: None,
+            scrub_coarse_req: None,
+            scrub_last_moved: None,
+            playback_media_id: None,
+            prev_playing: false,
+            audio_was_playing: false,
+            prebuffer_sent_for: None,
         }
     }
 
@@ -199,13 +199,13 @@ impl PlaybackContext {
     /// Called by the `ClearProject` handler so the scrub / playback pipeline
     /// starts clean after a wipe without needing to reconstruct the struct.
     pub fn reset(&mut self) {
-        self.last_frame_req      = None;
-        self.scrub_coarse_req    = None;
-        self.scrub_last_moved    = None;
-        self.playback_media_id   = None;
-        self.prev_playing        = false;
-        self.audio_was_playing   = false;
-        self.prebuffer_sent_for  = None;
+        self.last_frame_req = None;
+        self.scrub_coarse_req = None;
+        self.scrub_last_moved = None;
+        self.playback_media_id = None;
+        self.prev_playing = false;
+        self.audio_was_playing = false;
+        self.prebuffer_sent_for = None;
     }
 }
 
@@ -225,7 +225,7 @@ pub struct AppContext {
     // MixerDeviceSink MUST stay alive for the entire app lifetime — dropping it
     // stops all audio.  audio_module borrows it each tick via .mixer().
     pub audio_stream: Option<MixerDeviceSink>,
-    pub audio_sinks:  HashMap<Uuid, Player>,
+    pub audio_sinks: HashMap<Uuid, Player>,
     pub audio_overlay_sinks: HashMap<Uuid, rodio::Player>,
 }
 
@@ -237,10 +237,10 @@ impl AppContext {
         // for the entire session. By the time tick() runs, the message loop is live.
         Self {
             media_worker,
-            cache:        CacheContext::new(),
-            playback:     PlaybackContext::new(),
+            cache: CacheContext::new(),
+            playback: PlaybackContext::new(),
             audio_stream: None,
-            audio_sinks:  HashMap::new(),
+            audio_sinks: HashMap::new(),
             audio_overlay_sinks: HashMap::new(),
         }
     }
@@ -255,11 +255,7 @@ impl AppContext {
     ///
     /// [Opt 3] scrub_rx is drained first (before the shared rx) so scrub
     /// VideoFrame results are never delayed behind probe or encode traffic.
-    pub fn ingest_media_results(
-        &mut self,
-        state: &mut ProjectState,
-        ctx:   &egui::Context,
-    ) {
+    pub fn ingest_media_results(&mut self, state: &mut ProjectState, ctx: &egui::Context) {
         // Single repaint flag — set by any result that changes visible state.
         // Calling ctx.request_repaint() once at the end is identical in effect
         // to calling it N times mid-loop (egui deduplicates), but avoids the
@@ -274,7 +270,13 @@ impl AppContext {
         while let Ok(result) = self.media_worker.scrub_rx.try_recv() {
             // Only VideoFrame arrives on scrub_rx — match exhaustively so the
             // compiler warns if the channel ever carries an unexpected variant.
-            if let MediaResult::VideoFrame { id, width, height, data } = result {
+            if let MediaResult::VideoFrame {
+                id,
+                width,
+                height,
+                data,
+            } = result
+            {
                 self.ingest_video_frame(id, width, height, data, state, &mut needs_repaint, ctx);
             }
         }
@@ -282,7 +284,11 @@ impl AppContext {
         // ── Shared channel: probes, waveforms, audio, encode, HQ frames ───────
         while let Ok(result) = self.media_worker.rx.try_recv() {
             match result {
-                MediaResult::AudioPath { id, path, trimmed_offset } => {
+                MediaResult::AudioPath {
+                    id,
+                    path,
+                    trimmed_offset,
+                } => {
                     velocut_log!("[audio] AudioPath arrived id={id} path={} trimmed_offset={trimmed_offset:.3}", path.display());
                     state.set_audio_path(id, path, trimmed_offset);
                 }
@@ -292,11 +298,17 @@ impl AppContext {
                     needs_repaint = true;
                 }
 
-                MediaResult::Thumbnail { id, width, height, data } => {
+                MediaResult::Thumbnail {
+                    id,
+                    width,
+                    height,
+                    data,
+                } => {
                     let tex = ctx.load_texture(
                         format!("thumb-{id}"),
                         egui::ColorImage::from_rgba_unmultiplied(
-                            [width as usize, height as usize], &data,
+                            [width as usize, height as usize],
+                            &data,
                         ),
                         egui::TextureOptions::LINEAR,
                     );
@@ -318,7 +330,8 @@ impl AppContext {
 
                 MediaResult::FrameSaved { path } => {
                     velocut_log!("[app] frame PNG saved → {:?}", path);
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "frame".into());
                     state.save_status = Some(format!("✓ Saved: {}", name));
@@ -328,8 +341,21 @@ impl AppContext {
                 // VideoFrame on the shared channel = HQ one-shot frame from
                 // extract_frame_hq.  Scrub frames no longer arrive here —
                 // they travel on scrub_rx and are consumed above.
-                MediaResult::VideoFrame { id, width, height, data } => {
-                    self.ingest_video_frame(id, width, height, data, state, &mut needs_repaint, ctx);
+                MediaResult::VideoFrame {
+                    id,
+                    width,
+                    height,
+                    data,
+                } => {
+                    self.ingest_video_frame(
+                        id,
+                        width,
+                        height,
+                        data,
+                        state,
+                        &mut needs_repaint,
+                        ctx,
+                    );
                 }
 
                 MediaResult::Error { id, msg } => {
@@ -340,8 +366,11 @@ impl AppContext {
                 // All three arms guard on `state.encode_job == Some(job_id)` so a
                 // stale result from a previously cancelled job never clobbers a
                 // freshly started one.
-
-                MediaResult::EncodeProgress { job_id, frame, total_frames } => {
+                MediaResult::EncodeProgress {
+                    job_id,
+                    frame,
+                    total_frames,
+                } => {
                     if state.encode_job == Some(job_id) {
                         state.encode_progress = Some((frame, total_frames));
                         needs_repaint = true;
@@ -377,20 +406,21 @@ impl AppContext {
     /// Factored out so both the scrub_rx fast path and the shared rx path
     /// (HQ frames from extract_frame_hq) go through identical bucket-cache
     /// and frame_cache logic without duplication.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_video_frame(
         &mut self,
-        id:            Uuid,
-        width:         u32,
-        height:        u32,
-        mut data:          Vec<u8>,
-        state:         &mut ProjectState,
+        id: Uuid,
+        width: u32,
+        height: u32,
+        mut data: Vec<u8>,
+        state: &mut ProjectState,
         needs_repaint: &mut bool,
-        ctx:           &egui::Context,
+        ctx: &egui::Context,
     ) {
-
-
         {
-            let active_filter = state.timeline.iter()
+            let active_filter = state
+                .timeline
+                .iter()
                 .find(|c| {
                     c.track_row % 2 == 0
                         && state.current_time >= c.start_time
@@ -430,7 +460,7 @@ impl AppContext {
             Vec::from_raw_parts(ptr, len, cap)
         };
         let image = egui::ColorImage {
-            size:        [width as usize, height as usize],
+            size: [width as usize, height as usize],
             // source_size is the logical source dimensions before any egui scaling.
             // Our buffer is always exactly `size` pixels (no sub-region), so they match.
             source_size: egui::Vec2::new(width as f32, height as f32),
@@ -456,26 +486,32 @@ impl AppContext {
             }
             _ => {
                 // Cold path: first frame or resolution change — full GPU alloc.
-                let handle = ctx.load_texture(
-                    format!("scrub-{id}"),
-                    image,
-                    egui::TextureOptions::LINEAR,
-                );
-                self.cache.scrub_textures.insert(id, (handle.clone(), width, height));
+                let handle =
+                    ctx.load_texture(format!("scrub-{id}"), image, egui::TextureOptions::LINEAR);
+                self.cache
+                    .scrub_textures
+                    .insert(id, (handle.clone(), width, height));
                 handle
             }
         };
 
         // Derive the ¼s bucket key for frame_bucket_cache.
         // playback.last_frame_req stores exact f64 ts — convert here.
-        let bucket: u32 = self.playback.last_frame_req
+        let bucket: u32 = self
+            .playback
+            .last_frame_req
             .filter(|(rid, _)| *rid == id)
             .map(|(_, ts)| (ts * 4.0) as u32)
-            .or_else(|| self.playback.scrub_coarse_req
-                .filter(|(rid, _)| *rid == id)
-                .map(|(_, cb)| cb * 8))
+            .or_else(|| {
+                self.playback
+                    .scrub_coarse_req
+                    .filter(|(rid, _)| *rid == id)
+                    .map(|(_, cb)| cb * 8)
+            })
             .unwrap_or_else(|| {
-                state.timeline.iter()
+                state
+                    .timeline
+                    .iter()
                     .find(|c| c.media_id == id)
                     .map(|c| {
                         let lt = (state.current_time - c.start_time).max(0.0);

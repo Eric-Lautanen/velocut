@@ -11,8 +11,8 @@
 // with a lifetime tied to the state, so callers can continue to read other
 // fields on state in the same expression.
 
-use velocut_core::state::{LibraryClip, ProjectState, TimelineClip};
 use uuid::Uuid;
+use velocut_core::state::{LibraryClip, ProjectState, TimelineClip};
 
 // ── Timeline lookups ──────────────────────────────────────────────────────────
 
@@ -31,7 +31,9 @@ pub fn timeline_clip(state: &ProjectState, id: Uuid) -> Option<&TimelineClip> {
 /// .iter().find(|c| c.id == id))` chain that recurs in the timeline toolbar.
 #[inline]
 pub fn selected_timeline_clip(state: &ProjectState) -> Option<&TimelineClip> {
-    state.selected_timeline_clip.and_then(|id| timeline_clip(state, id))
+    state
+        .selected_timeline_clip
+        .and_then(|id| timeline_clip(state, id))
 }
 
 /// Return the timeline clip that contains `time` (i.e. the clip currently
@@ -41,9 +43,10 @@ pub fn selected_timeline_clip(state: &ProjectState) -> Option<&TimelineClip> {
 /// and app.rs for "what is playing right now" queries.
 #[inline]
 pub fn clip_at_time(state: &ProjectState, time: f64) -> Option<&TimelineClip> {
-    state.timeline.iter().find(|c| {
-        time >= c.start_time && time < c.start_time + c.duration
-    })
+    state
+        .timeline
+        .iter()
+        .find(|c| time >= c.start_time && time < c.start_time + c.duration)
 }
 
 // ── Library lookups ───────────────────────────────────────────────────────────
@@ -71,7 +74,7 @@ pub fn library_clip(state: &ProjectState, id: Uuid) -> Option<&LibraryClip> {
 #[inline]
 pub fn library_entry_for<'s>(
     state: &'s ProjectState,
-    clip:  &TimelineClip,
+    clip: &TimelineClip,
 ) -> Option<&'s LibraryClip> {
     library_clip(state, clip.media_id)
 }
@@ -113,10 +116,12 @@ pub fn is_extracted_audio_clip(clip: &TimelineClip) -> bool {
 /// has `audio_muted = true`, and anywhere else the V↔A relationship is traversed.
 #[inline]
 pub fn linked_audio_clip<'s>(
-    state:      &'s ProjectState,
+    state: &'s ProjectState,
     video_clip: &TimelineClip,
 ) -> Option<&'s TimelineClip> {
-    video_clip.linked_clip_id.and_then(|aid| timeline_clip(state, aid))
+    video_clip
+        .linked_clip_id
+        .and_then(|aid| timeline_clip(state, aid))
 }
 
 // ── Playhead helpers ──────────────────────────────────────────────────────────
@@ -152,11 +157,11 @@ pub fn linked_audio_clip<'s>(
 pub fn playhead_source_timestamp(state: &ProjectState) -> Option<(f64, &LibraryClip)> {
     const ONE_FRAME: f64 = 1.0 / 30.0;
 
-    let tc  = selected_timeline_clip(state)?;
+    let tc = selected_timeline_clip(state)?;
     let lib = library_entry_for(state, tc)?;
 
-    let offset = (state.current_time - tc.start_time)
-        .clamp(0.0, (tc.duration - ONE_FRAME).max(0.0));
+    let offset =
+        (state.current_time - tc.start_time).clamp(0.0, (tc.duration - ONE_FRAME).max(0.0));
 
     Some((tc.source_offset + offset, lib))
 }
@@ -191,10 +196,14 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
     let t = state.current_time;
 
     // Collect V-row video clips, sorted by timeline position.
-    let mut v_clips: Vec<&TimelineClip> = state.timeline.iter()
+    let mut v_clips: Vec<&TimelineClip> = state
+        .timeline
+        .iter()
         .filter(|c| c.track_row % 2 == 0 && !is_extracted_audio_clip(c))
         .collect();
-    if v_clips.len() < 2 { return None; }
+    if v_clips.len() < 2 {
+        return None;
+    }
     v_clips.sort_unstable_by(|a, b| a.start_time.total_cmp(&b.start_time));
 
     for pair in v_clips.windows(2) {
@@ -204,32 +213,41 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
         // Look for a non-Cut transition recorded after clip_a.
         // Use if-let + continue instead of ? so a missing transition on one pair
         // doesn't abort the entire search — other pairs may still have one.
-        let tr = match state.transitions.iter()
+        let tr = match state
+            .transitions
+            .iter()
             .find(|tr| tr.after_clip_id == clip_a.id)
         {
             Some(tr) => tr,
-            None     => continue,
+            None => continue,
         };
-        if tr.kind.kind == velocut_core::transitions::TransitionKind::Cut { continue; }
+        if tr.kind.kind == velocut_core::transitions::TransitionKind::Cut {
+            continue;
+        }
 
         let d = tr.kind.duration_secs as f64;
-        if d <= 0.0 { continue; }
+        if d <= 0.0 {
+            continue;
+        }
 
         // Zone is centered on the cut point: [clip_a_end − D/2, clip_a_end + D/2).
         let clip_a_end = clip_a.start_time + clip_a.duration;
-        let half_d     = d / 2.0;
+        let half_d = d / 2.0;
         let zone_start = clip_a_end - half_d;
-        let zone_end   = clip_a_end + half_d;
+        let zone_end = clip_a_end + half_d;
 
-        if t < zone_start || t >= zone_end { continue; }
+        if t < zone_start || t >= zone_end {
+            continue;
+        }
 
-        let local_blend = t - zone_start;                          // 0.0 .. D
-        let alpha       = (local_blend / d).clamp(0.0, 1.0) as f32;
+        let local_blend = t - zone_start; // 0.0 .. D
+        let alpha = (local_blend / d).clamp(0.0, 1.0) as f32;
 
         // Source timestamps (centered on cut):
         //   clip_a: last D/2 of its source playing out over the full zone
         //   clip_b: first D/2 of its source starting at source_offset
-        let clip_a_source_ts = (clip_a.source_offset + clip_a.duration - half_d + local_blend).max(0.0);
+        let clip_a_source_ts =
+            (clip_a.source_offset + clip_a.duration - half_d + local_blend).max(0.0);
         // clip_b only starts advancing at the cut point (local_blend == half_d).
         // Before the cut, clip_b is decoded at its first frame (source_offset).
         // After the cut it advances to source_offset + half_d at zone_end.
@@ -240,7 +258,7 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
         return Some(TransitionZone {
             clip_a,
             clip_b,
-            transition: tr.kind.clone(),  // TransitionType is Clone; tr is a shared ref
+            transition: tr.kind.clone(), // TransitionType is Clone; tr is a shared ref
             alpha,
             clip_a_source_ts,
             clip_b_source_ts,
@@ -265,7 +283,9 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
 #[inline]
 pub fn active_audio_clip(state: &ProjectState, time: f64) -> Option<&TimelineClip> {
     // Extracted A-row first (linked_clip_id present = V↔A pair, not standalone)
-    state.timeline.iter()
+    state
+        .timeline
+        .iter()
         .find(|c| {
             matches!(c.track_row, 1 | 3)
                 && c.linked_clip_id.is_some()
@@ -290,11 +310,10 @@ pub fn active_audio_clip(state: &ProjectState, time: f64) -> Option<&TimelineCli
 /// the primary audio from `active_audio_clip`, mirroring the `AudioOverlay`
 /// behaviour in the encode pipeline.
 #[inline]
-pub fn active_overlay_clips<'s>(
-    state: &'s ProjectState,
-    time:  f64,
-) -> Vec<&'s TimelineClip> {
-    state.timeline.iter()
+pub fn active_overlay_clips(state: &ProjectState, time: f64) -> Vec<&TimelineClip> {
+    state
+        .timeline
+        .iter()
         .filter(|c| {
             matches!(c.track_row, 1 | 3)
                 && c.linked_clip_id.is_none()

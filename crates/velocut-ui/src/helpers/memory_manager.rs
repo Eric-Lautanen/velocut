@@ -38,43 +38,43 @@
 //   so evict_outside_window (an impl on CacheContext defined here) can update
 //   the byte budget. The field stays private to external crates.
 
-use std::time::Instant;
-use eframe::egui;
-use velocut_core::state::ProjectState;
 use crate::context::{AppContext, CacheContext};
 use crate::velocut_log;
+use eframe::egui;
+use std::time::Instant;
+use velocut_core::state::ProjectState;
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
 /// Seconds of playhead stillness before Stage 1 (scrub-idle trim) fires.
-const SCRUB_IDLE_SECS:  f64   = 2.0;
+const SCRUB_IDLE_SECS: f64 = 2.0;
 
 /// Seconds of total inactivity before Stage 2 (deep idle flush) fires.
-const DEEP_IDLE_SECS:   f64   = 30.0;
+const DEEP_IDLE_SECS: f64 = 30.0;
 
 /// How many seconds around the current playhead to *keep* during Stage 1.
 /// ±KEEP_WINDOW_SECS worth of bucket entries survive the trim so seeking
 /// a short distance after idle still hits the cache.
-const KEEP_WINDOW_SECS: f64   = 5.0;
+const KEEP_WINDOW_SECS: f64 = 5.0;
 
 /// Maximum thumbnails to retain. Evicts oldest-inserted beyond this count.
 /// At ≈ 20 KB per thumbnail, 100 entries ≈ 2 MB — negligible but bounded.
-const MAX_THUMBNAILS:   usize = 100;
+const MAX_THUMBNAILS: usize = 100;
 
 // ── MemoryManager ─────────────────────────────────────────────────────────────
 
 pub struct MemoryManager {
     /// Wall-clock time the playhead last changed position.
-    last_scrub:      Instant,
+    last_scrub: Instant,
 
     /// Wall-clock time of last any user activity (play/pause/import/edit).
-    last_activity:   Instant,
+    last_activity: Instant,
 
     /// Playhead position observed on the previous tick — used to detect movement.
-    prev_time:       f64,
+    prev_time: f64,
 
     /// Whether playback was active on the previous tick.
-    prev_playing:    bool,
+    prev_playing: bool,
 
     /// Number of library clips seen on the previous tick — detects imports.
     prev_clip_count: usize,
@@ -91,10 +91,10 @@ impl MemoryManager {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            last_scrub:      now,
-            last_activity:   now,
-            prev_time:       -1.0,
-            prev_playing:    false,
+            last_scrub: now,
+            last_activity: now,
+            prev_time: -1.0,
+            prev_playing: false,
             prev_clip_count: 0,
             scrub_trim_done: false,
             deep_flush_done: false,
@@ -102,16 +102,11 @@ impl MemoryManager {
     }
 
     /// Call once per frame from `tick_modules()`.
-    pub fn tick(
-        &mut self,
-        ctx:     &egui::Context,
-        state:   &ProjectState,
-        context: &mut AppContext,
-    ) {
+    pub fn tick(&mut self, ctx: &egui::Context, state: &ProjectState, context: &mut AppContext) {
         self.detect_activity(state);
 
         let scrub_idle = self.last_scrub.elapsed().as_secs_f64();
-        let deep_idle  = self.last_activity.elapsed().as_secs_f64();
+        let deep_idle = self.last_activity.elapsed().as_secs_f64();
 
         // ── Stage 2: deep idle flush ──────────────────────────────────────────
         if deep_idle >= DEEP_IDLE_SECS && !self.deep_flush_done {
@@ -132,10 +127,7 @@ impl MemoryManager {
         let cache = &mut context.cache;
         if cache.thumbnail_cache.len() > MAX_THUMBNAILS {
             let over = cache.thumbnail_cache.len() - MAX_THUMBNAILS;
-            let to_remove: Vec<_> = cache.thumbnail_cache.keys()
-                .take(over)
-                .copied()
-                .collect();
+            let to_remove: Vec<_> = cache.thumbnail_cache.keys().take(over).copied().collect();
             for k in to_remove {
                 cache.thumbnail_cache.remove(&k);
             }
@@ -146,8 +138,8 @@ impl MemoryManager {
     // ── Activity detection ────────────────────────────────────────────────────
 
     fn detect_activity(&mut self, state: &ProjectState) {
-        let time_moved    = (state.current_time - self.prev_time).abs() > 1e-6;
-        let play_changed  = state.is_playing != self.prev_playing;
+        let time_moved = (state.current_time - self.prev_time).abs() > 1e-6;
+        let play_changed = state.is_playing != self.prev_playing;
         let clips_changed = state.library.len() != self.prev_clip_count;
 
         // An encode in progress counts as continuous activity — Stage 2 must
@@ -164,18 +156,18 @@ impl MemoryManager {
         if time_moved {
             // Playhead moved — reset scrub idle timer and re-arm both stages
             // so the next idle period fires fresh.
-            self.last_scrub      = Instant::now();
+            self.last_scrub = Instant::now();
             self.scrub_trim_done = false;
             self.deep_flush_done = false;
         }
 
         if time_moved || play_changed || clips_changed || encoding || encode_finished {
-            self.last_activity   = Instant::now();
+            self.last_activity = Instant::now();
             self.deep_flush_done = false;
         }
 
-        self.prev_time       = state.current_time;
-        self.prev_playing    = state.is_playing;
+        self.prev_time = state.current_time;
+        self.prev_playing = state.is_playing;
         self.prev_clip_count = state.library.len();
     }
 
@@ -190,12 +182,13 @@ impl MemoryManager {
 
         let before = cache.frame_bucket_cache.len();
         cache.evict_outside_window(keep_min, keep_max);
-        let after  = cache.frame_bucket_cache.len();
+        let after = cache.frame_bucket_cache.len();
 
         if before != after {
             velocut_log!(
                 "[memory] scrub-idle trim: evicted {} frame buckets ({} remain)",
-                before - after, after
+                before - after,
+                after
             );
         }
     }
@@ -218,8 +211,8 @@ impl MemoryManager {
         // as CacheContext::clear_all() in context.rs).
         cache.frame_cache.clear();
         cache.frame_bucket_cache.clear();
-        cache.frame_cache_bytes  = 0;
-        cache.pending_pb_frame   = None;
+        cache.frame_cache_bytes = 0;
+        cache.pending_pb_frame = None;
 
         // scrub_textures holds one persistent GPU TextureHandle per scrubbed clip.
         // It is intentionally kept alive during Stage 1 (so short seeks after idle
@@ -238,7 +231,8 @@ impl MemoryManager {
 
         velocut_log!(
             "[memory] deep idle flush: evicted {} frame buckets, {} scrub textures + egui memory",
-            buckets_before, textures_before
+            buckets_before,
+            textures_before
         );
     }
 }

@@ -74,7 +74,7 @@ impl VideoTransition for DipToBlack {
 
         // Black in YUV420P: Y=0, U=128, V=128.
         // Blending U/V toward 0 produces green — each plane needs its own target.
-        let luma_len = y_len(width, height) as usize;
+        let luma_len = y_len(width, height);
 
         let blend_to_black = |src: &[u8], ramp: f32| -> Vec<u8> {
             src.iter().enumerate().map(|(i, &v)| {
