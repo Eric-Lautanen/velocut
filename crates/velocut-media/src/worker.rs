@@ -170,7 +170,7 @@ impl MediaWorker {
                         let tpts = d.ts_to_pts(req.timestamp);
                         let two_secs = d.ts_to_pts(2.0);
                         d.path != req.path
-                        || tpts <= d.last_pts               // any backward seek
+                        || tpts < d.last_pts                // any backward seek
                         || tpts > d.last_pts + two_secs // large forward jump
                     })
                     .unwrap_or(true);
@@ -186,15 +186,12 @@ impl MediaWorker {
                     match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws, None)
                     {
                         Ok(mut d) => {
-                            // Set skip_until_pts so next_frame() burns through the GOP
-                            // (decode-only, no scale/alloc) and returns the frame at
-                            // exactly req.timestamp rather than the keyframe.
-                            // This replaces the old "show keyframe immediately" approach
-                            // which showed a frame that could be seconds off-position.
-                            // The skip loop is ~4x faster than advance_to() since it
-                            // avoids scaling every intermediate frame.
-                            d.skip_until_pts = d.ts_to_pts(req.timestamp);
-                            if let Some((data, w, h, _)) = d.next_frame() {
+                            let target_pts = d.ts_to_pts(req.timestamp);
+                            // advance_to burns through the GOP (decode-only, no scale/alloc)
+                            // and returns the frame at exactly req.timestamp. Unlike next_frame
+                            // it has no per-call packet limit, so it always reaches the target
+                            // in one call without advancing last_pts past it.
+                            if let Some((data, w, h)) = d.advance_to(target_pts) {
                                 let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                                     id: req.id,
                                     width: w,
@@ -1537,7 +1534,7 @@ fn decode_transition_scrub_frame(
         .map(|(p, d)| {
             let tpts = d.ts_to_pts(ts);
             let two_secs = d.ts_to_pts(2.0);
-            p != path || tpts <= d.last_pts || tpts > d.last_pts + two_secs
+            p != path || tpts < d.last_pts || tpts > d.last_pts + two_secs
         })
         .unwrap_or(true);
 
@@ -1547,8 +1544,8 @@ fn decode_transition_scrub_frame(
             .map(|(_, d)| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
         match LiveDecoder::open(path, ts, 1.0, cached_sws, None) {
             Ok(mut d) => {
-                d.skip_until_pts = d.ts_to_pts(ts);
-                let result = d.next_frame().map(|(data, w, h, _)| (data, w, h));
+                let target_pts = d.ts_to_pts(ts);
+                let result = d.advance_to(target_pts);
                 *live = Some((path.clone(), d));
                 result
             }
