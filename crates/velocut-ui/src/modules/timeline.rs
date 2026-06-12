@@ -852,7 +852,7 @@ impl EditorModule for TimelineModule {
                         {
                             let fc = Pos2::new(clip_rect.center().x + 12.0, clip_rect.max.y - 10.0);
                             let fopen   = self.filter_popup.map(|(id,_)| id == clip.id).unwrap_or(false);
-                            let factive = !clip.filter.is_identity();
+                            let factive = clip.has_filter();
                             let fcol = if fopen { ACCENT }
                                 else if factive { Color32::from_rgb(120, 210, 130) }
                                 else { Color32::from_gray(165) };
@@ -1020,7 +1020,7 @@ impl EditorModule for TimelineModule {
                             let cur_filter = clip.filter.clone();
                             let fr_resp = ui.interact(fr, Id::new(("filter_badge", clip_id)), Sense::click());
                             let fr_resp = fr_resp.on_hover_ui(|ui| {
-                                let lbl = if cur_filter.is_identity() {
+                                let lbl = if !clip.has_filter() {
                                     "No filter — click to add".to_string()
                                 } else {
                                     format!("Filter: {}  (click to edit)", cur_filter.kind.label())
@@ -1568,9 +1568,9 @@ impl EditorModule for TimelineModule {
             if let Some((filter_clip_id, anchor)) = self.filter_popup {
                 let clip_data = state.timeline.iter()
                     .find(|c| c.id == filter_clip_id)
-                    .map(|c| c.filter.clone());
+                    .map(|c| (c.filter.clone(), c.has_filter()));
 
-                if let Some(cur_filter) = clip_data {
+                if let Some((cur_filter, has_filter)) = clip_data {
                     let popup_w = 160.0_f32;
                     let popup_pos = Pos2::new(
                         (anchor.x - popup_w * 0.5).max(4.0),
@@ -1596,7 +1596,7 @@ impl EditorModule for TimelineModule {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("🎨  Color Filter").size(11.0).strong().color(ACCENT));
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if !cur_filter.is_identity()
+                                            if has_filter
                                                 && ui.small_button(RichText::new("Reset").size(9.0).color(Color32::from_gray(130))).clicked()
                                             {
                                                 cmd.push(EditorCommand::SetClipFilter {

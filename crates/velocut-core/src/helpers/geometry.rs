@@ -9,6 +9,8 @@
 // importing UI internals, and any future crate (e.g. a headless renderer) gets
 // them for free.
 
+use std::fmt;
+
 use crate::state::AspectRatio;
 
 /// Numeric width-to-height ratio for the given `AspectRatio` variant.
@@ -50,5 +52,11 @@ pub fn aspect_ratio_label(ar: AspectRatio) -> &'static str {
         AspectRatio::FourFive => "4:5   — Instagram portrait",
         AspectRatio::TwentyOneNine => "21:9  — Ultrawide / Cinema",
         AspectRatio::Anamorphic => "2.39  — Anamorphic widescreen",
+    }
+}
+
+impl fmt::Display for AspectRatio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", aspect_ratio_label(*self))
     }
 }

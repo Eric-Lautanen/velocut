@@ -5,7 +5,7 @@
 // Adding a new feature = add a variant here + one match arm in app.rs.
 
 use crate::filters::FilterParams;
-use crate::state::AspectRatio;
+use crate::state::{AspectRatio, ProjectState};
 use crate::transitions::TransitionType;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -140,4 +140,122 @@ pub enum EditorCommand {
     /// Equivalent to "start a new project" without restarting the process.
     /// app.rs::process_command handles the ordered teardown sequence.
     ClearProject,
+}
+
+impl EditorCommand {
+    /// Validate that this command can be applied to the given state.
+    /// Returns `Ok(())` if valid, or an error message describing the problem.
+    pub fn validate(&self, state: &ProjectState) -> Result<(), String> {
+        match self {
+            EditorCommand::SetPlayhead(t) => {
+                if *t < 0.0 {
+                    return Err("Playhead cannot be negative".to_string());
+                }
+            }
+            EditorCommand::SetVolume(v) => {
+                if *v < 0.0 || *v > 2.0 {
+                    return Err("Volume must be between 0.0 and 2.0".to_string());
+                }
+            }
+            EditorCommand::SetClipVolume { id, volume } => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+                if *volume < 0.0 || *volume > 2.0 {
+                    return Err("Volume must be between 0.0 and 2.0".to_string());
+                }
+            }
+            EditorCommand::SetClipFadeIn { id, .. }
+            | EditorCommand::SetClipFadeInStart { id, .. }
+            | EditorCommand::SetClipFadeOut { id, .. }
+            | EditorCommand::SetClipFadeOutEnd { id, .. } => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+            }
+            EditorCommand::MoveTimelineClip {
+                id,
+                new_start,
+                new_row,
+            } => {
+                let Some(clip) = state.timeline.iter().find(|c| c.id == *id) else {
+                    return Err("Clip not found in timeline".to_string());
+                };
+                if *new_start < 0.0 {
+                    return Err("Clip start time cannot be negative".to_string());
+                }
+                if *new_row > 1 {
+                    return Err("Track row must be 0 or 1".to_string());
+                }
+                // Prevent moving an audio-extracted clip to row 0 (video row)
+                if *new_row == 0 && clip.linked_clip_id.is_some() {
+                    return Err("Cannot move audio-extracted clip to video track".to_string());
+                }
+            }
+            EditorCommand::TrimClipStart {
+                id,
+                new_source_offset,
+                new_duration,
+            } => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+                if *new_source_offset < 0.0 {
+                    return Err("Source offset cannot be negative".to_string());
+                }
+                if *new_duration <= 0.0 {
+                    return Err("Duration must be positive".to_string());
+                }
+            }
+            EditorCommand::TrimClipEnd { id, new_duration } => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+                if *new_duration <= 0.0 {
+                    return Err("Duration must be positive".to_string());
+                }
+            }
+            EditorCommand::SetTimelineZoom(z) => {
+                if *z < 0.01 || *z > 1000.0 {
+                    return Err("Zoom must be between 0.01 and 1000.0".to_string());
+                }
+            }
+            EditorCommand::SetCrossfadeDuration(d) => {
+                if *d < 0.0 {
+                    return Err("Crossfade duration cannot be negative".to_string());
+                }
+            }
+            EditorCommand::RenderMP4 { width, height, .. } => {
+                if *width == 0 || *height == 0 {
+                    return Err("Render dimensions must be non-zero".to_string());
+                }
+            }
+            EditorCommand::SetClipFilter { id, .. } => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+            }
+            EditorCommand::DeleteTimelineClip(id)
+            | EditorCommand::SelectTimelineClip(Some(id))
+            | EditorCommand::ExtractAudioTrack(id) => {
+                if state.timeline.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+            }
+            EditorCommand::DeleteLibraryClip(id) | EditorCommand::SelectLibraryClip(Some(id)) => {
+                if state.library.iter().all(|c| c.id != *id) {
+                    return Err("Clip not found in library".to_string());
+                }
+            }
+            EditorCommand::SetTransition { after_clip_id, .. }
+            | EditorCommand::RemoveTransition(after_clip_id) => {
+                if state.timeline.iter().all(|c| c.id != *after_clip_id) {
+                    return Err("Clip not found in timeline".to_string());
+                }
+            }
+            // Remaining commands have no validation requirements
+            _ => {}
+        }
+        Ok(())
+    }
 }

@@ -36,7 +36,7 @@ use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER, DARK_TEXT_DIM, RENDER_BTN};
 use egui::{Color32, Context, Margin, RichText, Stroke, Ui};
 use velocut_core::commands::EditorCommand;
-use velocut_core::helpers::geometry::{aspect_ratio_label, aspect_ratio_value};
+use velocut_core::helpers::geometry::aspect_ratio_value;
 use velocut_core::state::{AspectRatio, ProjectState};
 use velocut_media::encode::HwEncodeCapabilities;
 
@@ -598,12 +598,9 @@ impl ExportModule {
         ui.add_enabled_ui(!is_encoding, |ui| {
             // Label shown in the collapsed combo.
             let combo_label = if self.export_aspect.is_none() {
-                format!(
-                    "↩ Match Project  ({})",
-                    aspect_ratio_label(state.aspect_ratio)
-                )
+                format!("↩ Match Project  ({})", state.aspect_ratio)
             } else {
-                aspect_ratio_label(effective_ar).to_string()
+                effective_ar.to_string()
             };
 
             egui::ComboBox::from_id_salt("export_aspect_ratio")
@@ -612,10 +609,7 @@ impl ExportModule {
                 .show_ui(ui, |ui| {
                     // "Match Project" option always at the top.
                     let match_selected = self.export_aspect.is_none();
-                    let match_label = format!(
-                        "↩ Match Project  ({})",
-                        aspect_ratio_label(state.aspect_ratio)
-                    );
+                    let match_label = format!("↩ Match Project  ({})", state.aspect_ratio);
                     if ui.selectable_label(match_selected, &match_label).clicked() {
                         self.export_aspect = None;
                     }
@@ -625,10 +619,7 @@ impl ExportModule {
                     // One entry per aspect ratio variant.
                     for &ar in ALL_ASPECT_RATIOS {
                         let selected = self.export_aspect == Some(ar);
-                        if ui
-                            .selectable_label(selected, aspect_ratio_label(ar))
-                            .clicked()
-                        {
+                        if ui.selectable_label(selected, ar.to_string()).clicked() {
                             self.export_aspect = Some(ar);
                         }
                     }

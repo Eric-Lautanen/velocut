@@ -1618,19 +1618,13 @@ fn blend_rgba_transition(
     alpha: f32,
     kind: velocut_core::transitions::TransitionKind,
 ) -> Vec<u8> {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    use velocut_core::transitions::{registry, TransitionKind, VideoTransition};
+    use velocut_core::transitions::{registry, TransitionKind};
 
     if kind == TransitionKind::Cut {
         return a.to_vec();
     }
 
-    // Cache the registry in a static so we don't allocate a fresh HashMap
-    // (+ Box<dyn VideoTransition> per entry) on every blend frame.
-    // The registry is immutable after init — OnceLock is sufficient.
-    static REGISTRY: OnceLock<HashMap<TransitionKind, Box<dyn VideoTransition>>> = OnceLock::new();
-    let reg = REGISTRY.get_or_init(registry);
+    let reg = registry();
 
     reg.get(&kind)
         .expect(

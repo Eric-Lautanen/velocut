@@ -39,6 +39,7 @@ pub mod helpers;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 // ── Drop-in registration ──────────────────────────────────────────────────────
@@ -249,6 +250,10 @@ pub fn registered() -> Vec<Box<dyn VideoTransition>> {
 ///
 /// Use during encode and preview. Cut has no entry — short-circuit on
 /// `TransitionKind::Cut` before calling this.
-pub fn registry() -> HashMap<TransitionKind, Box<dyn VideoTransition>> {
-    make_entries().into_iter().map(|t| (t.kind(), t)).collect()
+///
+/// The registry is cached in a static `OnceLock` so it is built only once
+/// and shared across all callers.
+pub fn registry() -> &'static HashMap<TransitionKind, Box<dyn VideoTransition>> {
+    static REGISTRY: OnceLock<HashMap<TransitionKind, Box<dyn VideoTransition>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| make_entries().into_iter().map(|t| (t.kind(), t)).collect())
 }

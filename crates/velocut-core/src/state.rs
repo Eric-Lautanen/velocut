@@ -90,6 +90,13 @@ pub struct TimelineClip {
     pub filter: crate::filters::FilterParams,
 }
 
+impl TimelineClip {
+    /// True when this clip has a non-identity filter applied.
+    pub fn has_filter(&self) -> bool {
+        !self.filter.is_identity()
+    }
+}
+
 fn default_clip_volume() -> f32 {
     1.0
 }

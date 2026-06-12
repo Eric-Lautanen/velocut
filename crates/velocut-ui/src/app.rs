@@ -439,6 +439,7 @@ impl VeloCutApp {
                 }
             }
             EditorCommand::SetClipFilter { id, filter } => {
+                let filter = filter.validated();
                 if let Some(tc) = self.state.timeline.iter_mut().find(|c| c.id == id) {
                     tc.filter = filter;
                 }

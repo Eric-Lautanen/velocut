@@ -144,7 +144,7 @@ impl FilterParams {
     /// Canonical parameter values for each named preset.
     /// `strength` is always left at 1.0 here — the UI slider handles partial blending.
     pub fn from_preset(kind: FilterKind) -> Self {
-        match kind {
+        let params = match kind {
             FilterKind::None => Self::none(),
 
             // Slightly desaturated, lifted shadows, gentle S-curve feel
@@ -322,6 +322,21 @@ impl FilterParams {
                 temperature: 0.22,
                 strength: 1.0,
             },
+        };
+        params.validated()
+    }
+
+    /// Clamp all fields to their valid ranges.
+    pub fn validated(&self) -> Self {
+        Self {
+            kind: self.kind,
+            brightness: self.brightness.clamp(-1.0, 1.0),
+            contrast: self.contrast.clamp(0.0, 3.0),
+            saturation: self.saturation.clamp(0.0, 3.0),
+            gamma: self.gamma.clamp(0.1, 4.0),
+            hue: self.hue.clamp(-180.0, 180.0),
+            temperature: self.temperature.clamp(-1.0, 1.0),
+            strength: self.strength.clamp(0.0, 1.0),
         }
     }
 
