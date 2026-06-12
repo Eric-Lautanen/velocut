@@ -480,12 +480,14 @@ impl PbThread {
                         if frame_count.is_multiple_of(60) {
                             crate::media_log!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
                         }
-                        // try_send so the pb thread never blocks — if the channel
-                        // is full the UI is overloaded; skip this frame rather than
-                        // stalling the decode loop (which would prevent processing
-                        // Stop/Start/StartBlend commands).
-                        if pb_frame_tx.try_send(f).is_err() && frame_count.is_multiple_of(60) {
-                            crate::media_log!("[pb] channel full — dropping frame ts={ts_secs:.3}");
+                        // Blocking send — rate-limits the decoder to the UI's
+                        // consumption speed.  When the channel is full the pb thread
+                        // sleeps here until poll_playback drains a frame, which also
+                        // gives the UI thread a chance to send Stop/Start commands.
+                        // The UI always drains before/after sending Stop, so this
+                        // cannot deadlock.
+                        if pb_frame_tx.send(f).is_err() {
+                            return;
                         }
                         // [P0-3] Interleave prebuffer burn between primary frames.
                         // Advance by 10 packets (~5ms) per frame so the prebuffered
@@ -793,57 +795,55 @@ impl PbThread {
                     }
                 } else {
                     // Coast mode, no command yet.
-                    if pb_frame_tx.len() >= 5 {
-                        std::thread::sleep(std::time::Duration::from_millis(4));
-                    } else {
-                        let animated = (|| -> Option<Vec<u8>> {
-                            let b = blend.as_mut()?;
-                            let fa = coast_last_primary.as_ref()?;
-                            let db = b.decoder_b.as_mut()?;
-                            let (data_b, _, _, _) = db.next_frame()?;
-                            if data_b.len() != fa.len() {
-                                return None;
-                            }
-                            let step = (1.0_f32 / 30.0) / b.spec.duration;
-                            coast_last_alpha = (coast_last_alpha + step).min(1.0);
-                            coast_ts += 1.0 / 30.0;
-                            Some(blend_rgba_transition(
-                                fa,
-                                &data_b,
-                                coast_w,
-                                coast_h,
-                                coast_last_alpha,
-                                b.spec.kind,
-                            ))
-                        })();
-
-                        let send_data = if let Some(blended) = animated {
-                            crate::media_log!("[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}");
-                            // [Fix 2] Move into held_blend, clone for send.
-                            let out = blended.clone();
-                            held_blend = Some(blended);
-                            Some(out)
-                        } else {
-                            held_blend.clone()
-                        };
-
-                        if let Some(data) = send_data {
-                            let f = PlaybackFrame {
-                                id: coast_id,
-                                timestamp: coast_ts,
-                                width: coast_w,
-                                height: coast_h,
-                                data,
-                            };
-                            if pb_frame_tx.try_send(f).is_err() {
-                                return;
-                            }
-                        } else {
-                            crate::media_log!(
-                                "[pb] coast: both animated and held_blend None — exiting coast"
-                            );
-                            coasting = false;
+                    // Produce an animated blend frame or repeat held_blend.
+                    let animated = (|| -> Option<Vec<u8>> {
+                        let b = blend.as_mut()?;
+                        let fa = coast_last_primary.as_ref()?;
+                        let db = b.decoder_b.as_mut()?;
+                        let (data_b, _, _, _) = db.next_frame()?;
+                        if data_b.len() != fa.len() {
+                            return None;
                         }
+                        let step = (1.0_f32 / 30.0) / b.spec.duration;
+                        coast_last_alpha = (coast_last_alpha + step).min(1.0);
+                        coast_ts += 1.0 / 30.0;
+                        Some(blend_rgba_transition(
+                            fa,
+                            &data_b,
+                            coast_w,
+                            coast_h,
+                            coast_last_alpha,
+                            b.spec.kind,
+                        ))
+                    })();
+
+                    let send_data = if let Some(blended) = animated {
+                        crate::media_log!("[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}");
+                        // [Fix 2] Move into held_blend, clone for send.
+                        let out = blended.clone();
+                        held_blend = Some(blended);
+                        Some(out)
+                    } else {
+                        held_blend.clone()
+                    };
+
+                    if let Some(data) = send_data {
+                        let f = PlaybackFrame {
+                            id: coast_id,
+                            timestamp: coast_ts,
+                            width: coast_w,
+                            height: coast_h,
+                            data,
+                        };
+                        // Blocking send — rate-limits coast to UI consumption speed.
+                        if pb_frame_tx.send(f).is_err() {
+                            return;
+                        }
+                    } else {
+                        crate::media_log!(
+                            "[pb] coast: both animated and held_blend None — exiting coast"
+                        );
+                        coasting = false;
                     }
                 }
             }

@@ -243,17 +243,26 @@ pub fn active_transition_at(state: &ProjectState) -> Option<TransitionZone<'_>> 
         let local_blend = t - zone_start; // 0.0 .. D
         let alpha = (local_blend / d).clamp(0.0, 1.0) as f32;
 
+        const ONE_FRAME: f64 = 1.0 / 30.0;
+
         // Source timestamps (centered on cut):
-        //   clip_a: last D/2 of its source playing out over the full zone
-        //   clip_b: first D/2 of its source starting at source_offset
-        let clip_a_source_ts =
-            (clip_a.source_offset + clip_a.duration - half_d + local_blend).max(0.0);
-        // clip_b only starts advancing at the cut point (local_blend == half_d).
-        // Before the cut, clip_b is decoded at its first frame (source_offset).
-        // After the cut it advances to source_offset + half_d at zone_end.
-        // Old formula (+ local_blend) was half_d seconds ahead at the cut point,
-        // making clip_b show mid-clip content and the blend appear half as long.
-        let clip_b_source_ts = (clip_b.source_offset + (local_blend - half_d).max(0.0)).max(0.0);
+        //   clip_a: last D/2 of its source playing out over the full zone.
+        //     In the second half (local_blend > half_d), clip_a freezes at its
+        //     last valid frame — we never request a timestamp past source end.
+        //   clip_b: first D/2 of its source; starts at source_offset, freezes
+        //     before the cut, then advances from the cut to zone_end.
+        let clip_a_source_ts = (clip_a.source_offset + clip_a.duration - half_d + local_blend)
+            .clamp(
+                clip_a.source_offset,
+                (clip_a.source_offset + clip_a.duration - ONE_FRAME).max(clip_a.source_offset),
+            )
+            .max(0.0);
+        let clip_b_source_ts = (clip_b.source_offset + (local_blend - half_d).max(0.0))
+            .clamp(
+                clip_b.source_offset,
+                (clip_b.source_offset + clip_b.duration - ONE_FRAME).max(clip_b.source_offset),
+            )
+            .max(0.0);
 
         return Some(TransitionZone {
             clip_a,

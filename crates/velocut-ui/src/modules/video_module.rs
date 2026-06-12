@@ -120,47 +120,76 @@ impl VideoModule {
             }
         }
 
-        // Step 2: fast-forward past overdue frames.
-        // With the 32-frame channel and burn_to_pts completing before first send,
-        // this drains the early keyframe frames in a single tick after seek.
+        // Step 2: drain stale/overdue frames, keep the best available frame.
+        //
+        // With blocking send in the pb thread, the channel is small (6 frames)
+        // and the decoder is rate-limited to UI consumption speed, so this loop
+        // typically executes 0-1 iterations per tick.
         if let Some(local_t) = pb_local_t {
+            // Discard frames that are more than 0.5s behind local_t.
+            let too_old_threshold = local_t - 0.5;
+            let too_far_ahead = local_t + 0.5;
+
+            // Drain any frames that are too old.
             while ctx
                 .cache
                 .pending_pb_frame
                 .as_ref()
-                .map(|f: &PlaybackFrame| f.timestamp < local_t - (1.0 / 30.0))
+                .map(|f| f.timestamp < too_old_threshold)
                 .unwrap_or(false)
             {
                 match ctx.media_worker.pb_rx.try_recv() {
                     Ok(newer) => {
                         ctx.cache.pending_pb_frame = Some(newer);
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        ctx.cache.pending_pb_frame = None;
+                        break;
+                    }
+                }
+            }
+
+            // If we have a frame that's too far ahead, try to find a closer one
+            // in the channel (but keep the too-far-ahead one if nothing better).
+            if ctx
+                .cache
+                .pending_pb_frame
+                .as_ref()
+                .map(|f| f.timestamp > too_far_ahead)
+                .unwrap_or(false)
+            {
+                let mut best = ctx.cache.pending_pb_frame.take();
+                loop {
+                    match ctx.media_worker.pb_rx.try_recv() {
+                        Ok(f) => {
+                            if f.timestamp >= too_old_threshold
+                                && f.timestamp <= too_far_ahead
+                            {
+                                // Found a good frame within window.
+                                ctx.cache.pending_pb_frame = Some(f);
+                                break;
+                            }
+                            if f.timestamp < too_old_threshold {
+                                continue; // still too old, discard
+                            }
+                            // Too far ahead, but maybe closer than current best.
+                            if best
+                                .as_ref()
+                                .map_or(true, |b| f.timestamp < b.timestamp)
+                            {
+                                best = Some(f);
+                            }
+                        }
+                        Err(_) => {
+                            ctx.cache.pending_pb_frame = best;
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        // Step 3: promote pending frame when its PTS is due.
-        //
-        // Upper bound: 2 frames (2/30s ≈ 67ms) of early-show tolerance for steady
-        // state, plus a startup exception for the first 150ms of any new clip.
-        //
-        // Why the startup exception: after a clip transition the primary decoder
-        // burns to `elapsed` (e.g. 10ms into clip_b), but the first decodable
-        // keyframe lands ~73ms later (e.g. ts=0.083s). With pb_local_t=0.010 that
-        // blows past even the 2/30s upper bound (0.083 > 0.010+0.067), so the
-        // frame sits in pending while held_frame (frozen coast, alpha=0.437) keeps
-        // displaying — visible as a stall right at the blend handoff.
-        // The exception bypasses the upper bound for the first 150ms of any new
-        // clip (lt<0.15), where any near-future frame (ts<0.30) is preferable to
-        // the stale held_frame. The lower bound (-3s) still guards against genuinely
-        // stale frames, and step 2 fast-forward handles runaway lookahead in steady
-        // playback.
-        //
-        // Lower bound: 3.0 s — must cover the worst-case burn_to_pts duration.
-        // At 60 fps H.264 with a 5 s GOP, burn is ~300 frames × ~2 ms = ~600 ms.
-        // 3 s is ample headroom. Genuine staleness (different clip, scrub bleed)
-        // is caught by the wrong_clip / too_old guards above.
+        // Step 3: promote pending frame when its PTS is within the display window.
         let frame_due = ctx
             .cache
             .pending_pb_frame
@@ -168,12 +197,9 @@ impl VideoModule {
             .map(|f: &PlaybackFrame| {
                 pb_local_t
                     .map(|lt| {
-                        let above_lower = f.timestamp >= lt - 3.0;
-                        let normal_window = f.timestamp <= lt + (2.0 / 30.0);
-                        // Startup exception: at clip startup (lt < 150ms) show any
-                        // near-future frame immediately rather than stalling on held_frame.
-                        let startup_early = lt < 0.15 && f.timestamp < 0.30;
-                        above_lower && (normal_window || startup_early)
+                        // Lower bound: frame must not be more than 3s behind.
+                        // Upper bound: frame must not be more than 0.5s ahead.
+                        f.timestamp >= lt - 3.0 && f.timestamp <= lt + 0.5
                     })
                     .unwrap_or(true)
             })
@@ -208,8 +234,16 @@ impl VideoModule {
                 );
                 ctx.cache.frame_cache.insert(f.id, tex);
                 egui_ctx.request_repaint();
-                if let Ok(next) = ctx.media_worker.pb_rx.try_recv() {
-                    ctx.cache.pending_pb_frame = Some(next);
+                // Pre-fill pending for next tick.
+                if ctx.cache.pending_pb_frame.is_none() {
+                    while let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
+                        let stale = current_media_id.is_some_and(|id| id != f.id);
+                        if stale {
+                            continue;
+                        }
+                        ctx.cache.pending_pb_frame = Some(f);
+                        break;
+                    }
                 }
             }
         }

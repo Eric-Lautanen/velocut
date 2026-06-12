@@ -523,7 +523,9 @@ impl AppContext {
                     .iter()
                     .find(|c| c.media_id == id)
                     .map(|c| {
-                        let lt = (state.current_time - c.start_time).max(0.0);
+                        // Match the local_t formula in video_module::tick():
+                        // source-relative time = timeline time + source_offset.
+                        let lt = (state.current_time - c.start_time + c.source_offset).max(0.0);
                         (lt * 4.0) as u32
                     })
                     .unwrap_or(0)

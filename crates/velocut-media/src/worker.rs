@@ -228,6 +228,12 @@ impl MediaWorker {
         let transition_scrub_thread = thread::spawn(move || {
             let mut live_a: Option<(PathBuf, LiveDecoder)> = None;
             let mut live_b: Option<(PathBuf, LiveDecoder)> = None;
+            // Cache the last successfully decoded frame for each slot so we can
+            // freeze on the last frame when the decoder hits EOF (e.g. clip_a
+            // timestamp clamped to its source end during the second half of a
+            // centered transition).
+            let mut last_a: Option<(Vec<u8>, u32, u32)> = None;
+            let mut last_b: Option<(Vec<u8>, u32, u32)> = None;
             loop {
                 let req: TransitionScrubRequest = {
                     let (lock, cvar) = &*transition_slot;
@@ -247,17 +253,34 @@ impl MediaWorker {
                 let frame_a =
                     decode_transition_scrub_frame(&mut live_a, &req.clip_a_path, req.clip_a_ts);
                 let (data_a, w, h) = match frame_a {
-                    Some(f) => f,
-                    None => continue,
+                    Some(f) => {
+                        last_a = Some(f.clone());
+                        f
+                    }
+                    None => match last_a.as_ref() {
+                        Some(cached) => cached.clone(),
+                        None => continue,
+                    },
                 };
 
                 // ── Decode clip_b frame ────────────────────────────────────────
                 let frame_b =
                     decode_transition_scrub_frame(&mut live_b, &req.clip_b_path, req.clip_b_ts);
                 let data_b = match frame_b {
-                    Some((data_b_raw, wb, hb)) if wb == w && hb == h => data_b_raw,
-                    Some((data_b_raw, wb, hb)) => crop_rgba(&data_b_raw, wb, hb, w, h),
-                    None => continue,
+                    Some((data_b_raw, wb, hb)) => {
+                        let sized = if wb == w && hb == h {
+                            data_b_raw
+                        } else {
+                            crop_rgba(&data_b_raw, wb, hb, w, h)
+                        };
+                        last_b = Some((sized.clone(), w, h));
+                        sized
+                    }
+                    None => match last_b.as_ref() {
+                        Some((cached, cw, ch)) if *cw == w && *ch == h => cached.clone(),
+                        Some((cached, cw, ch)) => crop_rgba(cached, *cw, *ch, w, h),
+                        None => continue,
+                    },
                 };
 
                 let blended = blend_rgba_transition(&data_a, &data_b, w, h, req.alpha, req.kind);
@@ -279,7 +302,7 @@ impl MediaWorker {
         // before the send loop starts so the extra headroom was never consumed;
         // 6 frames (~200ms at 30fps) is sufficient for smooth playback.
         let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(8);
-        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(16);
+        let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(6);
 
         let pb = PbThread {
             cmd_rx: pb_cmd_rx,
