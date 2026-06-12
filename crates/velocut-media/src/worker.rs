@@ -27,51 +27,11 @@ use crate::waveform::extract_waveform;
 mod blend;
 use blend::{ActiveBlend, blend_rgba_transition, crop_rgba, decode_transition_scrub_frame};
 
-// ── Internal types ────────────────────────────────────────────────────────────
+mod types;
+use types::{FrameRequest, PlaybackCmd};
 
-struct FrameRequest {
-    id: Uuid,
-    path: PathBuf,
-    timestamp: f64,
-    aspect: f32,
-    /// When Some, decode at these pixel dimensions instead of the default
-    /// scrub resolution (320px). Set to the current preview canvas size so
-    /// L2 scrub frames fill the panel without blurry upscaling.
-    preview_size: Option<(u32, u32)>,
-}
-
-enum PlaybackCmd {
-    Start {
-        id: Uuid,
-        path: PathBuf,
-        ts: f64,
-        aspect: f32,
-        preview_size: Option<(u32, u32)>,
-    },
-    /// Like Start but also carries blend info so the pb thread can open a second
-    /// decoder for clip_b and blend frames during the transition zone.
-    StartBlend {
-        id: Uuid,
-        path: PathBuf,
-        ts: f64,
-        aspect: f32,
-        blend: PlaybackTransitionSpec,
-        preview_size: Option<(u32, u32)>,
-    },
-    Stop,
-    /// Pre-open and start burning a decoder for the next clip so the transition
-    /// at the clip boundary is instant.  Sent ~500 ms before the current clip
-    /// ends.  The pb thread opens the decoder, sets skip_until_pts, and advances
-    /// the burn incrementally (10 packets per primary frame) so the decoder is
-    /// ready by the time Start / StartBlend arrives.
-    PreBuffer {
-        id: Uuid,
-        path: PathBuf,
-        ts: f64,
-        aspect: f32,
-        preview_size: Option<(u32, u32)>,
-    },
-}
+mod semaphore;
+use semaphore::SemaphoreGuard;
 
 // ── MediaWorker ───────────────────────────────────────────────────────────────
 
@@ -1235,23 +1195,7 @@ impl MediaWorker {
             // the ENTIRE probe (including waveform + audio) — previously it was
             // released after thumbnail, which defeated the limit entirely.
             const PROBE_CONCURRENCY: u32 = 2;
-            {
-                let (lock, cvar) = &*sem;
-                let mut count = lock.lock().unwrap();
-                while *count >= PROBE_CONCURRENCY {
-                    count = cvar.wait(count).unwrap();
-                }
-                *count += 1;
-            }
-            struct SemGuard(Arc<(Mutex<u32>, Condvar)>);
-            impl Drop for SemGuard {
-                fn drop(&mut self) {
-                    let (lock, cvar) = &*self.0;
-                    *lock.lock().unwrap() -= 1;
-                    cvar.notify_one();
-                }
-            }
-            let _guard = SemGuard(sem);
+            let _guard = SemaphoreGuard::acquire(sem, PROBE_CONCURRENCY);
 
             if sd.load(Ordering::Acquire) {
                 return;
@@ -1340,25 +1284,7 @@ impl MediaWorker {
             // Without this, rapid L3-idle updates spawn N threads simultaneously,
             // each holding a native-res decoder + scaler + frame buffer (~16 MB).
             const HQ_CONCURRENCY: u32 = 2;
-            {
-                let (lock, cvar) = &*sem;
-                let mut c = lock.lock().unwrap();
-                while *c >= HQ_CONCURRENCY {
-                    c = cvar.wait(c).unwrap();
-                }
-                *c += 1;
-            }
-            let _guard = {
-                struct G(Arc<(Mutex<u32>, Condvar)>);
-                impl Drop for G {
-                    fn drop(&mut self) {
-                        let (lock, cvar) = &*self.0;
-                        *lock.lock().unwrap() -= 1;
-                        cvar.notify_one();
-                    }
-                }
-                G(sem)
-            };
+            let _guard = SemaphoreGuard::acquire(sem, HQ_CONCURRENCY);
             if sd.load(Ordering::Acquire) {
                 return;
             }
@@ -1382,25 +1308,7 @@ impl MediaWorker {
         thread::spawn(move || {
             // Two native-res decoders opened per call — gate on hq_sem.
             const HQ_CONCURRENCY: u32 = 2;
-            {
-                let (lock, cvar) = &*sem;
-                let mut c = lock.lock().unwrap();
-                while *c >= HQ_CONCURRENCY {
-                    c = cvar.wait(c).unwrap();
-                }
-                *c += 1;
-            }
-            let _guard = {
-                struct G(Arc<(Mutex<u32>, Condvar)>);
-                impl Drop for G {
-                    fn drop(&mut self) {
-                        let (lock, cvar) = &*self.0;
-                        *lock.lock().unwrap() -= 1;
-                        cvar.notify_one();
-                    }
-                }
-                G(sem)
-            };
+            let _guard = SemaphoreGuard::acquire(sem, HQ_CONCURRENCY);
             if sd.load(Ordering::Acquire) {
                 return;
             }
