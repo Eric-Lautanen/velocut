@@ -19,7 +19,7 @@ pub fn probe_duration(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) -> f64
         Ok(ctx) => {
             let dur = ctx.duration() as f64 / ffmpeg::ffi::AV_TIME_BASE as f64;
             if dur > 0.0 {
-                eprintln!("[media] duration {dur:.2}s ← {}", path.display());
+                crate::media_log!("[media] duration {dur:.2}s ← {}", path.display());
                 let _ = tx.send(MediaResult::Duration { id, seconds: dur });
                 return dur;
             }
@@ -43,7 +43,7 @@ pub fn probe_duration(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) -> f64
             0.0
         }
         Err(e) => {
-            eprintln!("[media] probe_duration open failed: {e}");
+            crate::media_log!("[media] probe_duration open failed: {e}");
             let _ = tx.send(MediaResult::Error {
                 id,
                 msg: e.to_string(),
@@ -93,7 +93,7 @@ pub fn probe_video_size_and_thumbnail(
         let dec_ctx = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[media] codec ctx: {e}");
+                crate::media_log!("[media] codec ctx: {e}");
                 return;
             }
         };
@@ -101,7 +101,7 @@ pub fn probe_video_size_and_thumbnail(
     };
 
     if raw_w > 0 && raw_h > 0 {
-        eprintln!("[media] video size {raw_w}x{raw_h} ← {}", path.display());
+        crate::media_log!("[media] video size {raw_w}x{raw_h} ← {}", path.display());
         let _ = tx.send(MediaResult::VideoSize {
             id,
             width: raw_w,
@@ -167,7 +167,7 @@ pub fn probe_video_size_and_thumbnail(
                         scaler.as_mut().unwrap()
                     }
                     Err(e) => {
-                        eprintln!("[media] thumbnail scaler: {e}");
+                        crate::media_log!("[media] thumbnail scaler: {e}");
                         continue;
                     }
                 },
@@ -184,7 +184,7 @@ pub fn probe_video_size_and_thumbnail(
                 .flat_map(|row| &raw[row * stride..row * stride + row_bytes])
                 .copied()
                 .collect();
-            eprintln!(
+            crate::media_log!(
                 "[media] thumbnail {}x{} ← {}",
                 thumb_w,
                 thumb_h,
@@ -201,6 +201,6 @@ pub fn probe_video_size_and_thumbnail(
         }
     }
     if !found {
-        eprintln!("[media] thumbnail: no frame decoded for {}", path.display());
+        crate::media_log!("[media] thumbnail: no frame decoded for {}", path.display());
     }
 }

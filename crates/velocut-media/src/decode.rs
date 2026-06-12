@@ -70,6 +70,10 @@ pub struct LiveDecoder {
 /// Send-safe wrapper for a raw `*mut SwsContext` (FFmpeg scaler context).
 /// SwsContext is thread-safe for independent use on a single thread.
 struct RawSwsCtx(*mut ffi::SwsContext);
+// Safety: RawSwsCtx is safe to Send because:
+//   1. SwsContext is documented by FFmpeg as thread-safe when not shared.
+//   2. The pointer is owned uniquely — it is moved, not cloned or aliased.
+//   3. The CachedCropSws wrapper that holds this only provides &mut access.
 unsafe impl Send for RawSwsCtx {}
 
 /// RAII wrapper for the cached crop SwsContext.  Owns the raw pointer and frees
@@ -105,9 +109,15 @@ impl Drop for HwDeviceCtx {
     }
 }
 
-// Safety: the AVBufferRef is ref-counted internally by FFmpeg and its
-// internal data (AVHWDeviceContext + D3D11Device) is thread-safe for
-// concurrent decoding.  We never alias the raw pointer across threads.
+// Safety: HwDeviceCtx is safe to Send because:
+//   1. AVBufferRef uses FFmpeg's internal ref-counting (av_buffer_ref/av_buffer_unref).
+//      The raw pointer uniquely owns a reference — no other thread can access it.
+//   2. The underlying AVHWDeviceContext + D3D11Device are created once and held
+//      immutably. FFmpeg's D3D11VA implementation uses per-decoder locking.
+//   3. We move (not share) HwDeviceCtx across threads — it is never aliased.
+//   4. Drop calls av_buffer_unref which is thread-safe per FFmpeg docs.
+// Sync is NOT implemented because sharing an AVBufferRef across threads
+// would allow concurrent mutable access to the ref-count field.
 unsafe impl Send for HwDeviceCtx {}
 
 /// Try to create a D3D11VA hardware device context.
@@ -128,13 +138,13 @@ fn try_create_d3d11va_device() -> Option<HwDeviceCtx> {
             0,
         );
         if ret < 0 || hw_ctx.is_null() {
-            eprintln!(
+            crate::media_log!(
                 "[hwaccel] D3D11VA device init failed ({}), using CPU decode",
                 ret
             );
             return None;
         }
-        eprintln!("[hwaccel] D3D11VA device created");
+        crate::media_log!("[hwaccel] D3D11VA device created");
         Some(HwDeviceCtx(hw_ctx))
     }
 }
@@ -179,7 +189,7 @@ unsafe extern "C" fn get_format_d3d11va(
             offered.push((*p) as i32);
             p = p.add(1);
         }
-        eprintln!(
+        crate::media_log!(
             "[hwaccel] get_format called — offered: {:?} (d3d11={} vld={} yuv420p={} nv12={})",
             offered, d3d11, d3d11_vld, yuv420p, nv12
         );
@@ -189,7 +199,7 @@ unsafe extern "C" fn get_format_d3d11va(
     let mut p = fmt;
     while (*p) as i32 != -1 {
         if (*p) as i32 == d3d11 {
-            eprintln!(
+            crate::media_log!(
                 "[hwaccel] get_format: selected AV_PIX_FMT_D3D11 ({})",
                 d3d11
             );
@@ -202,14 +212,14 @@ unsafe extern "C" fn get_format_d3d11va(
     p = fmt;
     while (*p) as i32 != -1 {
         if (*p) as i32 == d3d11_vld {
-            eprintln!(
+            crate::media_log!(
                 "[hwaccel] get_format: AV_PIX_FMT_D3D11VA_VLD ({}) — allocating hw_frames_ctx",
                 d3d11_vld
             );
             if allocate_d3d11va_vld_frames_ctx(ctx) {
                 return *p;
             }
-            eprintln!("[hwaccel] get_format: hw_frames_ctx alloc failed, falling through to CPU");
+            crate::media_log!("[hwaccel] get_format: hw_frames_ctx alloc failed, falling through to CPU");
             break;
         }
         p = p.add(1);
@@ -230,7 +240,7 @@ unsafe extern "C" fn get_format_d3d11va(
         }
         p = p.add(1);
     }
-    eprintln!("[hwaccel] get_format: no preferred CPU format found, returning first offered");
+    crate::media_log!("[hwaccel] get_format: no preferred CPU format found, returning first offered");
     *fmt
 }
 
@@ -242,13 +252,13 @@ unsafe extern "C" fn get_format_d3d11va(
 unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool {
     let hw_device_ctx = (*ctx).hw_device_ctx;
     if hw_device_ctx.is_null() {
-        eprintln!("[hwaccel] allocate_d3d11va_vld_frames_ctx: hw_device_ctx is NULL");
+        crate::media_log!("[hwaccel] allocate_d3d11va_vld_frames_ctx: hw_device_ctx is NULL");
         return false;
     }
 
     let frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
     if frames_ref.is_null() {
-        eprintln!("[hwaccel] av_hwframe_ctx_alloc failed");
+        crate::media_log!("[hwaccel] av_hwframe_ctx_alloc failed");
         return false;
     }
 
@@ -268,7 +278,7 @@ unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool
 
     let ret = ffi::av_hwframe_ctx_init(frames_ref);
     if ret < 0 {
-        eprintln!("[hwaccel] av_hwframe_ctx_init failed ({})", ret);
+        crate::media_log!("[hwaccel] av_hwframe_ctx_init failed ({})", ret);
         let mut p = frames_ref;
         ffi::av_buffer_unref(&mut p);
         return false;
@@ -280,11 +290,11 @@ unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool
     ffi::av_buffer_unref(&mut p);
 
     if (*ctx).hw_frames_ctx.is_null() {
-        eprintln!("[hwaccel] av_buffer_ref for hw_frames_ctx failed");
+        crate::media_log!("[hwaccel] av_buffer_ref for hw_frames_ctx failed");
         return false;
     }
 
-    eprintln!(
+    crate::media_log!(
         "[hwaccel] D3D11VA VLD hw_frames_ctx allocated ({}x{})",
         (*ctx).coded_width,
         (*ctx).coded_height
@@ -308,7 +318,7 @@ fn ensure_cpu_frame(frame: ffmpeg::util::frame::video::Video) -> ffmpeg::util::f
         let mut cpu_frame = ffmpeg::util::frame::video::Video::empty();
         let ret = ffi::av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_ptr(), 0);
         if ret < 0 {
-            eprintln!(
+            crate::media_log!(
                 "[hwaccel] av_hwframe_transfer_data failed ({}), dropping frame",
                 ret
             );
@@ -395,7 +405,7 @@ impl LiveDecoder {
                     if !hw_ref.is_null() {
                         (*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref;
                         (*dec_ctx.as_mut_ptr()).get_format = Some(get_format_d3d11va);
-                        eprintln!("[hwaccel] D3D11VA attached to decoder context (pre-open)");
+                        crate::media_log!("[hwaccel] D3D11VA attached to decoder context (pre-open)");
                     }
                 }
             }
@@ -1157,7 +1167,7 @@ fn emit_frame(
             .map(|row| &raw[row * stride..row * stride + row_bytes])
             .collect();
         writer.write_image_data(&rows.concat())?;
-        eprintln!("[media] PNG saved → {}", dest_path.display());
+        crate::media_log!("[media] PNG saved → {}", dest_path.display());
         let _ = tx.send(MediaResult::FrameSaved { path: dest_path });
     } else {
         let data: Vec<u8> = (0..out_h as usize)

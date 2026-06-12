@@ -1,41 +1,49 @@
-# Build artifacts
-target/
-[Dd]ebug/
-[Rr]elease/
-bin/
-obj/
-.claude/
+# VeloCut .gitignore
 
-# Compiled outputs
-*.dll
-*.pdb
-*.exe
+# Build output
+/target/
+/debug/
+/release/
 
-# Rust/Cargo
-Cargo.lock.bak
-
-# FFmpeg static libs (if stored locally, not in repo)
-*.a
+# Rust
+*.rs.bk
+*.rlib
+*.rmeta
+*.d
+*.exp
 *.lib
+*.pdb
 
-# Editor & IDE
+# FFmpeg static build artifacts
+/c/ffmpeg-velocut/
+*.a
+*.dll.a
+
+# IDE
 .vscode/
 .idea/
-*.suo
-*.user
-*.userosscache
-*.sln.docview
-.vs/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Temp / logs
+# App runtime artifacts
 *.log
-*.tmp
-*.bak
-*~
+velocut_*
+!velocut-core/**
+!velocut-media/**
+!velocut-ui/**
+!assets/**
+!*.md
+!*.toml
+!*.lock
 
-.claudeignore
+# MSYS2 / MINGW64
+/msys64/
+/mingw64/
+
+# Temp files
+*.wav.tmp
+*.tmp

@@ -19,11 +19,11 @@ pub fn extract_waveform(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) {
     let samples = match decode_audio_samples(path) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
-            eprintln!("[media] waveform: no samples for {}", path.display());
+            crate::media_log!("[media] waveform: no samples for {}", path.display());
             return;
         }
         Err(e) => {
-            eprintln!("[media] waveform decode {}: {e}", path.display());
+            crate::media_log!("[media] waveform decode {}: {e}", path.display());
             return;
         }
     };
@@ -35,7 +35,7 @@ pub fn extract_waveform(path: &PathBuf, id: Uuid, tx: &Sender<MediaResult>) {
         .map(|chunk| chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max))
         .collect();
 
-    eprintln!(
+    crate::media_log!(
         "[media] waveform {} peaks <- {}",
         peaks.len(),
         path.display()
@@ -165,7 +165,7 @@ fn append_frame_samples(frame: &ffmpeg::frame::Audio, out: &mut Vec<f32>) {
             out.extend(data.iter().map(|&b| (b as f32 / 128.0) - 1.0));
         }
         fmt => {
-            eprintln!("[media] waveform: unhandled sample format {fmt:?} — skipping frame");
+            crate::media_log!("[media] waveform: unhandled sample format {fmt:?} — skipping frame");
         }
     }
 }

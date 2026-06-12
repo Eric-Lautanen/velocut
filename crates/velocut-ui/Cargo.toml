@@ -2,6 +2,7 @@
 name    = "velocut-ui"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.80"
 
 [[bin]]
 name = "velocut"
@@ -15,16 +16,11 @@ egui              = { workspace = true }
 eframe            = { workspace = true }
 egui_extras       = { workspace = true }
 serde             = { workspace = true }
-serde_json        = { workspace = true }
 uuid              = { workspace = true }
 rfd               = { workspace = true }
-tempfile          = { workspace = true }
 ffmpeg-the-third  = { workspace = true }
-anyhow            = { workspace = true }
-crossbeam-channel = { workspace = true }
-parking_lot       = { workspace = true }
 rodio             = { workspace = true }
 png               = { workspace = true }
 
 [build-dependencies]
-winresource = { workspace = true }
+winresource = "0.1"

@@ -285,7 +285,7 @@ impl VeloCutApp {
                 self.state.timeline.retain(|c| c.media_id != id);
                 // Evict the thumbnail so deleted clips don't leak GPU memory.
                 // No refcount check needed — library entry is the sole owner.
-                self.context.cache.thumbnail_cache.remove(&id);
+                self.context.cache.remove_thumbnail(&id);
             }
             EditorCommand::SelectLibraryClip(id) => {
                 self.state.selected_library_clip = id;

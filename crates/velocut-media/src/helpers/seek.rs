@@ -57,7 +57,7 @@ pub fn seek_to_secs(
     match ictx.seek(seek_ts, ..=seek_ts) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!(
+            crate::media_log!(
                 "[seek] soft-fail in {label} at {target_secs:.3}s: {e} \
                  — decoding from current position, PTS filter will skip pre-roll"
             );

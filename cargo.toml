@@ -18,15 +18,11 @@ egui              = "0.34"
 eframe            = { version = "0.34", features = ["persistence"] }
 egui_extras       = { version = "0.34", features = ["all_loaders"] }
 serde             = { version = "1.0",  features = ["derive"] }
-serde_json        = "1.0"
 uuid              = { version = "1.23", features = ["v4", "serde"] }
 rfd               = "0.17"
-tempfile          = "3.27"
 ffmpeg-the-third = { git = "https://github.com/Eric-Lautanen/velocut-ffmpeg-the-third.git", branch = "master", features = ["static"] }
 anyhow            = "1.0"
 crossbeam-channel = "0.5"
-parking_lot       = "0.12"
 rodio             = { version = "0.22", features = ["mp3", "mp4", "flac", "vorbis", "wav"] }
 png               = "0.18"
-winresource       = "0.1"
 rayon             = "1.12"

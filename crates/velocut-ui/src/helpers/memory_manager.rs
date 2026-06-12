@@ -120,18 +120,25 @@ impl MemoryManager {
         if scrub_idle >= SCRUB_IDLE_SECS && !self.scrub_trim_done {
             self.scrub_trim(&mut context.cache, state.current_time);
             self.scrub_trim_done = true;
+
+            // Also evict frame_cache entries for media_ids not under the current
+            // playhead.  frame_cache holds at most one frame per media_id.  During
+            // idle, any entry for a clip that is no longer visible would be stale.
+            // Keep only the entry for the currently-active clip so L1 doesn't show
+            // a wrong-position frame after the user resumes scrubbing.
+            let active_media_id = context.playback.last_frame_req.map(|(id, _)| id);
+            context
+                .cache
+                .frame_cache
+                .retain(|id, _| Some(*id) == active_media_id);
         }
 
         // ── Thumbnail cap: evict oldest beyond MAX_THUMBNAILS ─────────────────
-        // Runs every tick but is O(1) when under the cap so it's cheap.
-        let cache = &mut context.cache;
-        if cache.thumbnail_cache.len() > MAX_THUMBNAILS {
-            let over = cache.thumbnail_cache.len() - MAX_THUMBNAILS;
-            let to_remove: Vec<_> = cache.thumbnail_cache.keys().take(over).copied().collect();
-            for k in to_remove {
-                cache.thumbnail_cache.remove(&k);
-            }
-            velocut_log!("[memory] thumbnail cap: evicted {over} entries");
+        // Uses insertion-order Vec to evict true oldest-first (not arbitrary
+        // HashMap iteration order).
+        let evicted = context.cache.evict_oldest_thumbnails(MAX_THUMBNAILS);
+        if evicted > 0 {
+            velocut_log!("[memory] thumbnail cap: evicted {evicted} entries");
         }
     }
 

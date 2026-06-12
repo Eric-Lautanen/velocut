@@ -220,8 +220,10 @@ mod tests {
         let (w, h) = (16, 16);
         let a = packed(0, 128, w, h);
         let b = packed(200, 128, w, h);
-        // At alpha=0.25, only the top-right quadrant should be mostly revealed
-        let result = ClockWipe.apply(&a, &b, w, h, 0.25);
+        // ease_in_out_cubic(0.25) ≈ 0.0625 → sweep is only ~0.39 rad from 12 o'clock.
+        // Use alpha≈0.4 so sweep ≈ π/2 (3 o'clock), putting top-right in frame_b
+        // and bottom-left still in frame_a.
+        let result = ClockWipe.apply(&a, &b, w, h, 0.397);
         let top_right = result[(h / 4 * w + w * 3 / 4) as usize];
         let bottom_left = result[(h * 3 / 4 * w + w / 4) as usize];
         assert!(top_right > bottom_left,

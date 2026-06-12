@@ -9,11 +9,11 @@
 //   - Used by the concurrent crossfade decode path (Section 7)
 //
 // Layout convention for packed YUV420P byte vecs:
-//   [0 .. w*h]              — Y plane, packed (no stride)
-//   [w*h .. w*h + uv_w*uv_h]        — U plane, packed
-//   [w*h + uv_w*uv_h .. end]         — V plane, packed
+//   [0 .. w*h]                    — Y plane, packed (no stride)
+//   [w*h .. w*h + (w/2)*(h/2)]   — U plane, packed
+//   [w*h + (w/2)*(h/2) .. end]   — V plane, packed
 //
-// "Packed" means strides are removed — each row is exactly w (or uv_w) bytes.
+// "Packed" means strides are removed — each row is exactly w (or w/2) bytes.
 // ffmpeg VideoFrame rows may have padding; extract_yuv strips it.
 
 use ffmpeg_the_third::util::frame::video::Video as VideoFrame;
@@ -22,7 +22,11 @@ use ffmpeg_the_third::util::frame::video::Video as VideoFrame;
 ///
 /// The frame must already be in `Pixel::YUV420P` format — call swscale first.
 /// Returns a single Vec laid out as Y ++ U ++ V (see module doc for offsets).
-pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usize) -> Vec<u8> {
+///
+/// Chroma dimensions are computed as `w/2` and `h/2` (YUV420P spec).
+pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize) -> Vec<u8> {
+    let uv_w = w / 2;
+    let uv_h = h / 2;
     let mut raw = vec![0u8; w * h + uv_w * uv_h * 2];
 
     // Y plane
@@ -57,14 +61,17 @@ pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize, uv_w: usize, uv_h: usiz
 ///
 /// The inverse of `extract_yuv` — used when the blended frame needs to be sent
 /// to the encoder (which expects a strided VideoFrame, not a packed buffer).
+///
+/// Chroma dimensions are computed as `w/2` and `h/2` (YUV420P spec).
 pub fn write_yuv(
     packed: &[u8],
     yuv: &mut VideoFrame,
     w: usize,
     h: usize,
-    uv_w: usize,
-    uv_h: usize,
 ) {
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+
     // Y plane
     let y_stride = yuv.stride(0);
     let y_dst = yuv.data_mut(0);

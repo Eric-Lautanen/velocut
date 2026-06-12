@@ -469,8 +469,13 @@ impl VideoModule {
                 }
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 let aspect = state.active_video_ratio();
-                ctx.media_worker
-                    .request_frame(lib.id, lib.path.clone(), local_t, aspect);
+                ctx.media_worker.request_frame(
+                    lib.id,
+                    lib.path.clone(),
+                    local_t,
+                    aspect,
+                    preview_size,
+                );
             }
 
             // Layer 2b (per 2s): coarse warm-up prefetch ahead of scrub head.
@@ -488,6 +493,7 @@ impl VideoModule {
                             lib.path.clone(),
                             coarse_bucket as f64 * 2.0,
                             aspect,
+                            preview_size,
                         );
                     }
                 }

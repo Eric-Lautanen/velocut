@@ -38,6 +38,10 @@ pub struct CacheContext {
     /// Never evicted today — see Optimization Opportunities §thumbnail eviction.
     pub thumbnail_cache: ThumbnailCache,
 
+    /// Insertion-order tracking for thumbnail_cache.
+    /// Used by the memory manager to evict oldest-first (not arbitrary HashMap order).
+    thumbnail_order: Vec<Uuid>,
+
     /// Latest live-playback or scrub frame per media_id.
     /// Written by ingest_media_results (scrub) and poll_playback (playback).
     pub frame_cache: HashMap<Uuid, egui::TextureHandle>,
@@ -75,6 +79,7 @@ impl CacheContext {
     fn new() -> Self {
         Self {
             thumbnail_cache: HashMap::new(),
+            thumbnail_order: Vec::new(),
             frame_cache: HashMap::new(),
             pending_pb_frame: None,
             frame_bucket_cache: HashMap::new(),
@@ -142,11 +147,34 @@ impl CacheContext {
         // allocation — avoids a pointless dealloc+realloc on the next project open.
         // TextureHandle drops in-place, releasing GPU memory for each entry.
         self.thumbnail_cache.clear();
+        self.thumbnail_order.clear();
         self.frame_cache.clear();
         self.frame_bucket_cache.clear();
         self.scrub_textures.clear();
         self.pending_pb_frame = None;
         self.frame_cache_bytes = 0;
+    }
+
+    /// Remove a thumbnail from the cache, updating insertion-order tracking.
+    /// Call this instead of `thumbnail_cache.remove()` directly.
+    pub fn remove_thumbnail(&mut self, id: &Uuid) {
+        self.thumbnail_cache.remove(id);
+        self.thumbnail_order.retain(|x| x != id);
+    }
+
+    /// Evict the oldest thumbnails so the total count does not exceed `max`.
+    /// Returns the number evicted.
+    pub fn evict_oldest_thumbnails(&mut self, max: usize) -> usize {
+        let over = self.thumbnail_cache.len().saturating_sub(max);
+        if over == 0 {
+            return 0;
+        }
+        // Drain the oldest `over` entries from the front of the insertion-order vec.
+        let to_remove: Vec<Uuid> = self.thumbnail_order.drain(..over).collect();
+        for id in &to_remove {
+            self.thumbnail_cache.remove(id);
+        }
+        to_remove.len()
     }
 }
 
@@ -312,7 +340,11 @@ impl AppContext {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.cache.thumbnail_cache.insert(id, tex);
+                    self.cache.thumbnail_cache.insert(id, tex.clone());
+                    // Track insertion order for oldest-first eviction.
+                    // Remove any previous entry for this id (re-insertion moves to end).
+                    self.cache.thumbnail_order.retain(|x| *x != id);
+                    self.cache.thumbnail_order.push(id);
                     needs_repaint = true;
                 }
 
@@ -434,38 +466,15 @@ impl AppContext {
                 apply_filter_rgba(&mut data, &active_filter);
             }
         }
-        // ── Zero-copy ColorImage ───────────────────────────────────────────────
-        // `data` is an owned Vec<u8> of tightly packed RGBA bytes produced by
-        // copy_frame_rgba() in decode.rs.  egui's ColorImage stores Vec<Color32>,
-        // which is repr(C) [u8; 4] — identical layout to four RGBA bytes.
-        //
-        // Instead of calling ColorImage::from_rgba_unmultiplied (which copies the
-        // entire buffer into a new Vec<Color32>), we reinterpret the existing Vec<u8>
-        // in-place.  This eliminates one full-frame CPU allocation per promoted frame:
-        //   Before: decode alloc → channel Vec<u8> → ColorImage Vec<Color32> copy → GPU upload
-        //   After:  decode alloc → channel Vec<u8> → reinterpret → GPU upload
-        //
-        // SAFETY:
-        //   • Color32 is #[repr(C)] with alignment 1 (four u8 fields) — same as u8.
-        //   • data.len() is always width * height * 4 (enforced by copy_frame_rgba).
-        //   • We consume `data` via mem::forget so its destructor never runs on the
-        //     original pointer, avoiding a double-free.
-        //   • The resulting Vec<Color32> is the sole owner of the allocation.
-        let pixels: Vec<egui::Color32> = unsafe {
-            let mut data = data;
-            let len = data.len() / 4;
-            let cap = data.capacity() / 4;
-            let ptr = data.as_mut_ptr() as *mut egui::Color32;
-            std::mem::forget(data);
-            Vec::from_raw_parts(ptr, len, cap)
-        };
-        let image = egui::ColorImage {
-            size: [width as usize, height as usize],
-            // source_size is the logical source dimensions before any egui scaling.
-            // Our buffer is always exactly `size` pixels (no sub-region), so they match.
-            source_size: egui::Vec2::new(width as f32, height as f32),
-            pixels,
-        };
+        // ── Build ColorImage ─────────────────────────────────────────────────────
+        // `data` is tight RGBA bytes from the decode pipeline.  We use the safe
+        // `ColorImage::from_rgba_unmultiplied` which copies the data internally.
+        // The previous zero-copy reinterpret (Vec<u8> → Vec<Color32> via unsafe)
+        // was correct at the time (Color32 is repr(C) with alignment 1), but is
+        // fragile against future egui layout changes.  The extra copy is negligible
+        // on the GPU-upload path which already allocates and copies for the texture.
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &data);
 
         // ── Persistent texture reuse ──────────────────────────────────────────
         // Reuse the existing GPU texture handle for this clip when dimensions

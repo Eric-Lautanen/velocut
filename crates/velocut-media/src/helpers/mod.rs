@@ -4,5 +4,6 @@
 // Not re-exported from lib.rs — these are encode/decode implementation details,
 // not part of the public API consumed by velocut-ui.
 
+pub mod log;
 pub mod seek;
 pub mod yuv;

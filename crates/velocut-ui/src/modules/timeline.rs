@@ -40,8 +40,7 @@ pub struct TimelineModule {
     /// One-frame latency is imperceptible and avoids a second pass over clips.
     drag_target: Option<(Uuid, usize)>,
 
-    /// Last timeline position (seconds) for which a scrub decode was emitted.
-
+    /// Whether the hotkey reference popup is currently visible.
     /// Whether the hotkey reference popup is currently visible.
     hotkeys_open: bool,
     /// True on the frame the hotkey popup is first opened — suppresses the
@@ -216,7 +215,7 @@ impl EditorModule for TimelineModule {
                             let extract_enabled = state.selected_timeline_clip.is_some()
                                 && clip_query::selected_clip_library_entry(state).is_some();
 
-                            if ui.add_enabled(extract_enabled, tool_btn("🖼"))
+                            if ui.add_enabled(extract_enabled, tool_btn("⏮"))
                                 .on_hover_text("Extract first frame of selected clip as PNG")
                                 .on_disabled_hover_text("Select a timeline clip first")
                                 .clicked()
@@ -244,7 +243,7 @@ impl EditorModule for TimelineModule {
                                 }
                             }
 
-                            if ui.add_enabled(extract_enabled, tool_btn("🖼"))
+                            if ui.add_enabled(extract_enabled, tool_btn("⏭"))
                                 .on_hover_text("Extract last frame of selected clip as PNG")
                                 .on_disabled_hover_text("Select a timeline clip first")
                                 .clicked()

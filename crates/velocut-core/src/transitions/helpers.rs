@@ -598,13 +598,13 @@ mod tests {
 
     #[test]
     fn ease_in_out_sine_softer_than_smoothstep() {
-        // At t=0.1 the sine ease should be greater than smooth-step
-        // (it rises faster early, characteristic of the softer curve).
+        // At t=0.1 the sine ease should be *lower* than smooth-step
+        // (it rises slower early — a softer "shoulder" entering the transition).
         let sine = ease_in_out_sine(0.1);
         let poly = ease_in_out(0.1);
         assert!(
-            sine > poly,
-            "sine ease should lead smooth-step at t=0.1 (got {sine} vs {poly})"
+            sine < poly,
+            "sine ease should lag smooth-step at t=0.1 (got {sine} vs {poly})"
         );
     }
 

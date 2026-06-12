@@ -67,6 +67,24 @@ pub fn delete_app_data_dir() {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| storage_dir.clone());
 
+    // Safety check: confirm the path contains "VeloCut" before deleting.
+    // This guards against eframe changing its storage directory format in a
+    // way that would cause `.parent()` to walk up to the wrong directory.
+    // Without this check, a future eframe version that stores data directly
+    // in e.g. %APPDATA%\eframe\VeloCut\ would have parent = %APPDATA%\eframe,
+    // and deleting that would wipe all eframe apps' data.
+    let dir_name = app_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !dir_name.contains("velocut") {
+        eprintln!(
+            "[reset] SAFETY GUARD: refusing to delete '{}' — path does not contain 'VeloCut'",
+            app_dir.display()
+        );
+        return;
+    }
+
     match std::fs::remove_dir_all(&app_dir) {
         Ok(()) => eprintln!(
             "[reset] deleted VeloCut app data dir '{}'",

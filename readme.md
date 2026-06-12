@@ -162,9 +162,8 @@ The egui application and binary entry point (~10K lines, 4-panel layout).
 | `rfd` | 0.17 | Native file dialogs |
 | `serde` | 1.0 | Project serialization |
 | `uuid` | 1.23 | Clip identity |
-| `png` | 0.18 | Icon loading, frame export |
-| `tempfile` | 3.27 | Temp file management |
-| `parking_lot` | 0.12 | Fast primitives |
+| `png`               | 0.18 | Icon loading, frame export |
+| `parking_lot`        | 0.12 | Fast primitives |
 
 ### FFmpeg Fork
 

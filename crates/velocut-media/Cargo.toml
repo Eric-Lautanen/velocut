@@ -2,6 +2,7 @@
 name    = "velocut-media"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.80"
 
 [dependencies]
 velocut-core      = { path = "../velocut-core" }
@@ -10,4 +11,3 @@ crossbeam-channel = { workspace = true }
 anyhow            = { workspace = true }
 png               = { workspace = true }
 uuid              = { workspace = true }
-tempfile          = { workspace = true }

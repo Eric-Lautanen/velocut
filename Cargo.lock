@@ -4387,7 +4387,6 @@ version = "0.1.6"
 dependencies = [
  "rayon",
  "serde",
- "serde_json",
  "uuid",
 ]
 
@@ -4399,7 +4398,6 @@ dependencies = [
  "crossbeam-channel",
  "ffmpeg-the-third",
  "png 0.18.1",
- "tempfile",
  "uuid",
  "velocut-core",
 ]
@@ -4408,19 +4406,14 @@ dependencies = [
 name = "velocut-ui"
 version = "0.1.6"
 dependencies = [
- "anyhow",
- "crossbeam-channel",
  "eframe",
  "egui",
  "egui_extras",
  "ffmpeg-the-third",
- "parking_lot",
  "png 0.18.1",
  "rfd",
  "rodio",
  "serde",
- "serde_json",
- "tempfile",
  "uuid",
  "velocut-core",
  "velocut-media",

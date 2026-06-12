@@ -2,9 +2,9 @@
 name    = "velocut-core"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.80"
 
 [dependencies]
 uuid      = { workspace = true }
 serde     = { workspace = true }
-serde_json = { workspace = true }
-rayon = { workspace = true }
+rayon     = { workspace = true }

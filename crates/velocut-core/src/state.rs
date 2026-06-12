@@ -103,6 +103,10 @@ fn default_clip_volume() -> f32 {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectState {
+    /// Serialization format version. Increment when the project format changes
+    /// in a way that older versions cannot read. Currently: 1.
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub library: Vec<LibraryClip>,
     pub timeline: Vec<TimelineClip>,
     pub aspect_ratio: AspectRatio,
@@ -162,6 +166,10 @@ pub struct ProjectState {
     pub redo_len: usize,
 }
 
+fn default_version() -> u32 {
+    1
+}
+
 fn default_volume() -> f32 {
     1.0
 }
@@ -169,6 +177,7 @@ fn default_volume() -> f32 {
 impl Default for ProjectState {
     fn default() -> Self {
         Self {
+            version: 1,
             library: Vec::new(),
             timeline: Vec::new(),
             aspect_ratio: AspectRatio::SixteenNine,
@@ -234,8 +243,19 @@ impl AspectRatio {
 impl ProjectState {
     /// Import a file into the library. Duration = 0 until ffprobe returns.
     pub fn add_to_library(&mut self, path: PathBuf) -> Uuid {
-        // Avoid duplicates
-        if let Some(existing) = self.library.iter().find(|c| c.path == path) {
+        // Avoid duplicates — compare canonical paths when possible,
+        // fall back to the raw path when canonicalization fails.
+        let path_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Some(existing) = self
+            .library
+            .iter()
+            .find(|c| {
+                std::fs::canonicalize(&c.path)
+                    .map(|cp| cp == path_key)
+                    .unwrap_or(false)
+                    || c.path == path
+            })
+        {
             return existing.id;
         }
 
@@ -461,16 +481,6 @@ impl ProjectState {
     }
 
     pub fn active_video_ratio(&self) -> f32 {
-        match self.aspect_ratio {
-            AspectRatio::SixteenNine => 16.0 / 9.0,
-            AspectRatio::NineSixteen => 9.0 / 16.0,
-            AspectRatio::TwoThree => 2.0 / 3.0,
-            AspectRatio::ThreeTwo => 3.0 / 2.0,
-            AspectRatio::FourThree => 4.0 / 3.0,
-            AspectRatio::OneOne => 1.0,
-            AspectRatio::FourFive => 4.0 / 5.0,
-            AspectRatio::TwentyOneNine => 21.0 / 9.0,
-            AspectRatio::Anamorphic => 2.39,
-        }
+        crate::helpers::geometry::aspect_ratio_value(self.aspect_ratio)
     }
 }

@@ -3,9 +3,6 @@
 // MediaWorker: owns the frame-request slot and playback decode thread.
 // All public API that velocut-ui calls lives here.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-extern crate libc;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -27,6 +24,9 @@ use crate::encode::{encode_timeline, EncodeSpec};
 use crate::probe::{probe_duration, probe_video_size_and_thumbnail};
 use crate::waveform::extract_waveform;
 
+mod blend;
+use blend::{ActiveBlend, blend_rgba_transition, crop_rgba, decode_transition_scrub_frame};
+
 // ── Internal types ────────────────────────────────────────────────────────────
 
 struct FrameRequest {
@@ -34,6 +34,10 @@ struct FrameRequest {
     path: PathBuf,
     timestamp: f64,
     aspect: f32,
+    /// When Some, decode at these pixel dimensions instead of the default
+    /// scrub resolution (320px). Set to the current preview canvas size so
+    /// L2 scrub frames fill the panel without blurry upscaling.
+    preview_size: Option<(u32, u32)>,
 }
 
 enum PlaybackCmd {
@@ -119,6 +123,34 @@ pub struct MediaWorker {
     /// requests — avoiding the per-frame decoder open/seek/close overhead that
     /// made transition scrubbing laggy on CPU-only systems.
     transition_scrub_req: Arc<(Mutex<Option<TransitionScrubRequest>>, Condvar)>,
+
+    // ── Thread handles (for graceful shutdown) ─────────────────────────────────
+    /// Handle for the dedicated scrub-frame decode thread.
+    scrub_thread: Option<thread::JoinHandle<()>>,
+    /// Handle for the dedicated transition-scrub decode thread.
+    transition_scrub_thread: Option<thread::JoinHandle<()>>,
+    /// Handle for the dedicated playback decode thread.
+    pb_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for MediaWorker {
+    fn drop(&mut self) {
+        // Drop pb_tx first to disconnect the channel and wake the PB thread
+        // from recv().  We need to do this before joining because Rust drops
+        // fields in declaration order AFTER Drop::drop() returns.
+        //
+        // pb_tx is a crossbeam Sender; dropping it causes the Receiver in
+        // the PB thread to return Disconnected, which exits its main loop.
+        // We replace it with a dummy channel that's immediately dropped.
+        let (dummy_tx, _) = bounded::<PlaybackCmd>(1);
+        let old_tx = std::mem::replace(&mut self.pb_tx, dummy_tx);
+        drop(old_tx);
+
+        // Now join the PB thread — it should exit within a few ms.
+        if let Some(h) = self.pb_thread.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl Default for MediaWorker {
@@ -141,7 +173,7 @@ impl MediaWorker {
         // the shared channel and are consumed with lower latency under probe load.
         let scrub_result_tx = scrub_tx.clone();
         let slot = Arc::clone(&frame_req);
-        thread::spawn(move || {
+        let scrub_thread = thread::spawn(move || {
             let mut live: Option<LiveDecoder> = None;
             loop {
                 let req = {
@@ -165,8 +197,23 @@ impl MediaWorker {
                     let cached_sws = live
                         .take()
                         .map(|d| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
-                    match LiveDecoder::open(&req.path, req.timestamp, req.aspect, cached_sws, None)
-                    {
+                    // When preview_size is known, pass it as forced_size so the
+                    // decoder output matches the panel dimensions exactly.
+                    // Otherwise fall back to the aspect-based 320px scrub size.
+                    let forced = if req.preview_size.is_some() {
+                        req.preview_size
+                    } else if req.aspect > 0.0 {
+                        None // let LiveDecoder use its 320px default
+                    } else {
+                        None
+                    };
+                    match LiveDecoder::open(
+                        &req.path,
+                        req.timestamp,
+                        req.aspect,
+                        cached_sws,
+                        forced,
+                    ) {
                         Ok(mut d) => {
                             let target_pts = d.ts_to_pts(req.timestamp);
                             if let Some((data, w, h)) = d.advance_to(target_pts) {
@@ -179,7 +226,7 @@ impl MediaWorker {
                             }
                             live = Some(d);
                         }
-                        Err(e) => eprintln!("[media] LiveDecoder::open: {e}"),
+                        Err(e) => crate::media_log!("[media] LiveDecoder::open: {e}"),
                     }
                 } else if let Some(d) = &mut live {
                     let tpts = d.ts_to_pts(req.timestamp);
@@ -189,7 +236,7 @@ impl MediaWorker {
                     let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
                     if needs_seek {
                         if let Err(e) = d.seek_to(req.timestamp) {
-                            eprintln!("[media] seek_to failed: {e}");
+                            crate::media_log!("[media] seek_to failed: {e}");
                             continue;
                         }
                     }
@@ -215,7 +262,7 @@ impl MediaWorker {
             Arc::new((Mutex::new(None), Condvar::new()));
         let transition_slot = Arc::clone(&transition_scrub_req);
         let transition_scrub_result_tx = scrub_tx.clone();
-        thread::spawn(move || {
+        let transition_scrub_thread = thread::spawn(move || {
             let mut live_a: Option<(PathBuf, LiveDecoder)> = None;
             let mut live_b: Option<(PathBuf, LiveDecoder)> = None;
             loop {
@@ -271,7 +318,7 @@ impl MediaWorker {
         let (pb_tx, pb_cmd_rx) = bounded::<PlaybackCmd>(8);
         let (pb_frame_tx, pb_rx) = bounded::<PlaybackFrame>(16);
 
-        thread::spawn(move || {
+        let pb_thread = thread::spawn(move || {
             let mut decoder: Option<(Uuid, LiveDecoder)> = None;
             // Active transition blend state.
             // Set by StartBlend, cleared by Start / Stop / primary-EOF / decoder_b-EOF.
@@ -335,14 +382,14 @@ impl MediaWorker {
                             if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                 if pb_id == new_id {
                                     if pb_dec.skip_until_pts > 0 {
-                                        eprintln!("[pb] Start: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                        crate::media_log!("[pb] Start: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
                                     } else {
                                         let t0 = std::time::Instant::now();
                                         let tpts = pb_dec.ts_to_pts(ts);
                                         if tpts > pb_dec.last_pts {
                                             pb_dec.burn_to_pts(tpts);
                                         }
-                                        eprintln!("[pb] Start (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        crate::media_log!("[pb] Start (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
                                         decoder = Some((new_id, pb_dec));
                                         continue;
                                     }
@@ -350,19 +397,19 @@ impl MediaWorker {
                                 // Wrong id — drop it and open fresh.
                             }
                             let t0 = std::time::Instant::now();
-                            eprintln!("[pb] Start received (active), ts={ts:.3}");
+                            crate::media_log!("[pb] Start received (active), ts={ts:.3}");
                             match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
                                 Ok(mut nd) => {
                                     let tpts = nd.ts_to_pts(ts);
                                     nd.burn_to_pts(tpts);
-                                    eprintln!(
+                                    crate::media_log!(
                                         "[pb] primary burn done in {}ms",
                                         t0.elapsed().as_millis()
                                     );
                                     decoder = Some((new_id, nd));
                                 }
                                 Err(e) => {
-                                    eprintln!("[pb] open: {e}");
+                                    crate::media_log!("[pb] open: {e}");
                                     decoder = None;
                                 }
                             }
@@ -381,10 +428,10 @@ impl MediaWorker {
                             let recycled_decoder_b = if invert {
                                 let d = decoder.take().map(|(_, d)| d);
                                 if let Some(ref db) = d {
-                                    eprintln!("[pb] recycling old primary as decoder_b: last_pts={} (ts≈{:.3}s)",
+                                    crate::media_log!("[pb] recycling old primary as decoder_b: last_pts={} (ts≈{:.3}s)",
                                         db.last_pts, db.pts_to_secs(db.last_pts));
                                 } else {
-                                    eprintln!("[pb] invert=true but no active decoder to recycle — will lazy-open");
+                                    crate::media_log!("[pb] invert=true but no active decoder to recycle — will lazy-open");
                                 }
                                 d
                             } else {
@@ -400,8 +447,8 @@ impl MediaWorker {
                                 held_blend = None;
                             }
                             let t0 = std::time::Instant::now();
-                            eprintln!("[pb] StartBlend received (active), ts={ts:.3}, recycled_decoder_b={invert}");
-                            eprintln!("[pb] StartBlend spec: blend_start_ts={:.3} duration={:.3} alpha_start={:.3} invert={invert}",
+                            crate::media_log!("[pb] StartBlend received (active), ts={ts:.3}, recycled_decoder_b={invert}");
+                            crate::media_log!("[pb] StartBlend spec: blend_start_ts={:.3} duration={:.3} alpha_start={:.3} invert={invert}",
                                 blend.as_ref().map(|b| b.spec.blend_start_ts).unwrap_or(0.0),
                                 blend.as_ref().map(|b| b.spec.duration as f64).unwrap_or(0.0),
                                 blend.as_ref().map(|b| b.spec.alpha_start as f64).unwrap_or(0.0),
@@ -418,13 +465,13 @@ impl MediaWorker {
                                         // would make next_frame() return None immediately,
                                         // causing the None handler to clear blend + decoder
                                         // and freeze the preview for clip_b's entire duration.
-                                        eprintln!("[pb] StartBlend: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                        crate::media_log!("[pb] StartBlend: prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
                                     } else {
                                         let tpts = pb_dec.ts_to_pts(ts);
                                         if tpts > pb_dec.last_pts {
                                             pb_dec.burn_to_pts(tpts);
                                         }
-                                        eprintln!("[pb] StartBlend (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                        crate::media_log!("[pb] StartBlend (active): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
                                         decoder = Some((new_id, pb_dec));
                                     }
                                 }
@@ -435,14 +482,14 @@ impl MediaWorker {
                                     Ok(mut nd) => {
                                         let tpts = nd.ts_to_pts(ts);
                                         nd.burn_to_pts(tpts);
-                                        eprintln!(
+                                        crate::media_log!(
                                             "[pb] primary burn done in {}ms",
                                             t0.elapsed().as_millis()
                                         );
                                         decoder = Some((new_id, nd));
                                     }
                                     Err(e) => {
-                                        eprintln!("[pb] open (blend): {e}");
+                                        crate::media_log!("[pb] open (blend): {e}");
                                         decoder = None;
                                         blend = None;
                                     }
@@ -456,7 +503,7 @@ impl MediaWorker {
                                     let db_start = b.spec.clip_b_source_start;
                                     let db_aspect = b.aspect;
                                     let t_db = std::time::Instant::now();
-                                    eprintln!("[pb] pre-opening decoder_b for outgoing blend: clip_b_start={db_start:.3}");
+                                    crate::media_log!("[pb] pre-opening decoder_b for outgoing blend: clip_b_start={db_start:.3}");
                                     match LiveDecoder::open(
                                         &db_path,
                                         db_start,
@@ -466,12 +513,12 @@ impl MediaWorker {
                                     ) {
                                         Ok(mut db) => {
                                             db.skip_until_pts = db.ts_to_pts(db_start);
-                                            eprintln!("[pb] decoder_b pre-opened in {}ms, lazy burn started (skip_until_pts={})",
+                                            crate::media_log!("[pb] decoder_b pre-opened in {}ms, lazy burn started (skip_until_pts={})",
                                                 t_db.elapsed().as_millis(), db.skip_until_pts);
                                             b.decoder_b = Some(db);
                                         }
                                         Err(e) => {
-                                            eprintln!("[pb] decoder_b pre-open (outgoing): {e}")
+                                            crate::media_log!("[pb] decoder_b pre-open (outgoing): {e}")
                                         }
                                     }
                                 }
@@ -500,10 +547,10 @@ impl MediaWorker {
                             match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
                                 Ok(mut d) => {
                                     d.skip_until_pts = d.ts_to_pts(pb_ts);
-                                    eprintln!("[pb] prebuffer opened for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
+                                    crate::media_log!("[pb] prebuffer opened for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
                                     prebuffered = Some((pb_id, d));
                                 }
-                                Err(e) => eprintln!("[pb] prebuffer open: {e}"),
+                                Err(e) => crate::media_log!("[pb] prebuffer open: {e}"),
                             }
                             // Fall through to decode next primary frame — don't continue.
                         }
@@ -526,7 +573,7 @@ impl MediaWorker {
                                             Some(db) if db.skip_until_pts > 0 => "burning",
                                             Some(_)  => "ready",
                                         };
-                                        eprintln!("[blend] frame={blend_frame_count} ts={ts_secs:.3} local_t={local_t:.3} alpha={alpha:.3} db={db_state}");
+                                        crate::media_log!("[blend] frame={blend_frame_count} ts={ts_secs:.3} local_t={local_t:.3} alpha={alpha:.3} db={db_state}");
                                         Some((b.spec.clip_b_path.clone(), b.spec.clip_b_source_start, alpha, b.spec.kind, b.aspect))
                                     } else {
                                         None
@@ -555,7 +602,7 @@ impl MediaWorker {
                             {
                                 blend = None;
                                 held_blend = None;
-                                eprintln!(
+                                crate::media_log!(
                                     "[blend] alpha=1.0 — transition complete, dropping blend"
                                 );
                                 None
@@ -576,7 +623,7 @@ impl MediaWorker {
                                     if let Some(b) = blend.as_mut() {
                                         let invert = b.spec.invert_ab;
                                         if b.decoder_b.is_none() {
-                                            eprintln!("[blend] decoder_b is None — opening lazily, clip_b_start={clip_b_start:.3}");
+                                            crate::media_log!("[blend] decoder_b is None — opening lazily, clip_b_start={clip_b_start:.3}");
                                             let t_open = std::time::Instant::now();
                                             let primary_size =
                                                 decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
@@ -590,11 +637,11 @@ impl MediaWorker {
                                                 Ok(mut db) => {
                                                     let tpts = db.ts_to_pts(clip_b_start);
                                                     db.skip_until_pts = tpts;
-                                                    eprintln!("[blend] decoder_b opened in {}ms, skip_until_pts={tpts}", t_open.elapsed().as_millis());
+                                                    crate::media_log!("[blend] decoder_b opened in {}ms, skip_until_pts={tpts}", t_open.elapsed().as_millis());
                                                     b.decoder_b = Some(db);
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("[pb] blend decoder_b open: {e}")
+                                                    crate::media_log!("[pb] blend decoder_b open: {e}")
                                                 }
                                             }
                                         }
@@ -627,7 +674,7 @@ impl MediaWorker {
                                             if let Some((data_b, wb, hb, _)) = db.next_frame() {
                                                 if data_b.len() != data.len() || wb != w || hb != h
                                                 {
-                                                    eprintln!(
+                                                    crate::media_log!(
                                                         "[pb] blend size mismatch — primary {}×{} ({} B) \
                                                          vs decoder_b {}×{} ({} B); skipping blend",
                                                         w, h, data.len(), wb, hb, data_b.len()
@@ -652,12 +699,12 @@ impl MediaWorker {
                                                     .unwrap_or(false);
                                                 if still_burning {
                                                     let db = b.decoder_b.as_ref().unwrap();
-                                                    eprintln!("[blend] still_burning: skip_until_pts={} last_pts={} gap_pts={}",
+                                                    crate::media_log!("[blend] still_burning: skip_until_pts={} last_pts={} gap_pts={}",
                                                         db.skip_until_pts, db.last_pts, db.skip_until_pts - db.last_pts);
                                                     if invert {
                                                         if let Some(hb) = held_blend.as_ref() {
                                                             if hb.len() == data.len() {
-                                                                eprintln!("[blend] still_burning animated: alpha={alpha:.3}");
+                                                                crate::media_log!("[blend] still_burning animated: alpha={alpha:.3}");
                                                                 return Some(
                                                                     blend_rgba_transition(
                                                                         hb, &data, w, h, alpha,
@@ -686,7 +733,7 @@ impl MediaWorker {
                                 match blended {
                                     Some(b) => {
                                         if held_streak > 0 {
-                                            eprintln!("[blend] held_blend streak ended after {held_streak} frames");
+                                            crate::media_log!("[blend] held_blend streak ended after {held_streak} frames");
                                             held_streak = 0;
                                         }
                                         blend_frame_count += 1;
@@ -697,7 +744,7 @@ impl MediaWorker {
                                     None => {
                                         held_streak += 1;
                                         if held_streak == 1 {
-                                            eprintln!("[blend] held_blend streak START (ts={ts_secs:.3} alpha from blend_params pending)");
+                                            crate::media_log!("[blend] held_blend streak START (ts={ts_secs:.3} alpha from blend_params pending)");
                                         }
                                         held_blend.clone().unwrap_or(data)
                                     }
@@ -725,14 +772,14 @@ impl MediaWorker {
                             };
                             frame_count += 1;
                             if frame_count.is_multiple_of(60) {
-                                eprintln!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
+                                crate::media_log!("[pb] frame #{frame_count} sent, ts={ts_secs:.3}");
                             }
                             // try_send so the pb thread never blocks — if the channel
                             // is full the UI is overloaded; skip this frame rather than
                             // stalling the decode loop (which would prevent processing
                             // Stop/Start/StartBlend commands).
                             if pb_frame_tx.try_send(f).is_err() && frame_count.is_multiple_of(60) {
-                                eprintln!("[pb] channel full — dropping frame ts={ts_secs:.3}");
+                                crate::media_log!("[pb] channel full — dropping frame ts={ts_secs:.3}");
                             }
                             // [P0-3] Interleave prebuffer burn between primary frames.
                             // Advance by 10 packets (~5ms) per frame so the prebuffered
@@ -748,7 +795,7 @@ impl MediaWorker {
                                 blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false);
                             if outgoing_blend && held_blend.is_some() {
                                 coast_last_alpha = last_blend_alpha;
-                                eprintln!(
+                                crate::media_log!(
                                     "[pb] primary EOF during outgoing blend — entering coast mode \
                                            (ts={coast_ts:.3}, alpha={coast_last_alpha:.3}, \
                                            decoder_b preserved for animated coast)"
@@ -767,12 +814,12 @@ impl MediaWorker {
                                 coast_last_primary = None;
                                 coasting = true;
                                 decoder = None;
-                                eprintln!(
+                                crate::media_log!(
                                     "[pb] primary EOF → hard-cut coast (prebuffered ready, \
                                            held last frame for bridge)"
                                 );
                             } else {
-                                eprintln!("[pb] primary decoder EOF, clearing decoder + blend");
+                                crate::media_log!("[pb] primary decoder EOF, clearing decoder + blend");
                                 held_blend = None;
                                 coast_last_primary = None;
                                 blend = None;
@@ -814,32 +861,32 @@ impl MediaWorker {
                                 if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                     if pb_id == id {
                                         if pb_dec.skip_until_pts > 0 {
-                                            eprintln!("[pb] Start (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                            crate::media_log!("[pb] Start (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
                                         } else {
                                             let t0 = std::time::Instant::now();
                                             let tpts = pb_dec.ts_to_pts(ts);
                                             if tpts > pb_dec.last_pts {
                                                 pb_dec.burn_to_pts(tpts);
                                             }
-                                            eprintln!("[pb] Start (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                            crate::media_log!("[pb] Start (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
                                             decoder = Some((id, pb_dec));
                                             continue;
                                         }
                                     }
                                 }
                                 let t0 = std::time::Instant::now();
-                                eprintln!("[pb] Start received (idle), ts={ts:.3}");
+                                crate::media_log!("[pb] Start received (idle), ts={ts:.3}");
                                 match LiveDecoder::open(&path, ts, aspect, None, preview_size) {
                                     Ok(mut d) => {
                                         let tpts = d.ts_to_pts(ts);
                                         d.burn_to_pts(tpts);
-                                        eprintln!(
+                                        crate::media_log!(
                                             "[pb] primary burn done in {}ms",
                                             t0.elapsed().as_millis()
                                         );
                                         decoder = Some((id, d));
                                     }
-                                    Err(e) => eprintln!("[pb] open: {e}"),
+                                    Err(e) => crate::media_log!("[pb] open: {e}"),
                                 }
                             }
                             PlaybackCmd::StartBlend {
@@ -853,7 +900,7 @@ impl MediaWorker {
                                 let invert = spec.invert_ab;
 
                                 if invert && was_coasting {
-                                    eprintln!(
+                                    crate::media_log!(
                                         "[pb] incoming StartBlend while coasting: overriding \
                                                alpha_start {:.3} → {:.3} (coast_last_alpha)",
                                         spec.alpha_start, coast_last_alpha
@@ -872,7 +919,7 @@ impl MediaWorker {
                                     let db_path = spec.clip_b_path.clone();
                                     let db_start = spec.clip_b_source_start;
                                     let t_db = std::time::Instant::now();
-                                    eprintln!("[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}");
+                                    crate::media_log!("[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}");
                                     match LiveDecoder::open(
                                         &db_path,
                                         db_start,
@@ -883,14 +930,14 @@ impl MediaWorker {
                                         Ok(mut db) => {
                                             let tpts = db.ts_to_pts(db_start);
                                             db.burn_to_pts(tpts);
-                                            eprintln!(
+                                            crate::media_log!(
                                                 "[pb] decoder_b pre-burn done in {}ms",
                                                 t_db.elapsed().as_millis()
                                             );
                                             Some(db)
                                         }
                                         Err(e) => {
-                                            eprintln!("[pb] decoder_b pre-open: {e}");
+                                            crate::media_log!("[pb] decoder_b pre-open: {e}");
                                             None
                                         }
                                     }
@@ -933,7 +980,7 @@ impl MediaWorker {
                                             coast_last_alpha,
                                             bridge_kind,
                                         );
-                                        eprintln!("[pb] bridge: ts={bridge_ts:.3} alpha={coast_last_alpha:.3} chan={}", pb_frame_tx.len());
+                                        crate::media_log!("[pb] bridge: ts={bridge_ts:.3} alpha={coast_last_alpha:.3} chan={}", pb_frame_tx.len());
                                         // [Fix 2] Move blended into held_blend, clone for send.
                                         // Previously: held_blend = Some(blended.clone()); ... data: blended
                                         // — two equal-sized allocations per bridge frame.
@@ -952,7 +999,7 @@ impl MediaWorker {
                                     }
                                     spec.alpha_start = coast_last_alpha;
                                     burn_ts = bridge_ts;
-                                    eprintln!("[pb] bridge done: alpha_start updated to {:.3}, burn_ts={burn_ts:.3}, chan_filled={}", spec.alpha_start, pb_frame_tx.len());
+                                    crate::media_log!("[pb] bridge done: alpha_start updated to {:.3}, burn_ts={burn_ts:.3}, chan_filled={}", spec.alpha_start, pb_frame_tx.len());
                                 }
 
                                 blend = Some(ActiveBlend {
@@ -967,14 +1014,14 @@ impl MediaWorker {
                                 if let Some((pb_id, mut pb_dec)) = prebuffered.take() {
                                     if pb_id == id {
                                         if pb_dec.skip_until_pts > 0 {
-                                            eprintln!("[pb] StartBlend (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
+                                            crate::media_log!("[pb] StartBlend (idle): prebuffer burn incomplete (skip_until_pts={}, last_pts={}), opening fresh", pb_dec.skip_until_pts, pb_dec.last_pts);
                                         } else {
                                             let t0 = std::time::Instant::now();
                                             let tpts = pb_dec.ts_to_pts(burn_ts);
                                             if tpts > pb_dec.last_pts {
                                                 pb_dec.burn_to_pts(tpts);
                                             }
-                                            eprintln!("[pb] StartBlend (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
+                                            crate::media_log!("[pb] StartBlend (idle): using prebuffered decoder, residual burn {}ms", t0.elapsed().as_millis());
                                             decoder = Some((id, pb_dec));
                                         }
                                     } else {
@@ -984,7 +1031,7 @@ impl MediaWorker {
                                 }
                                 if decoder.is_none() {
                                     let t0 = std::time::Instant::now();
-                                    eprintln!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
+                                    crate::media_log!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
                                     match LiveDecoder::open(
                                         &path,
                                         burn_ts,
@@ -995,14 +1042,14 @@ impl MediaWorker {
                                         Ok(mut d) => {
                                             let tpts = d.ts_to_pts(burn_ts);
                                             d.burn_to_pts(tpts);
-                                            eprintln!(
+                                            crate::media_log!(
                                                 "[pb] primary burn done in {}ms",
                                                 t0.elapsed().as_millis()
                                             );
                                             decoder = Some((id, d));
                                         }
                                         Err(e) => {
-                                            eprintln!("[pb] open (blend, idle): {e}");
+                                            crate::media_log!("[pb] open (blend, idle): {e}");
                                             blend = None;
                                         }
                                     }
@@ -1028,10 +1075,10 @@ impl MediaWorker {
                                 match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
                                     Ok(mut d) => {
                                         d.skip_until_pts = d.ts_to_pts(pb_ts);
-                                        eprintln!("[pb] prebuffer opened (idle) for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
+                                        crate::media_log!("[pb] prebuffer opened (idle) for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
                                         prebuffered = Some((pb_id, d));
                                     }
-                                    Err(e) => eprintln!("[pb] prebuffer open (idle): {e}"),
+                                    Err(e) => crate::media_log!("[pb] prebuffer open (idle): {e}"),
                                 }
                                 // Restore coast state — PreBuffer is a side-effect-only
                                 // command that should not interrupt coast frame production.
@@ -1065,7 +1112,7 @@ impl MediaWorker {
                             })();
 
                             let send_data = if let Some(blended) = animated {
-                                eprintln!("[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}");
+                                crate::media_log!("[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}");
                                 // [Fix 2] Move into held_blend, clone for send.
                                 let out = blended.clone();
                                 held_blend = Some(blended);
@@ -1086,7 +1133,7 @@ impl MediaWorker {
                                     return;
                                 }
                             } else {
-                                eprintln!(
+                                crate::media_log!(
                                     "[pb] coast: both animated and held_blend None — exiting coast"
                                 );
                                 coasting = false;
@@ -1110,14 +1157,17 @@ impl MediaWorker {
             encode_cancels: Arc::new(Mutex::new(HashMap::new())),
             hq_sem: Arc::new((Mutex::new(0), Condvar::new())),
             transition_scrub_req,
+            scrub_thread: Some(scrub_thread),
+            transition_scrub_thread: Some(transition_scrub_thread),
+            pb_thread: Some(pb_thread),
         }
     }
 
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         let cancels = self.encode_cancels.lock().unwrap();
         for flag in cancels.values() {
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::Release);
         }
         // Poison-pill the regular scrub thread.
         let (lock, cvar) = &*self.frame_req;
@@ -1126,6 +1176,7 @@ impl MediaWorker {
             path: std::path::PathBuf::new(),
             timestamp: 0.0,
             aspect: 0.0,
+            preview_size: None,
         });
         cvar.notify_one();
         // Poison-pill the transition scrub thread.
@@ -1142,6 +1193,32 @@ impl MediaWorker {
                 kind: velocut_core::transitions::TransitionKind::Cut,
             });
             cvar.notify_one();
+        }
+        // ── Join long-lived threads ─────────────────────────────────────────
+        // The poison pills above cause each thread to exit its main loop
+        // immediately.  We join them so all resources (LiveDecoders, SwsContexts,
+        // scalers) are dropped cleanly before the process exits.
+        //
+        // For the PB thread: the active loop uses try_recv() and will see
+        // Stop/Disconnected; the idle loop uses recv() which will wake when
+        // pb_tx is dropped. We send a Stop then replace pb_tx with a dummy
+        // (same pattern as Drop) so the idle recv() wakes up.
+        let _ = self.pb_tx.try_send(PlaybackCmd::Stop);
+        let (dummy_tx, _) = bounded::<PlaybackCmd>(1);
+        let old_tx = std::mem::replace(&mut self.pb_tx, dummy_tx);
+        drop(old_tx);
+
+        // Joining is best-effort — if a thread is stuck in an FFmpeg call,
+        // we don't want to hang the process.  In practice the poison pills
+        // cause near-instant exit from all three thread loops.
+        if let Some(h) = self.scrub_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.transition_scrub_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.pb_thread.take() {
+            let _ = h.join();
         }
     }
 
@@ -1176,22 +1253,22 @@ impl MediaWorker {
             }
             let _guard = SemGuard(sem);
 
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             let dur = probe_duration(&path, id, &tx);
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             probe_video_size_and_thumbnail(&path, id, dur, &tx);
 
             // NOTE: do NOT drop(_guard) here. extract_waveform and extract_audio
             // must run under the semaphore — they are the expensive operations.
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             extract_waveform(&path, id, &tx);
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             if dur > 0.0 {
@@ -1222,20 +1299,28 @@ impl MediaWorker {
         let tx = self.tx.clone();
         let sd = self.shutdown.clone();
         thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             extract_audio(&path, id, source_offset, duration, &tx);
         });
     }
 
-    pub fn request_frame(&self, id: Uuid, path: PathBuf, timestamp: f64, aspect: f32) {
+    pub fn request_frame(
+        &self,
+        id: Uuid,
+        path: PathBuf,
+        timestamp: f64,
+        aspect: f32,
+        preview_size: Option<(u32, u32)>,
+    ) {
         let (lock, cvar) = &*self.frame_req;
         *lock.lock().unwrap() = Some(FrameRequest {
             id,
             path,
             timestamp,
             aspect,
+            preview_size,
         });
         cvar.notify_one();
     }
@@ -1274,12 +1359,12 @@ impl MediaWorker {
                 }
                 G(sem)
             };
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             if let Err(e) = decode_frame(&path, id, timestamp, 0.0, false, None, &tx, preview_size)
             {
-                eprintln!("[media] request_frame_hq: {e}");
+                crate::media_log!("[media] request_frame_hq: {e}");
             }
         });
     }
@@ -1316,29 +1401,29 @@ impl MediaWorker {
                 }
                 G(sem)
             };
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             let (data_a, w, h) = match decode_one_frame_rgba(&req.clip_a_path, req.clip_a_ts, 0.0) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("[transition_hq] clip_a decode: {e}");
+                    crate::media_log!("[transition_hq] clip_a decode: {e}");
                     return;
                 }
             };
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             let (data_b_raw, wb, hb) =
                 match decode_one_frame_rgba(&req.clip_b_path, req.clip_b_ts, 0.0) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("[transition_hq] clip_b decode: {e}");
+                        crate::media_log!("[transition_hq] clip_b decode: {e}");
                         return;
                     }
                 };
             let data_b = if wb != w || hb != h {
-                eprintln!(
+                crate::media_log!(
                     "[transition_hq] clip_b size {}x{} differs from clip_a {}x{}; cropping",
                     wb, hb, w, h
                 );
@@ -1381,7 +1466,7 @@ impl MediaWorker {
             })
             .is_err()
         {
-            eprintln!("[pb] start_playback: command channel full — Start dropped. This is a bug.");
+            crate::media_log!("[pb] start_playback: command channel full — Start dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
     }
@@ -1407,7 +1492,7 @@ impl MediaWorker {
             })
             .is_err()
         {
-            eprintln!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
+            crate::media_log!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
     }
@@ -1435,7 +1520,7 @@ impl MediaWorker {
 
     pub fn stop_playback(&self) {
         if self.pb_tx.try_send(PlaybackCmd::Stop).is_err() {
-            eprintln!("[pb] stop_playback: command channel full — Stop dropped. This is a bug.");
+            crate::media_log!("[pb] stop_playback: command channel full — Stop dropped. This is a bug.");
         }
         while self.pb_rx.try_recv().is_ok() {}
     }
@@ -1444,11 +1529,11 @@ impl MediaWorker {
         let tx = self.tx.clone();
         let sd = self.shutdown.clone();
         thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 return;
             }
             if let Err(e) = decode_frame(&path, id, timestamp, 0.0, true, Some(dest), &tx, None) {
-                eprintln!("[media] extract_frame_hq: {e}");
+                crate::media_log!("[media] extract_frame_hq: {e}");
             }
         });
     }
@@ -1466,7 +1551,7 @@ impl MediaWorker {
 
         let cancels_ref = Arc::clone(&self.encode_cancels);
         thread::spawn(move || {
-            if sd.load(Ordering::Relaxed) {
+            if sd.load(Ordering::Acquire) {
                 let _ = tx.send(MediaResult::EncodeError {
                     job_id,
                     msg: "worker shutting down".into(),
@@ -1480,33 +1565,7 @@ impl MediaWorker {
             // but yields the moment any higher-priority thread needs a core.
             // Combined with the libx264 thread cap in open_software_encoder,
             // this prevents system lockups during 2K/4K CPU encodes.
-            #[cfg(windows)]
-            {
-                extern "system" {
-                    fn GetCurrentThread() -> *mut core::ffi::c_void;
-                    fn SetThreadPriority(hThread: *mut core::ffi::c_void, nPriority: i32) -> i32;
-                }
-                // THREAD_PRIORITY_BELOW_NORMAL = -1: yields to normal-priority
-                // threads (UI, audio) but still outranks idle/background work.
-                // THREAD_PRIORITY_LOWEST (-2) is too aggressive and makes even
-                // 1080p SW encodes feel glacially slow.
-                const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
-                unsafe {
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                }
-            }
-
-            // Linux + macOS: nice(10) lowers the encode thread's scheduler
-            // priority relative to normal (0). Range is 0–19; 10 is a
-            // well-established middle ground for background CPU work — the
-            // encode runs full-speed when cores are idle but yields
-            // immediately to the UI, audio, and scrub-decode threads.
-            // nice() applies to the calling thread on Linux (via NPTL) and
-            // to the calling thread on macOS; it does not affect the process.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            unsafe {
-                libc::nice(10);
-            }
+            velocut_core::windows::lower_thread_priority();
 
             encode_timeline(spec, cancel, tx);
 
@@ -1516,119 +1575,14 @@ impl MediaWorker {
 
     pub fn cancel_encode(&self, job_id: Uuid) {
         if let Some(flag) = self.encode_cancels.lock().unwrap().get(&job_id) {
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::Release);
         }
     }
 }
 
 // ── Blend decoder helpers ─────────────────────────────────────────────────────
 
-struct ActiveBlend {
-    spec: velocut_core::media_types::PlaybackTransitionSpec,
-    aspect: f32,
-    decoder_b: Option<LiveDecoder>,
-}
-
-// ── RGBA crop helper ──────────────────────────────────────────────────────────
-
-/// Decode a single frame for the transition scrub thread, reusing an existing
-/// LiveDecoder when the same file is being scrubbed forward within 2 seconds.
-///
-/// The `live` slot holds `(path, decoder)`.  On a hit (same path, small forward
-/// delta), the decoder advances in-place — no re-open overhead.  On a miss the
-/// decoder is re-opened with a keyframe-aligned seek, and the old SwsContext is
-/// recycled.
-fn decode_transition_scrub_frame(
-    live: &mut Option<(PathBuf, LiveDecoder)>,
-    path: &PathBuf,
-    ts: f64,
-) -> Option<(Vec<u8>, u32, u32)> {
-    let needs_open = live.as_ref().map(|(p, _)| p != path).unwrap_or(true);
-
-    if needs_open {
-        let cached_sws = live
-            .take()
-            .map(|(_, d)| (d.scaler, d.decoder_fmt, d.decoder_w, d.decoder_h));
-        match LiveDecoder::open(path, ts, 1.0, cached_sws, None) {
-            Ok(mut d) => {
-                let target_pts = d.ts_to_pts(ts);
-                let result = d.advance_to(target_pts);
-                *live = Some((path.clone(), d));
-                result
-            }
-            Err(e) => {
-                eprintln!("[transition_scrub] LiveDecoder::open: {e}");
-                None
-            }
-        }
-    } else if let Some((_, d)) = live.as_mut() {
-        let tpts = d.ts_to_pts(ts);
-        let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
-        if needs_seek {
-            if let Err(e) = d.seek_to(ts) {
-                eprintln!("[transition_scrub] seek_to failed: {e}");
-                return None;
-            }
-        }
-        d.advance_to(tpts)
-    } else {
-        None
-    }
-}
-
-fn crop_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    let src_ar = src_w as f32 / src_h.max(1) as f32;
-    let dst_ar = dst_w as f32 / dst_h.max(1) as f32;
-
-    let (off_x, off_y, used_w, used_h) = if src_ar > dst_ar {
-        let used_w = (src_h as f32 * dst_ar) as u32;
-        let off_x = (src_w - used_w) / 2;
-        (off_x, 0u32, used_w, src_h)
-    } else {
-        let used_h = (src_w as f32 / dst_ar) as u32;
-        let off_y = (src_h - used_h) / 2;
-        (0u32, off_y, src_w, used_h)
-    };
-
-    let sx = used_w as f32 / dst_w.max(1) as f32;
-    let sy = used_h as f32 / dst_h.max(1) as f32;
-
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
-    for dy in 0..dst_h {
-        for dx in 0..dst_w {
-            let src_x = (off_x as f32 + dx as f32 * sx) as u32;
-            let src_y = (off_y as f32 + dy as f32 * sy) as u32;
-            let src_x = src_x.clamp(0, src_w.saturating_sub(1));
-            let src_y = src_y.clamp(0, src_h.saturating_sub(1));
-            let si = (src_y * src_w + src_x) as usize * 4;
-            let di = (dy * dst_w + dx) as usize * 4;
-            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
-        }
-    }
-    out
-}
-
-// ── RGBA transition blending ──────────────────────────────────────────────────
-
-fn blend_rgba_transition(
-    a: &[u8],
-    b: &[u8],
-    w: u32,
-    h: u32,
-    alpha: f32,
-    kind: velocut_core::transitions::TransitionKind,
-) -> Vec<u8> {
-    use velocut_core::transitions::{registry, TransitionKind};
-
-    if kind == TransitionKind::Cut {
-        return a.to_vec();
-    }
-
-    let reg = registry();
-
-    reg.get(&kind)
-        .expect(
-            "blend_rgba_transition: unregistered TransitionKind — add it to declare_transitions!",
-        )
-        .apply_rgba(a, b, w, h, alpha)
-}
+// ── Blend helpers (extracted to worker/blend.rs) ────────────────────────────
+// ActiveBlend, decode_transition_scrub_frame, crop_rgba, and
+// blend_rgba_transition are defined in the `blend` submodule and
+// re-imported at the top of this file via `use blend::*`.

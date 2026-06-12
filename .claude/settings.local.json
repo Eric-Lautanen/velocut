@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check)",
+      "Read(//c/ffmpeg-velocut//**)",
+      "Read(//c/ffmpeg-velocut/lib//**)"
+    ]
+  }
+}

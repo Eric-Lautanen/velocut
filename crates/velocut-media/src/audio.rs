@@ -60,7 +60,7 @@ pub fn extract_audio(
 
     match decode_to_wav(path, &wav_path, source_offset, duration) {
         Ok(bytes) => {
-            eprintln!(
+            crate::media_log!(
                 "[media] audio WAV written ({bytes} bytes PCM) ← {}",
                 path.display()
             );
@@ -71,7 +71,7 @@ pub fn extract_audio(
             });
         }
         Err(e) => {
-            eprintln!("[media] audio extract failed for '{}': {e}", path.display());
+            crate::media_log!("[media] audio extract failed for '{}': {e}", path.display());
         }
     }
 }
@@ -86,9 +86,9 @@ pub fn cleanup_audio_temp(path: &std::path::Path) {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if in_temp && name.starts_with("velocut_audio_") && name.ends_with(".wav") {
         if let Err(e) = std::fs::remove_file(path) {
-            eprintln!("[media] cleanup_audio_temp: {e}");
+            crate::media_log!("[media] cleanup_audio_temp: {e}");
         } else {
-            eprintln!("[media] cleaned up temp WAV: {}", path.display());
+            crate::media_log!("[media] cleaned up temp WAV: {}", path.display());
         }
     }
 }

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// is a one-liner.
 ///
 /// Usage:
-/// ```
+/// ```ignore
 /// declare_filters! {
 ///     None,
 ///     Cinematic,
