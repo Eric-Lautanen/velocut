@@ -284,7 +284,7 @@ impl MediaWorker {
                 };
 
                 let blended = blend_rgba_transition(&data_a, &data_b, w, h, req.alpha, req.kind);
-                let _ = transition_scrub_result_tx.send(MediaResult::VideoFrame {
+                let _ = transition_scrub_result_tx.send(MediaResult::TransitionVideoFrame {
                     id: req.clip_a_id,
                     width: w,
                     height: h,

@@ -29,6 +29,15 @@ pub enum MediaResult {
         height: u32,
         data: Vec<u8>,
     },
+    /// A blended transition frame from the transition scrub thread.
+    /// Carries the same payload as VideoFrame but is routed separately so
+    /// the UI can distinguish blended results from single-clip decodes.
+    TransitionVideoFrame {
+        id: Uuid,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
     VideoSize {
         id: Uuid,
         width: u32,

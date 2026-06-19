@@ -50,12 +50,12 @@ pub struct CacheContext {
     /// Prevents the drain-all pattern from racing ahead of wall-clock time.
     pub pending_pb_frame: Option<PlaybackFrame>,
 
-    /// Decoded frames keyed by (media_id, fine_bucket) — the scrub look-ahead store.
-    /// Value is (texture, byte_size) — the byte count is the exact RGBA size of that
-    /// frame so eviction subtracts the right amount regardless of source resolution.
-    /// Eviction: when byte estimate exceeds MAX_FRAME_CACHE_BYTES, evict the 32
-    /// entries furthest from the current playhead (not random, not LRU).
-    pub frame_bucket_cache: HashMap<(Uuid, u32), (egui::TextureHandle, usize)>,
+    /// Decoded frames keyed by (media_id, fine_bucket, is_coarse) - the scrub
+    /// look-ahead store.  The `is_coarse` flag prevents L1 fine-bucket entries from
+    /// colliding with L2 coarse-bucket entries when the numeric bucket values happen
+    /// to overlap (e.g. fine_bucket == coarse_bucket * 8 at 2-second boundaries).
+    /// Value is (texture, byte_size).
+    pub frame_bucket_cache: HashMap<(Uuid, u32, bool), (egui::TextureHandle, usize)>,
 
     /// Approximate bytes currently held in frame_bucket_cache.
     /// Updated on insert and eviction.  Treated as an estimate (we don't track
@@ -66,13 +66,15 @@ pub struct CacheContext {
     ///
     /// On every scrub frame ingest we call `TextureHandle::set()` on the existing
     /// handle rather than `ctx.load_texture()`.  `set()` does an in-place GPU pixel
-    /// upload with no reallocation when dimensions are unchanged — one GPU transfer
+    /// upload with no reallocation when dimensions are unchanged - one GPU transfer
     /// per frame instead of alloc + upload + dealloc.  A new handle is allocated only
     /// on first use or when the clip's source resolution changes (e.g. switching to a
     /// clip recorded at a different camera resolution).
     ///
     /// Stores `(handle, width, height)` so a dimension change is detectable in O(1).
     pub scrub_textures: HashMap<Uuid, (egui::TextureHandle, u32, u32)>,
+
+
 }
 
 impl CacheContext {
@@ -99,7 +101,7 @@ impl CacheContext {
     /// linearly if the cap is raised.
     pub fn insert_bucket_frame(
         &mut self,
-        key: (Uuid, u32),
+        key: (Uuid, u32, bool),
         tex: egui::TextureHandle,
         width: usize,
         height: usize,
@@ -115,14 +117,14 @@ impl CacheContext {
             // [Opt 4] O(N) partial select: puts the 32 furthest entries at keys[..32]
             // without fully sorting the remaining N-32 entries.
             if keys.len() > 32 {
-                keys.select_nth_unstable_by_key(32, |(_, b)| {
+                keys.select_nth_unstable_by_key(32, |(_, b, _)| {
                     std::cmp::Reverse(b.abs_diff(current_bucket))
                 });
             }
             keys.truncate(32);
 
             for k in &keys {
-                // Subtract this entry's own byte count — not the incoming frame size.
+                // Subtract this entry's own byte count - not the incoming frame size.
                 // Mixed-resolution projects (e.g. 4K + 720p) would cause the budget
                 // estimate to drift if we assumed all entries are the same size.
                 if let Some((_, entry_bytes)) = self.frame_bucket_cache.remove(k) {
@@ -296,16 +298,31 @@ impl AppContext {
         // The scrub thread sends at most one result per condvar wake, so this
         // loop typically executes 0 or 1 iterations per frame.
         while let Ok(result) = self.media_worker.scrub_rx.try_recv() {
-            // Only VideoFrame arrives on scrub_rx — match exhaustively so the
-            // compiler warns if the channel ever carries an unexpected variant.
-            if let MediaResult::VideoFrame {
-                id,
-                width,
-                height,
-                data,
-            } = result
-            {
-                self.ingest_video_frame(id, width, height, data, state, &mut needs_repaint, ctx);
+            match result {
+                // Single-clip scrub frame (regular scrub thread)
+                MediaResult::VideoFrame {
+                    id,
+                    width,
+                    height,
+                    data,
+                } => {
+                    self.ingest_video_frame(
+                        id, width, height, data, state, &mut needs_repaint, ctx,
+                    );
+                }
+                // Blended transition frame (transition scrub thread)
+                MediaResult::TransitionVideoFrame {
+                    id,
+                    width,
+                    height,
+                    data,
+                } => {
+                    self.ingest_video_frame(
+                        id, width, height, data, state, &mut needs_repaint, ctx,
+                    );
+                }
+                // Other variants never arrive on scrub_rx - ignore them.
+                _ => {}
             }
         }
 
@@ -425,6 +442,8 @@ impl AppContext {
                         needs_repaint = true;
                     }
                 }
+                // TransitionVideoFrame only arrives on scrub_rx, not the shared channel.
+                MediaResult::TransitionVideoFrame { .. } => {}
             }
         }
 
@@ -483,7 +502,7 @@ impl AppContext {
         //
         // A new handle is allocated only on:
         //   a) First frame for this clip (cold path, O(1) HashMap miss).
-        //   b) Source resolution change — e.g. switching from a 4K clip to a
+        //   b) Source resolution change - e.g. switching from a 4K clip to a
         //      720p clip that happens to share the same media_id (pathological but
         //      handled correctly: the old handle is replaced and the GPU memory
         //      freed when the Arc refcount in frame_bucket_cache reaches zero).
@@ -494,7 +513,7 @@ impl AppContext {
                 handle.clone()
             }
             _ => {
-                // Cold path: first frame or resolution change — full GPU alloc.
+                // Cold path: first frame or resolution change - full GPU alloc.
                 let handle =
                     ctx.load_texture(format!("scrub-{id}"), image, egui::TextureOptions::LINEAR);
                 self.cache
@@ -505,17 +524,17 @@ impl AppContext {
         };
 
         // Derive the ¼s bucket key for frame_bucket_cache.
-        // playback.last_frame_req stores exact f64 ts — convert here.
-        let bucket: u32 = self
+        // playback.last_frame_req stores exact f64 ts - convert here.
+        let (bucket, is_coarse) = self
             .playback
             .last_frame_req
             .filter(|(rid, _)| *rid == id)
-            .map(|(_, ts)| (ts * 4.0) as u32)
+            .map(|(_, ts)| ((ts * 4.0) as u32, false))
             .or_else(|| {
                 self.playback
                     .scrub_coarse_req
                     .filter(|(rid, _)| *rid == id)
-                    .map(|(_, cb)| cb * 8)
+                    .map(|(_, cb)| (cb * 8, true))
             })
             .unwrap_or_else(|| {
                 state
@@ -526,13 +545,13 @@ impl AppContext {
                         // Match the local_t formula in video_module::tick():
                         // source-relative time = timeline time + source_offset.
                         let lt = (state.current_time - c.start_time + c.source_offset).max(0.0);
-                        (lt * 4.0) as u32
+                        ((lt * 4.0) as u32, false)
                     })
-                    .unwrap_or(0)
+                    .unwrap_or((0, false))
             });
 
         let tex = self.cache.insert_bucket_frame(
-            (id, bucket),
+            (id, bucket, is_coarse),
             tex,
             width as usize,
             height as usize,
