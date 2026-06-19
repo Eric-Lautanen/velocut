@@ -377,10 +377,10 @@ impl VideoModule {
 
         let Some(clip) = current_clip else {
             if let Some((prev_id, _)) = ctx.playback.last_frame_req {
-                // Playhead moved into empty space — evict that clip's bucket cache.
+                // Playhead moved into empty space - evict that clip's bucket cache.
                 ctx.cache
                     .frame_bucket_cache
-                    .retain(|(id, _), _| *id != prev_id);
+                    .retain(|(id, _, _), _| *id != prev_id);
             }
             ctx.playback.last_frame_req = None;
             ctx.playback.scrub_last_moved = None;
@@ -392,13 +392,17 @@ impl VideoModule {
         let fine_bucket = (local_t * 4.0) as u32; // ¼s grid — cache key only
         let coarse_bucket = (local_t / 2.0) as u32; // 2s grid — prefetch key
 
-        // scrub_moved: any position change > ~10ms fires a new decode request.
-        // Compare exact f64 ts so every ruler pixel triggers a request, not just
-        // every ¼s bucket crossing. The latest-wins condvar slot is the rate limiter.
+        // scrub_moved: position change > ~30ms (≈1 frame) fires a new decode request.
+        // The debounce prevents redundant decodes when the UI runs at 60 Hz and the
+        // user scrubs quickly - without it the decode thread gets swamped with stale
+        // requests that the latest-wins slot can only partially suppress.
+        const SCRUB_DEBOUNCE_SECS: f64 = 0.030;
         let scrub_moved = ctx
             .playback
             .last_frame_req
-            .map(|(rid, last_ts)| rid != clip.media_id || (last_ts - local_t).abs() > 0.010)
+            .map(|(rid, last_ts)| {
+                rid != clip.media_id || (last_ts - local_t).abs() > SCRUB_DEBOUNCE_SECS
+            })
             .unwrap_or(true);
 
         if scrub_moved {
@@ -416,7 +420,7 @@ impl VideoModule {
                     // they are never freed, causing unbounded TextureHandle growth.
                     ctx.cache
                         .frame_bucket_cache
-                        .retain(|(id, _), _| *id != prev_id);
+                        .retain(|(id, _, _), _| *id != prev_id);
                     // If the new clip is inside a transition zone, also evict any
                     // stale raw frame that may be sitting in frame_cache for it.
                     //
@@ -442,15 +446,18 @@ impl VideoModule {
             // Use a narrower search window (2 buckets ≈ 500ms) in zones so the
             // displayed alpha is close to correct; outside zones use the full
             // 8-bucket (2s) window.  Showing a slightly-wrong-alpha cached frame
-            // for the 1–3 ticks until L2's exact decode arrives is far better than
+            // for the 1-3 ticks until L2's exact decode arrives is far better than
             // showing nothing (which caused the visible flicker at zone entry).
             {
                 let search_range = if zone.is_some() { 2u32 } else { 8u32 };
                 let found_nearby = (0..=search_range).find_map(|delta| {
                     let b = fine_bucket.saturating_sub(delta);
+                    // Only look at fine-bucket entries (is_coarse=false) for L1.
+                    // Coarse prefetch entries are stored with is_coarse=true so they
+                    // never collide with fine-bucket lookups.
                     ctx.cache
                         .frame_bucket_cache
-                        .get(&(clip.media_id, b))
+                        .get(&(clip.media_id, b, false))
                         .map(|(tex, _)| tex.clone())
                 });
                 if let Some(cached) = found_nearby {
@@ -522,6 +529,9 @@ impl VideoModule {
                     ctx.playback.scrub_coarse_req = Some(coarse_key);
                     if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                         let aspect = state.active_video_ratio();
+                        // Mark this as a coarse prefetch so ingest_video_frame stores
+                        // it with is_coarse=true, preventing collision with fine-bucket
+                        // entries in the bucket cache.
                         ctx.media_worker.request_frame(
                             lib.id,
                             lib.path.clone(),

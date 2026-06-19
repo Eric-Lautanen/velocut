@@ -354,7 +354,7 @@ impl VeloCutApp {
                         self.context
                             .cache
                             .frame_bucket_cache
-                            .retain(|(bucket_mid, _), _| *bucket_mid != mid);
+                            .retain(|(bucket_mid, _, _), _| *bucket_mid != mid);
                         self.preview.current_frame = None;
                     }
                 }
@@ -454,7 +454,7 @@ impl VeloCutApp {
                     self.context
                         .cache
                         .frame_bucket_cache
-                        .retain(|(bid, _), _| *bid != mid);
+                        .retain(|(bid, _, _), _| *bid != mid);
                 }
                 self.context.playback.last_frame_req = None;
                 ctx.request_repaint();
