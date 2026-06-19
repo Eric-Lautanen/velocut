@@ -16,6 +16,7 @@ use crate::decode::LiveDecoder;
 use super::blend::{ActiveBlend, blend_rgba_transition};
 use super::types::PlaybackCmd;
 
+
 pub(super) struct PbThread {
     pub cmd_rx: Receiver<PlaybackCmd>,
     pub frame_tx: Sender<PlaybackFrame>,

@@ -944,7 +944,8 @@ unsafe fn center_crop_and_scale_cached(
     );
 
     if rows > 0 {
-        Some(crop_buf.clone())
+        // Move the buffer out instead of cloning. The caller takes ownership.
+        Some(std::mem::take(crop_buf))
     } else {
         None
     }
@@ -953,9 +954,9 @@ unsafe fn center_crop_and_scale_cached(
 // ── Frame copy helper ─────────────────────────────────────────────────────────
 
 /// [Opt 1] Copy an RGBA-format ffmpeg VideoFrame into `buf`, stripping stride
-/// padding, and return a clone of the filled buffer.
+/// padding, and return the filled buffer (moved out, not cloned).
 ///
-/// `buf` is reused across calls — it is only reallocated when `out_w * out_h * 4`
+/// `buf` is reused across calls - it is only reallocated when `out_w * out_h * 4`
 /// exceeds its current capacity (i.e. never in steady state for a fixed-resolution
 /// source).  The returned Vec is a single allocation of the exact frame size.
 #[inline]
@@ -980,7 +981,8 @@ fn copy_frame_rgba(
         let s = row * stride;
         buf.extend_from_slice(&raw[s..s + row_bytes]);
     }
-    buf.clone()
+    // Move the buffer out instead of cloning. The caller takes ownership.
+    std::mem::take(buf)
 }
 
 // ── One-shot frame decode (preview + PNG save) ────────────────────────────────
