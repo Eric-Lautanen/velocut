@@ -6,4 +6,5 @@ PKG_CONFIG_PATH = "C:\\ffmpeg-velocut\\lib\\pkgconfig;C:\\msys64\\mingw64\\lib\\
 rustflags = [
   "-L", "/mingw64/lib",
   "-L", "/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0",
+  "-C", "target-cpu=native",
 ]
