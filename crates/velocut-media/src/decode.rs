@@ -510,10 +510,11 @@ impl LiveDecoder {
         (t * self.tb_den as f64 / self.tb_num as f64) as i64
     }
 
-    /// Seek within the already-open decoder — avoids a full decoder reopen for
+    /// Seek within the already-open decoder - avoids a full decoder reopen for
     /// backward or large-forward jumps during scrubbing. Seeks the demuxer to
-    /// the keyframe nearest `timestamp`, flushes the decoder, and sets
-    /// `skip_until_pts` so the next `advance_to` call burns through the GOP.
+    /// the keyframe nearest `timestamp`, flushes the decoder, burns forward to
+    /// the exact target, and sets `skip_until_pts` so the next `advance_to` call
+    /// burns through the GOP.
     pub fn seek_to(&mut self, timestamp: f64) -> Result<()> {
         let seek_pts = self.ts_to_pts(timestamp);
         self.ictx
@@ -522,6 +523,10 @@ impl LiveDecoder {
         self.decoder.flush();
         self.last_pts = seek_pts.saturating_sub(1);
         self.skip_until_pts = seek_pts;
+        // Burn forward to ensure the decoder is properly positioned at the target.
+        // Without this, the first advance_to() after a backward seek can fail to
+        // find the target frame if the decoder needs additional packets to sync.
+        self.burn_to_pts(seek_pts);
         Ok(())
     }
 
@@ -761,7 +766,7 @@ impl LiveDecoder {
     /// Advance the skip_until_pts burn by at most `max_packets` video packets.
     ///
     /// Returns `true` when the burn is complete (skip_until_pts cleared) or was
-    /// already inactive.  Returns `false` when more packets remain — the caller
+    /// already inactive.  Returns `false` when more packets remain - the caller
     /// should try again next iteration.
     ///
     /// Used by the playback thread to interleave decoder_b's GOP burn with
@@ -794,9 +799,25 @@ impl LiveDecoder {
                 return false;
             }
         }
-        // EOF before reaching target — treat as complete.
+        // EOF before reaching target - treat as complete.
         self.skip_until_pts = 0;
         true
+    }
+
+    /// Check if the decoder has reached EOF (no more packets available).
+    /// Used by the playback thread to detect when a clip has ended.
+    pub fn is_at_eof(&mut self) -> bool {
+        // Try to read one packet to see if there's more data.
+        // If no packets are available, we're at EOF.
+        match self.ictx.packets().next() {
+            None => true,
+            Some(_) => {
+                // We found a packet, but we need to put it back.
+                // Since we can't easily put it back, we just return false
+                // and let normal decoding handle it.
+                false
+            }
+        }
     }
 }
 

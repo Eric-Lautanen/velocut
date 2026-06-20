@@ -54,12 +54,19 @@ pub(super) fn decode_transition_scrub_frame(
         }
     } else if let Some((_, d)) = live.as_mut() {
         let tpts = d.ts_to_pts(ts);
+        // Seek within the existing decoder instead of reopening when:
+        //   a) backward movement - advance_to can only go forward
+        //   b) large forward jump > 2 s - avoid decoding hundreds of frames
         let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
         if needs_seek {
             if let Err(e) = d.seek_to(ts) {
                 crate::media_log!("[transition_scrub] seek_to failed: {e}");
                 return None;
             }
+            // After a backward seek, use next_frame to get the frame at the target.
+            // advance_to may fail to find the target if the decoder needs to sync.
+            let result = d.next_frame().map(|(data, w, h, _ts)| (data, w, h));
+            return result;
         }
         d.advance_to(tpts)
     } else {
