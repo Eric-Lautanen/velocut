@@ -74,11 +74,12 @@ pub struct CacheContext {
     /// Stores `(handle, width, height)` so a dimension change is detectable in O(1).
     pub scrub_textures: HashMap<Uuid, (egui::TextureHandle, u32, u32)>,
 
-
+    /// Last time each media_id was accessed (for time-based eviction).
+    pub scrub_texture_access: std::collections::HashMap<Uuid, std::time::Instant>,
 }
 
 impl CacheContext {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             thumbnail_cache: HashMap::new(),
             thumbnail_order: Vec::new(),
@@ -87,6 +88,7 @@ impl CacheContext {
             frame_bucket_cache: HashMap::new(),
             frame_cache_bytes: 0,
             scrub_textures: HashMap::new(),
+            scrub_texture_access: std::collections::HashMap::new(),
         }
     }
 
@@ -146,13 +148,14 @@ impl CacheContext {
     /// byte counter prevents a stale over-budget signal on the next insert.
     pub fn clear_all(&mut self) {
         // Use .clear() rather than = HashMap::new() to retain the HashMap's heap
-        // allocation — avoids a pointless dealloc+realloc on the next project open.
+        // allocation - avoids a pointless dealloc+realloc on the next project open.
         // TextureHandle drops in-place, releasing GPU memory for each entry.
         self.thumbnail_cache.clear();
         self.thumbnail_order.clear();
         self.frame_cache.clear();
         self.frame_bucket_cache.clear();
         self.scrub_textures.clear();
+        self.scrub_texture_access.clear();
         self.pending_pb_frame = None;
         self.frame_cache_bytes = 0;
     }
@@ -522,6 +525,22 @@ impl AppContext {
                 handle
             }
         };
+
+        // Update access time for time-based eviction.
+        self.cache.scrub_texture_access.insert(id, std::time::Instant::now());
+
+        // Evict old scrub textures that haven't been accessed in 30 seconds.
+        // This prevents unbounded memory growth when scrubbing many clips.
+        let now = std::time::Instant::now();
+        let old_ids: Vec<Uuid> = self.cache.scrub_texture_access
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > std::time::Duration::from_secs(30))
+            .map(|(id, _)| *id)
+            .collect();
+        for old_id in old_ids {
+            self.cache.scrub_textures.remove(&old_id);
+            self.cache.scrub_texture_access.remove(&old_id);
+        }
 
         // Derive the ¼s bucket key for frame_bucket_cache.
         // playback.last_frame_req stores exact f64 ts - convert here.
