@@ -194,16 +194,25 @@ impl MediaWorker {
                 } else if let Some(d) = &mut live {
                     let tpts = d.ts_to_pts(req.timestamp);
                     // Seek within the existing decoder instead of reopening when:
-                    //   a) backward movement — advance_to can only go forward
-                    //   b) large forward jump > 2 s — avoid decoding hundreds of frames
+                    //   a) backward movement - advance_to can only go forward
+                    //   b) large forward jump > 2 s - avoid decoding hundreds of frames
                     let needs_seek = tpts < d.last_pts || tpts > d.last_pts + d.ts_to_pts(2.0);
                     if needs_seek {
                         if let Err(e) = d.seek_to(req.timestamp) {
                             crate::media_log!("[media] seek_to failed: {e}");
                             continue;
                         }
-                    }
-                    if let Some((data, w, h)) = d.advance_to(tpts) {
+                        // After a seek, burn_to_pts positions the decoder at the target.
+                        // Use next_frame to get the frame at or just after the target.
+                        if let Some((data, w, h, _ts)) = d.next_frame() {
+                            let _ = scrub_result_tx.send(MediaResult::VideoFrame {
+                                id: req.id,
+                                width: w,
+                                height: h,
+                                data,
+                            });
+                        }
+                    } else if let Some((data, w, h)) = d.advance_to(tpts) {
                         let _ = scrub_result_tx.send(MediaResult::VideoFrame {
                             id: req.id,
                             width: w,
@@ -571,6 +580,10 @@ impl MediaWorker {
         aspect: f32,
         preview_size: Option<(u32, u32)>,
     ) {
+        // Clear any stale playback frames before starting new playback.
+        // This prevents the "scrub then play freeze" where a stale pending
+        // frame blocks the new playback from displaying.
+        while self.pb_rx.try_recv().is_ok() {}
         if self
             .pb_tx
             .try_send(PlaybackCmd::Start {
@@ -582,9 +595,8 @@ impl MediaWorker {
             })
             .is_err()
         {
-            crate::media_log!("[pb] start_playback: command channel full — Start dropped. This is a bug.");
+            crate::media_log!("[pb] start_playback: command channel full - Start dropped. This is a bug.");
         }
-        while self.pb_rx.try_recv().is_ok() {}
     }
 
     pub fn start_blend_playback(
@@ -596,6 +608,8 @@ impl MediaWorker {
         blend: PlaybackTransitionSpec,
         preview_size: Option<(u32, u32)>,
     ) {
+        // Clear any stale playback frames before starting new blend playback.
+        while self.pb_rx.try_recv().is_ok() {}
         if self
             .pb_tx
             .try_send(PlaybackCmd::StartBlend {
@@ -608,9 +622,8 @@ impl MediaWorker {
             })
             .is_err()
         {
-            crate::media_log!("[pb] start_blend_playback: command channel full — StartBlend dropped. This is a bug.");
+            crate::media_log!("[pb] start_blend_playback: command channel full - StartBlend dropped. This is a bug.");
         }
-        while self.pb_rx.try_recv().is_ok() {}
     }
 
     /// [P0-3] Pre-open a decoder for the next clip so Start/StartBlend can

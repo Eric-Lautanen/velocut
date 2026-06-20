@@ -423,6 +423,12 @@ impl PbThread {
                                                 }
                                                 return None;
                                             }
+                                            // decoder_b returned None but isn't burning.
+                                            // Check if it's truly exhausted or just needs more time.
+                                            // If the primary decoder is still producing frames,
+                                            // keep the blend alive and retry next frame.
+                                            let db = b.decoder_b.as_ref().unwrap();
+                                            crate::media_log!("[blend] decoder_b next_frame returned None, skip_until_pts=0, last_pts={}", db.last_pts);
                                             decoder_b_exhausted = true;
                                         }
                                     }

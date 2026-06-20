@@ -281,18 +281,15 @@ impl VideoModule {
                     ctx.playback.playback_media_id = Some(clip.media_id);
                     // Drop stale scrub frame so preview doesn't freeze on wrong pos.
                     ctx.cache.frame_cache.remove(&clip.media_id);
-                    // Only clear pending if it belongs to a different clip.
-                    // The pb thread may already have sent a correct frame for the
-                    // new clip — clearing it would cause a one-frame blank.
-                    if ctx
-                        .cache
-                        .pending_pb_frame
-                        .as_ref()
-                        .map(|f| f.id != clip.media_id)
-                        .unwrap_or(false)
-                    {
-                        ctx.cache.pending_pb_frame = None;
-                    }
+                    // Clear ALL pending playback frames when starting new playback.
+                    // This prevents the "scrub then play freeze" where a stale
+                    // pending frame from scrubbing blocks new playback frames.
+                    ctx.cache.pending_pb_frame = None;
+                    // Also clear the frame bucket cache for this clip to prevent
+                    // stale low-res scrub frames from showing during playback.
+                    ctx.cache
+                        .frame_bucket_cache
+                        .retain(|(id, _, _), _| *id != clip.media_id);
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts =
                             (state.current_time - clip.start_time + clip.source_offset).max(0.0);
