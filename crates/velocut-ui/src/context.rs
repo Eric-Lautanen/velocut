@@ -310,7 +310,13 @@ impl AppContext {
                     data,
                 } => {
                     self.ingest_video_frame(
-                        id, width, height, data, state, &mut needs_repaint, ctx,
+                        id,
+                        width,
+                        height,
+                        data,
+                        state,
+                        &mut needs_repaint,
+                        ctx,
                     );
                 }
                 // Blended transition frame (transition scrub thread)
@@ -321,7 +327,13 @@ impl AppContext {
                     data,
                 } => {
                     self.ingest_video_frame(
-                        id, width, height, data, state, &mut needs_repaint, ctx,
+                        id,
+                        width,
+                        height,
+                        data,
+                        state,
+                        &mut needs_repaint,
+                        ctx,
                     );
                 }
                 // Other variants never arrive on scrub_rx - ignore them.
@@ -527,12 +539,16 @@ impl AppContext {
         };
 
         // Update access time for time-based eviction.
-        self.cache.scrub_texture_access.insert(id, std::time::Instant::now());
+        self.cache
+            .scrub_texture_access
+            .insert(id, std::time::Instant::now());
 
         // Evict old scrub textures that haven't been accessed in 30 seconds.
         // This prevents unbounded memory growth when scrubbing many clips.
         let now = std::time::Instant::now();
-        let old_ids: Vec<Uuid> = self.cache.scrub_texture_access
+        let old_ids: Vec<Uuid> = self
+            .cache
+            .scrub_texture_access
             .iter()
             .filter(|(_, t)| now.duration_since(**t) > std::time::Duration::from_secs(30))
             .map(|(id, _)| *id)

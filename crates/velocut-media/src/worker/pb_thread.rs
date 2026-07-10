@@ -13,9 +13,8 @@ use velocut_core::media_types::PlaybackFrame;
 
 use crate::decode::LiveDecoder;
 
-use super::blend::{ActiveBlend, blend_rgba_transition};
+use super::blend::{blend_rgba_transition, ActiveBlend};
 use super::types::PlaybackCmd;
-
 
 pub(super) struct PbThread {
     pub cmd_rx: Receiver<PlaybackCmd>,
@@ -24,7 +23,10 @@ pub(super) struct PbThread {
 
 impl PbThread {
     pub fn run(self) {
-        let Self { cmd_rx: pb_cmd_rx, frame_tx: pb_frame_tx } = self;
+        let Self {
+            cmd_rx: pb_cmd_rx,
+            frame_tx: pb_frame_tx,
+        } = self;
 
         let mut decoder: Option<(Uuid, LiveDecoder)> = None;
         // Active transition blend state.
@@ -203,8 +205,7 @@ impl PbThread {
                             }
                         }
                         if !invert {
-                            let primary_size =
-                                decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
+                            let primary_size = decoder.as_ref().map(|(_, d)| (d.out_w, d.out_h));
                             if let Some(ref mut b) = blend {
                                 let db_path = b.spec.clip_b_path.clone();
                                 let db_start = b.spec.clip_b_source_start;
@@ -254,7 +255,10 @@ impl PbThread {
                         match LiveDecoder::open(&pb_path, pb_ts, pb_aspect, None, pb_ps) {
                             Ok(mut d) => {
                                 d.skip_until_pts = d.ts_to_pts(pb_ts);
-                                crate::media_log!("[pb] prebuffer opened for id={pb_id} ts={pb_ts:.3} in {}ms", t0.elapsed().as_millis());
+                                crate::media_log!(
+                                    "[pb] prebuffer opened for id={pb_id} ts={pb_ts:.3} in {}ms",
+                                    t0.elapsed().as_millis()
+                                );
                                 prebuffered = Some((pb_id, d));
                             }
                             Err(e) => crate::media_log!("[pb] prebuffer open: {e}"),
@@ -366,12 +370,9 @@ impl PbThread {
                                                 if invert {
                                                     if let Some(hb) = held_blend.as_ref() {
                                                         if hb.len() == data.len() {
-                                                            return Some(
-                                                                blend_rgba_transition(
-                                                                    hb, &data, w, h, alpha,
-                                                                    kind,
-                                                                ),
-                                                            );
+                                                            return Some(blend_rgba_transition(
+                                                                hb, &data, w, h, alpha, kind,
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -379,8 +380,7 @@ impl PbThread {
                                             }
                                         }
                                         if let Some((data_b, wb, hb, _)) = db.next_frame() {
-                                            if data_b.len() != data.len() || wb != w || hb != h
-                                            {
+                                            if data_b.len() != data.len() || wb != w || hb != h {
                                                 crate::media_log!(
                                                     "[pb] blend size mismatch — primary {}×{} ({} B) \
                                                      vs decoder_b {}×{} ({} B); skipping blend",
@@ -412,12 +412,9 @@ impl PbThread {
                                                     if let Some(hb) = held_blend.as_ref() {
                                                         if hb.len() == data.len() {
                                                             crate::media_log!("[blend] still_burning animated: alpha={alpha:.3}");
-                                                            return Some(
-                                                                blend_rgba_transition(
-                                                                    hb, &data, w, h, alpha,
-                                                                    kind,
-                                                                ),
-                                                            );
+                                                            return Some(blend_rgba_transition(
+                                                                hb, &data, w, h, alpha, kind,
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -618,7 +615,8 @@ impl PbThread {
                                 crate::media_log!(
                                     "[pb] incoming StartBlend while coasting: overriding \
                                            alpha_start {:.3} → {:.3} (coast_last_alpha)",
-                                    spec.alpha_start, coast_last_alpha
+                                    spec.alpha_start,
+                                    coast_last_alpha
                                 );
                                 spec.alpha_start = coast_last_alpha;
                             }
@@ -634,7 +632,9 @@ impl PbThread {
                                 let db_path = spec.clip_b_path.clone();
                                 let db_start = spec.clip_b_source_start;
                                 let t_db = Instant::now();
-                                crate::media_log!("[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}");
+                                crate::media_log!(
+                                    "[pb] pre-opening decoder_b for clip_a tail at {db_start:.3}"
+                                );
                                 match LiveDecoder::open(
                                     &db_path,
                                     db_start,
@@ -747,13 +747,8 @@ impl PbThread {
                             if decoder.is_none() {
                                 let t0 = Instant::now();
                                 crate::media_log!("[pb] StartBlend received (idle), ts={ts:.3} burn_ts={burn_ts:.3}");
-                                match LiveDecoder::open(
-                                    &path,
-                                    burn_ts,
-                                    aspect,
-                                    None,
-                                    preview_size,
-                                ) {
+                                match LiveDecoder::open(&path, burn_ts, aspect, None, preview_size)
+                                {
                                     Ok(mut d) => {
                                         let tpts = d.ts_to_pts(burn_ts);
                                         d.burn_to_pts(tpts);
@@ -825,7 +820,9 @@ impl PbThread {
                     })();
 
                     let send_data = if let Some(blended) = animated {
-                        crate::media_log!("[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}");
+                        crate::media_log!(
+                            "[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}"
+                        );
                         // [Fix 2] Move into held_blend, clone for send.
                         let out = blended.clone();
                         held_blend = Some(blended);

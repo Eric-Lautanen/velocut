@@ -76,11 +76,11 @@ use ffmpeg::codec::{self, Id as CodecId};
 use ffmpeg::encoder;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::format::{output as open_output, Pixel, Sample};
+use ffmpeg::packet::Mut as _;
 use ffmpeg::util::channel_layout::ChannelLayout;
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
-use ffmpeg::packet::Mut as _;
 use ffmpeg_the_third as ffmpeg;
 
 use velocut_core::filters::FilterParams;
@@ -92,7 +92,7 @@ pub use hw::probe_hw_encode_capabilities;
 use hw::{try_open_hw_encoder, HwBackend};
 
 mod audio;
-use audio::{AudioEncState, AudioFifo, decode_overlay};
+use audio::{decode_overlay, AudioEncState, AudioFifo};
 
 mod clip;
 use clip::{apply_transition, encode_clip, send_video_frame};
@@ -675,7 +675,7 @@ fn run_encode(
 // clip encoding moved to clip.rs
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::audio::fade_gain;
 
     #[test]
     fn fade_gain_no_fades_returns_unity() {

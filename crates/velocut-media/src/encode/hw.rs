@@ -34,7 +34,9 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
                 backend_name: "AMF",
             };
         } else {
-            crate::media_log!("[encode] probe: h264_amf found but D3D11 device init failed — skipping AMF");
+            crate::media_log!(
+                "[encode] probe: h264_amf found but D3D11 device init failed — skipping AMF"
+            );
         }
     } else {
         crate::media_log!("[encode] probe: h264_amf not found in FFmpeg build — recompile with --enable-encoder=h264_amf for AMD/Intel GPU support");
@@ -75,7 +77,9 @@ pub fn probe_hw_encode_capabilities() -> HwEncodeCapabilities {
         };
     }
 
-    crate::media_log!("[encode] probe: no HW encoder available — SW only, throttled at all resolutions");
+    crate::media_log!(
+        "[encode] probe: no HW encoder available — SW only, throttled at all resolutions"
+    );
     HwEncodeCapabilities {
         sw_only: true,
         backend_name: "Software (libx264)",

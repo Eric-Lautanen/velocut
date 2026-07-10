@@ -3,16 +3,16 @@
 // Audio FIFO, encoder state, overlay decode, and fade envelope.
 // Extracted from encode/mod.rs.
 
-use ffmpeg::Packet;
 use ffmpeg::format::sample::{Sample, Type as SampleType};
 use ffmpeg::media::Type as MediaType;
 use ffmpeg::software::resampling;
 use ffmpeg::util::channel_layout::{ChannelLayout, ChannelLayoutMask};
 use ffmpeg::util::frame::audio::Audio as AudioFrame;
 use ffmpeg::util::rational::Rational;
+use ffmpeg::Packet;
 use ffmpeg_the_third as ffmpeg;
 
-use super::{AUDIO_RATE, AudioOverlay};
+use super::{AudioOverlay, AUDIO_RATE};
 
 // ── Audio FIFO ────────────────────────────────────────────────────────────────
 

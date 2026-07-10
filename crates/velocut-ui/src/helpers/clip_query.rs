@@ -333,7 +333,6 @@ pub fn active_overlay_clips(state: &ProjectState, time: f64) -> Vec<&TimelineCli
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use uuid::Uuid;

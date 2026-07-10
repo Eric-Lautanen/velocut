@@ -257,12 +257,13 @@ impl CacheContext {
     /// [keep_min, keep_max]. Pass (u32::MAX, u32::MAX) to evict everything.
     /// Updates frame_cache_bytes to match.
     pub fn evict_outside_window(&mut self, keep_min: u32, keep_max: u32) {
-        self.frame_bucket_cache.retain(|(_, bucket, _), (_, bytes)| {
-            let keep = *bucket >= keep_min && *bucket <= keep_max;
-            if !keep {
-                self.frame_cache_bytes = self.frame_cache_bytes.saturating_sub(*bytes);
-            }
-            keep
-        });
+        self.frame_bucket_cache
+            .retain(|(_, bucket, _), (_, bytes)| {
+                let keep = *bucket >= keep_min && *bucket <= keep_max;
+                if !keep {
+                    self.frame_cache_bytes = self.frame_cache_bytes.saturating_sub(*bytes);
+                }
+                keep
+            });
     }
 }

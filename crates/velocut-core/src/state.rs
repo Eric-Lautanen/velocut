@@ -246,16 +246,12 @@ impl ProjectState {
         // Avoid duplicates — compare canonical paths when possible,
         // fall back to the raw path when canonicalization fails.
         let path_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if let Some(existing) = self
-            .library
-            .iter()
-            .find(|c| {
-                std::fs::canonicalize(&c.path)
-                    .map(|cp| cp == path_key)
-                    .unwrap_or(false)
-                    || c.path == path
-            })
-        {
+        if let Some(existing) = self.library.iter().find(|c| {
+            std::fs::canonicalize(&c.path)
+                .map(|cp| cp == path_key)
+                .unwrap_or(false)
+                || c.path == path
+        }) {
             return existing.id;
         }
 

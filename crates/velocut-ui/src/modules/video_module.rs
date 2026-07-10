@@ -162,9 +162,7 @@ impl VideoModule {
                 loop {
                     match ctx.media_worker.pb_rx.try_recv() {
                         Ok(f) => {
-                            if f.timestamp >= too_old_threshold
-                                && f.timestamp <= too_far_ahead
-                            {
+                            if f.timestamp >= too_old_threshold && f.timestamp <= too_far_ahead {
                                 // Found a good frame within window.
                                 ctx.cache.pending_pb_frame = Some(f);
                                 break;
@@ -173,10 +171,7 @@ impl VideoModule {
                                 continue; // still too old, discard
                             }
                             // Too far ahead, but maybe closer than current best.
-                            if best
-                                .as_ref()
-                                .map_or(true, |b| f.timestamp < b.timestamp)
-                            {
+                            if best.as_ref().is_none_or(|b| f.timestamp < b.timestamp) {
                                 best = Some(f);
                             }
                         }

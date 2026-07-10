@@ -165,9 +165,9 @@ impl MediaWorker {
                     // Otherwise fall back to the aspect-based 320px scrub size.
                     let forced = if req.preview_size.is_some() {
                         req.preview_size
-                    } else if req.aspect > 0.0 {
-                        None // let LiveDecoder use its 320px default
                     } else {
+                        // No preview size and no aspect: let LiveDecoder use its
+                        // 320px default scrub size.
                         None
                     };
                     match LiveDecoder::open(
@@ -550,7 +550,10 @@ impl MediaWorker {
             let data_b = if wb != w || hb != h {
                 crate::media_log!(
                     "[transition_hq] clip_b size {}x{} differs from clip_a {}x{}; cropping",
-                    wb, hb, w, h
+                    wb,
+                    hb,
+                    w,
+                    h
                 );
                 crop_rgba(&data_b_raw, wb, hb, w, h)
             } else {
@@ -595,7 +598,9 @@ impl MediaWorker {
             })
             .is_err()
         {
-            crate::media_log!("[pb] start_playback: command channel full - Start dropped. This is a bug.");
+            crate::media_log!(
+                "[pb] start_playback: command channel full - Start dropped. This is a bug."
+            );
         }
     }
 
@@ -649,7 +654,9 @@ impl MediaWorker {
 
     pub fn stop_playback(&self) {
         if self.pb_tx.try_send(PlaybackCmd::Stop).is_err() {
-            crate::media_log!("[pb] stop_playback: command channel full — Stop dropped. This is a bug.");
+            crate::media_log!(
+                "[pb] stop_playback: command channel full — Stop dropped. This is a bug."
+            );
         }
         while self.pb_rx.try_recv().is_ok() {}
     }

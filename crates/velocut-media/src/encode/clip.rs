@@ -11,11 +11,10 @@ use std::sync::{
 use crossbeam_channel::Sender;
 
 use ffmpeg::codec;
-use ffmpeg::format::{
-    input as open_input, Pixel,
-};
 use ffmpeg::format::sample::{Sample, Type as SampleType};
+use ffmpeg::format::{input as open_input, Pixel};
 use ffmpeg::media::Type as MediaType;
+use ffmpeg::packet::Mut as _;
 use ffmpeg::software::resampling;
 use ffmpeg::software::scaling::{Context as ScaleCtx, Flags as ScaleFlags};
 use ffmpeg::util::channel_layout::{ChannelLayout, ChannelLayoutMask};
@@ -23,7 +22,6 @@ use ffmpeg::util::frame::audio::Audio as AudioFrame;
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::util::rational::Rational;
 use ffmpeg::Packet;
-use ffmpeg::packet::Mut as _;
 use ffmpeg_the_third as ffmpeg;
 
 use crate::helpers::seek::seek_to_secs;
@@ -33,9 +31,9 @@ use velocut_core::filters::FilterParams;
 use velocut_core::media_types::MediaResult;
 use velocut_core::transitions::VideoTransition;
 
-use super::{AUDIO_RATE, ClipSpec, EncodeSpec, PROGRESS_INTERVAL};
-use super::audio::{AudioEncState, fade_gain, flush_audio_resampler};
-use super::hw::{HwBackend, upload_frame_to_hw};
+use super::audio::{fade_gain, flush_audio_resampler, AudioEncState};
+use super::hw::{upload_frame_to_hw, HwBackend};
+use super::{ClipSpec, EncodeSpec, AUDIO_RATE, PROGRESS_INTERVAL};
 
 // ── Center-crop scaler ────────────────────────────────────────────────────────
 
@@ -166,7 +164,12 @@ pub(super) fn send_video_frame(
     }
 }
 
-pub(super) fn apply_filter_to_yuv_frame(yuv: &mut VideoFrame, filter: &FilterParams, w: u32, h: u32) {
+pub(super) fn apply_filter_to_yuv_frame(
+    yuv: &mut VideoFrame,
+    filter: &FilterParams,
+    w: u32,
+    h: u32,
+) {
     if filter.is_identity() {
         return;
     }
@@ -419,8 +422,8 @@ pub(super) fn encode_clip(
 
                     audio_has_started = true;
 
-                    let pre_roll =
-                        ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64).round() as usize;
+                    let pre_roll = ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64)
+                        .round() as usize;
 
                     let src_channels = raw.ch_layout().channels();
                     let needs_resample = raw.format() != Sample::F32(SampleType::Planar)
@@ -455,7 +458,11 @@ pub(super) fn encode_clip(
                                 clip.fade_out_secs,
                                 clip.fade_out_end_secs,
                             );
-                            audio_state.fifo.push_scaled_from(&resampled, clip.volume * fg, pre_roll);
+                            audio_state.fifo.push_scaled_from(
+                                &resampled,
+                                clip.volume * fg,
+                                pre_roll,
+                            );
                         }
                     } else {
                         let fg = fade_gain(
@@ -467,7 +474,9 @@ pub(super) fn encode_clip(
                             clip.fade_out_secs,
                             clip.fade_out_end_secs,
                         );
-                        audio_state.fifo.push_scaled_from(&raw, clip.volume * fg, pre_roll);
+                        audio_state
+                            .fifo
+                            .push_scaled_from(&raw, clip.volume * fg, pre_roll);
                     }
                 }
             }
@@ -627,7 +636,10 @@ pub(super) fn encode_clip(
 
 // ── Crossfade helpers ─────────────────────────────────────────────────────────
 
-pub(super) fn decode_clip_frames(clip: &ClipSpec, spec: &EncodeSpec) -> Result<Vec<Vec<u8>>, String> {
+pub(super) fn decode_clip_frames(
+    clip: &ClipSpec,
+    spec: &EncodeSpec,
+) -> Result<Vec<Vec<u8>>, String> {
     let mut ictx = open_input(&clip.path)
         .map_err(|e| format!("crossfade open '{}': {e}", clip.path.display()))?;
 

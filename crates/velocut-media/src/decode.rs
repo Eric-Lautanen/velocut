@@ -191,7 +191,11 @@ unsafe extern "C" fn get_format_d3d11va(
         }
         crate::media_log!(
             "[hwaccel] get_format called — offered: {:?} (d3d11={} vld={} yuv420p={} nv12={})",
-            offered, d3d11, d3d11_vld, yuv420p, nv12
+            offered,
+            d3d11,
+            d3d11_vld,
+            yuv420p,
+            nv12
         );
     }
 
@@ -219,7 +223,9 @@ unsafe extern "C" fn get_format_d3d11va(
             if allocate_d3d11va_vld_frames_ctx(ctx) {
                 return *p;
             }
-            crate::media_log!("[hwaccel] get_format: hw_frames_ctx alloc failed, falling through to CPU");
+            crate::media_log!(
+                "[hwaccel] get_format: hw_frames_ctx alloc failed, falling through to CPU"
+            );
             break;
         }
         p = p.add(1);
@@ -240,7 +246,9 @@ unsafe extern "C" fn get_format_d3d11va(
         }
         p = p.add(1);
     }
-    crate::media_log!("[hwaccel] get_format: no preferred CPU format found, returning first offered");
+    crate::media_log!(
+        "[hwaccel] get_format: no preferred CPU format found, returning first offered"
+    );
     *fmt
 }
 
@@ -405,7 +413,9 @@ impl LiveDecoder {
                     if !hw_ref.is_null() {
                         (*dec_ctx.as_mut_ptr()).hw_device_ctx = hw_ref;
                         (*dec_ctx.as_mut_ptr()).get_format = Some(get_format_d3d11va);
-                        crate::media_log!("[hwaccel] D3D11VA attached to decoder context (pre-open)");
+                        crate::media_log!(
+                            "[hwaccel] D3D11VA attached to decoder context (pre-open)"
+                        );
                     }
                 }
             }

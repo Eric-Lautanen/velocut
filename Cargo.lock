@@ -4383,7 +4383,7 @@ dependencies = [
 
 [[package]]
 name = "velocut-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "rayon",
  "serde",
@@ -4392,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "velocut-media"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4404,7 +4404,7 @@ dependencies = [
 
 [[package]]
 name = "velocut-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "eframe",
  "egui",

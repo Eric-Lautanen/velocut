@@ -63,12 +63,7 @@ pub fn extract_yuv(yuv: &VideoFrame, w: usize, h: usize) -> Vec<u8> {
 /// to the encoder (which expects a strided VideoFrame, not a packed buffer).
 ///
 /// Chroma dimensions are computed as `w/2` and `h/2` (YUV420P spec).
-pub fn write_yuv(
-    packed: &[u8],
-    yuv: &mut VideoFrame,
-    w: usize,
-    h: usize,
-) {
+pub fn write_yuv(packed: &[u8], yuv: &mut VideoFrame, w: usize, h: usize) {
     let uv_w = w / 2;
     let uv_h = h / 2;
 
