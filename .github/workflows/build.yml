@@ -1,0 +1,327 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # FFmpeg source tag — must match the version the fork expects (ffmpeg-8.1).
+  FFMPEG_VERSION: "n8.0.1"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Windows (MINGW64) — fully static single .exe with D3D11VA/NVENC/AMF/QSV
+  # ──────────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-libvpl
+            make
+            git
+
+      - name: Install NVIDIA NVENC/NVDEC headers
+        run: |
+          cd /c/github
+          git clone --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
+          cd nv-codec-headers
+          make PREFIX=/mingw64 install
+
+      - name: Install AMD AMF headers
+        run: |
+          cd /c/github
+          git clone --depth=1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          mkdir -p /mingw64/include/AMF
+          cp -r AMF/amf/public/include/* /mingw64/include/AMF/
+
+      - name: Build FFmpeg (static, with HW accel)
+        run: |
+          cd /c/github
+          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          ./configure \
+            --prefix=/c/ffmpeg-velocut \
+            --target-os=mingw32 \
+            --arch=x86_64 \
+            --disable-shared \
+            --enable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-network \
+            --disable-everything \
+            --disable-bzlib \
+            --disable-iconv \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avfilter \
+            --enable-avdevice \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avutil \
+            --enable-protocol=file \
+            --enable-demuxer=mov,mp4,matroska,avi,flv,ogg,wav,mp3,aac,webm,asf,mpeg,image2,mpegts \
+            --enable-muxer=mp4,matroska,webm,image2 \
+            --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg,prores,dnxhd,wmv1,wmv2,theora,vorbis,opus,aac,mp3,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ac3,eac3,dts,wmav2,png \
+            --enable-encoder=libx264,aac,png \
+            --enable-filter=scale,format,aformat,concat,atrim,trim,setpts,asetpts,fps,blend,volume,amix,aresample,color,overlay,pad,crop,rotate \
+            --enable-bsf=h264_mp4toannexb,aac_adtstoasc,hevc_mp4toannexb \
+            --enable-parser=h264,hevc,aac,mp3,vp8,vp9,av1,ac3,mpeg4video,opus,vorbis,png \
+            --enable-libx264 \
+            --enable-gpl \
+            --enable-nvenc \
+            --enable-nvdec \
+            --enable-cuvid \
+            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc \
+            --enable-decoder=h264_cuvid,hevc_cuvid,vp8_cuvid,vp9_cuvid,av1_cuvid \
+            --enable-amf \
+            --enable-encoder=h264_amf,hevc_amf,av1_amf \
+            --enable-d3d11va \
+            --enable-dxva2 \
+            --enable-libvpl \
+            --enable-encoder=h264_qsv,hevc_qsv,av1_qsv \
+            --enable-decoder=h264_qsv,hevc_qsv \
+            --enable-filter=scale_qsv,vpp_qsv \
+            --extra-cflags="-I/mingw64/include" \
+            --extra-ldflags="-L/mingw64/lib -static" \
+            --pkg-config-flags="--static"
+          make -j$(nproc)
+          make install
+
+      - name: Rename .dll.a stubs for true static linking
+        run: |
+          mv /mingw64/lib/libx264.dll.a /mingw64/lib/libx264.dll.a.bak || true
+          mv /mingw64/lib/libz.dll.a /mingw64/lib/libz.dll.a.bak || true
+          mv /mingw64/lib/libvpl.dll.a /mingw64/lib/libvpl.dll.a.bak || true
+
+      - name: Build velocut
+        env:
+          FFMPEG_DIR: C:\ffmpeg-velocut
+          PKG_CONFIG_PATH: C:\ffmpeg-velocut\lib\pkgconfig;C:\msys64\mingw64\lib\pkgconfig
+          LIBCLANG_PATH: C:\msys64\mingw64\bin
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 -I/mingw64/include"
+        run: |
+          cargo build --release --features velocut-ui/winresource
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocut-windows
+          path: target/release/velocut.exe
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Linux — static FFmpeg libs, dynamic glibc (portable across modern distros)
+  # ──────────────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential nasm yasm git cmake pkg-config \
+            libx264-dev clang libclang-dev curl \
+            libva-dev libva-drm2 libdrm-dev \
+            libvpl-dev
+
+      - name: Install NVIDIA NVENC/NVDEC headers
+        run: |
+          cd /tmp
+          git clone --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
+          cd nv-codec-headers
+          sudo make install
+
+      - name: Install AMD AMF headers
+        run: |
+          cd /tmp
+          git clone --depth=1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          sudo mkdir -p /usr/local/include/AMF
+          sudo cp -r AMF/amf/public/include/* /usr/local/include/AMF/
+
+      - name: Build FFmpeg (static, with HW accel)
+        run: |
+          cd /tmp
+          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git
+          cd FFmpeg
+          ./configure \
+            --prefix=/opt/ffmpeg-static \
+            --disable-shared \
+            --enable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-network \
+            --disable-everything \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avfilter \
+            --enable-avdevice \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avutil \
+            --enable-protocol=file \
+            --enable-demuxer=mov,mp4,matroska,avi,flv,ogg,wav,mp3,aac,webm,asf,mpeg,image2,mpegts \
+            --enable-muxer=mp4,matroska,webm,image2 \
+            --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg,prores,dnxhd,vorbis,opus,aac,mp3,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ac3,eac3,dts,png \
+            --enable-encoder=libx264,aac,png \
+            --enable-filter=scale,format,aformat,concat,atrim,trim,setpts,asetpts,fps,blend,volume,amix,aresample,color,overlay,pad,crop,rotate \
+            --enable-bsf=h264_mp4toannexb,aac_adtstoasc,hevc_mp4toannexb \
+            --enable-parser=h264,hevc,aac,mp3,vp8,vp9,av1,ac3,mpeg4video,opus,vorbis,png \
+            --enable-libx264 \
+            --enable-gpl \
+            --enable-nvenc \
+            --enable-nvdec \
+            --enable-cuvid \
+            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc \
+            --enable-decoder=h264_cuvid,hevc_cuvid,vp9_cuvid,av1_cuvid \
+            --enable-amf \
+            --enable-encoder=h264_amf,hevc_amf \
+            --enable-vaapi \
+            --enable-encoder=h264_vaapi,hevc_vaapi,av1_vaapi \
+            --enable-filter=scale_vaapi,deinterlace_vaapi,overlay_vaapi \
+            --enable-libvpl \
+            --enable-encoder=h264_qsv,hevc_qsv,av1_qsv \
+            --enable-decoder=h264_qsv,hevc_qsv \
+            --enable-filter=scale_qsv,vpp_qsv \
+            --extra-cflags="-I/usr/local/include" \
+            --extra-ldflags="-L/usr/local/lib" \
+            --extra-libs="-lpthread -lm" \
+            --pkg-config-flags="--static"
+          make -j$(nproc)
+          sudo make install
+
+      - name: Build velocut
+        env:
+          FFMPEG_DIR: /opt/ffmpeg-static
+          PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+        run: |
+          cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocut-linux
+          path: target/release/velocut
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # macOS — static FFmpeg libs, VideoToolbox HW accel (Apple Silicon + Intel)
+  # ──────────────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install nasm yasm pkg-config cmake x264
+
+      - name: Build FFmpeg (static, with VideoToolbox)
+        run: |
+          cd /tmp
+          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git
+          cd FFmpeg
+          BREW_PREFIX=$(brew --prefix)
+          ./configure \
+            --prefix=/opt/ffmpeg-macos \
+            --disable-shared \
+            --enable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-network \
+            --disable-everything \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avfilter \
+            --enable-avdevice \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avutil \
+            --enable-protocol=file \
+            --enable-demuxer=mov,mp4,matroska,avi,flv,ogg,wav,mp3,aac,webm,asf,mpeg,image2,mpegts \
+            --enable-muxer=mp4,matroska,webm,mov,image2 \
+            --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg,prores,dnxhd,vorbis,opus,aac,mp3,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ac3,dts,png \
+            --enable-encoder=libx264,aac,png,prores \
+            --enable-filter=scale,format,aformat,concat,atrim,trim,setpts,asetpts,fps,blend,volume,amix,aresample,color,overlay,pad,crop,rotate \
+            --enable-bsf=h264_mp4toannexb,aac_adtstoasc,hevc_mp4toannexb \
+            --enable-parser=h264,hevc,aac,mp3,vp8,vp9,av1,ac3,mpeg4video,opus,vorbis,png \
+            --enable-libx264 \
+            --enable-gpl \
+            --enable-videotoolbox \
+            --enable-audiotoolbox \
+            --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox \
+            --enable-decoder=h264_videotoolbox,hevc_videotoolbox \
+            --extra-cflags="-I${BREW_PREFIX}/include" \
+            --extra-ldflags="-L${BREW_PREFIX}/lib" \
+            --pkg-config-flags="--static"
+          make -j$(sysctl -n hw.logicalcpu)
+          sudo make install
+
+      - name: Build velocut
+        env:
+          FFMPEG_DIR: /opt/ffmpeg-macos
+          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
+          LIBCLANG_PATH: $(brew --prefix llvm)/lib
+        run: |
+          cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocut-macos
+          path: target/release/velocut
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Release — create a GitHub Release with all three binaries on tag push
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp artifacts/velocut-windows/velocut.exe release/velocut-windows.exe
+          cp artifacts/velocut-linux/velocut release/velocut-linux
+          cp artifacts/velocut-macos/velocut release/velocut-macos
+          chmod +x release/velocut-linux release/velocut-macos
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/velocut-windows.exe
+            release/velocut-linux
+            release/velocut-macos

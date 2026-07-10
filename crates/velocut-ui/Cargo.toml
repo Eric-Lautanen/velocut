@@ -23,4 +23,12 @@ rodio             = { workspace = true }
 png               = { workspace = true }
 
 [build-dependencies]
-winresource = "0.1"
+winresource = { version = "0.1", optional = true }
+
+[features]
+default = []
+# Windows-only: embeds the .ico icon into the .exe resources.
+# Disabled by default — the Windows CI job enables it via
+# --features velocut-ui/winresource. Non-Windows builds skip it so they
+# don't pull in winresource (which only targets Windows).
+winresource = ["dep:winresource"]
