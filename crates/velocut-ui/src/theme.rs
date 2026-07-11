@@ -46,35 +46,35 @@ pub fn configure_style(ctx: &Context) {
     v.window_fill = DARK_BG_2;
     v.faint_bg_color = DARK_BG_0;
     v.extreme_bg_color = DARK_BG_0;
-    v.window_stroke = Stroke::new(1.0, DARK_BORDER);
+    v.window_stroke = Stroke::new(1.0_f32, DARK_BORDER);
 
     v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, Color32::BLACK);
+    v.selection.stroke = Stroke::new(1.0_f32, Color32::BLACK);
     v.hyperlink_color = ACCENT_HOVER;
 
     v.widgets.noninteractive.bg_fill = DARK_BG_2;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DARK_BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, DARK_TEXT_DIM);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, DARK_BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, DARK_TEXT_DIM);
     v.widgets.noninteractive.corner_radius = cr;
 
     v.widgets.inactive.bg_fill = DARK_BG_3;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, DARK_BORDER);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, DARK_TEXT);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, DARK_BORDER);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, DARK_TEXT);
     v.widgets.inactive.corner_radius = cr;
 
     v.widgets.hovered.bg_fill = DARK_BG_4;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.5, ACCENT_HOVER);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_DIM);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, ACCENT_HOVER);
     v.widgets.hovered.corner_radius = cr;
 
     v.widgets.active.bg_fill = ACCENT_DIM;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(2.0_f32, Color32::WHITE);
     v.widgets.active.corner_radius = cr;
 
     v.widgets.open.bg_fill = DARK_BG_4;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
-    v.widgets.open.fg_stroke = Stroke::new(1.5, ACCENT_HOVER);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, ACCENT_DIM);
+    v.widgets.open.fg_stroke = Stroke::new(1.5_f32, ACCENT_HOVER);
     v.widgets.open.corner_radius = cr;
 
     v.override_text_color = Some(DARK_TEXT);

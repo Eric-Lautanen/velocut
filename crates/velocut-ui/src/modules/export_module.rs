@@ -238,7 +238,7 @@ impl EditorModule for ExportModule {
                                 RichText::new(&btn_label).size(10.0).color(text_color),
                             )
                             .fill(fill)
-                            .stroke(Stroke::new(1.0, border))
+                            .stroke(Stroke::new(1.0_f32, border))
                             .min_size(egui::vec2(62.0, 20.0));
 
                             let hover_tip = if in_confirm {
@@ -359,7 +359,7 @@ impl ExportModule {
                     card_rect,
                     0.0,
                     Color32::from_rgb(22, 24, 32),
-                    Stroke::new(1.5, border_col),
+                    Stroke::new(1.5_f32, border_col),
                     egui::StrokeKind::Inside,
                 );
 
@@ -442,7 +442,7 @@ impl ExportModule {
                 .size(11.0)
                 .color(DARK_TEXT_DIM),
         )
-        .stroke(Stroke::new(1.0, DARK_BORDER))
+        .stroke(Stroke::new(1.0_f32, DARK_BORDER))
         .fill(DARK_BG_2)
         .min_size(egui::vec2(ui.available_width(), 28.0));
 
@@ -472,7 +472,7 @@ impl ExportModule {
         // Success frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
             .fill(Color32::from_rgb(25, 65, 40))
-            .stroke(Stroke::new(1.0, GREEN_DIM))
+            .stroke(Stroke::new(1.0_f32, GREEN_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {
@@ -487,7 +487,7 @@ impl ExportModule {
         ui.add_space(14.0);
 
         let dismiss = egui::Button::new(RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM))
-            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .stroke(Stroke::new(1.0_f32, DARK_BORDER))
             .fill(DARK_BG_2)
             .min_size(egui::vec2(ui.available_width(), 28.0));
 
@@ -515,7 +515,7 @@ impl ExportModule {
         // Error frame — fully opaque fill so content is crisp against the card
         egui::Frame::new()
             .fill(Color32::from_rgb(70, 25, 25))
-            .stroke(Stroke::new(1.0, RED_DIM))
+            .stroke(Stroke::new(1.0_f32, RED_DIM))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {
@@ -526,7 +526,7 @@ impl ExportModule {
         ui.add_space(14.0);
 
         let dismiss = egui::Button::new(RichText::new("Dismiss").size(11.0).color(DARK_TEXT_DIM))
-            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .stroke(Stroke::new(1.0_f32, DARK_BORDER))
             .fill(DARK_BG_2)
             .min_size(egui::vec2(ui.available_width(), 28.0));
 
@@ -719,7 +719,7 @@ impl ExportModule {
                             .color(if selected { ACCENT } else { DARK_TEXT_DIM }),
                     )
                     .stroke(Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if selected { ACCENT } else { DARK_BORDER },
                     ))
                     .fill(if selected { DARK_BG_3 } else { DARK_BG_2 });
@@ -738,7 +738,7 @@ impl ExportModule {
         // ✂ badge between any two touching clips to add a dissolve.
         egui::Frame::new()
             .fill(DARK_BG_3)
-            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .stroke(Stroke::new(1.0_f32, DARK_BORDER))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
@@ -783,7 +783,7 @@ impl ExportModule {
         // ── Stats ─────────────────────────────────────────────────────────────
         egui::Frame::new()
             .fill(DARK_BG_3)
-            .stroke(Stroke::new(1.0, DARK_BORDER))
+            .stroke(Stroke::new(1.0_f32, DARK_BORDER))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(Margin::same(8))
             .show(ui, |ui| {

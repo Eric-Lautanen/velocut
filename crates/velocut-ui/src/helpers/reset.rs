@@ -374,7 +374,7 @@ pub fn show_uninstall_modal(ctx: &egui::Context, visible: &mut bool) {
                 card_rect,
                 egui::CornerRadius::same(6),
                 DARK_BG_CARD,
-                Stroke::new(1.5, GREEN_DIM),
+                Stroke::new(1.5_f32, GREEN_DIM),
                 egui::StrokeKind::Inside,
             );
 
@@ -397,7 +397,7 @@ fn show_modal_content(ui: &mut egui::Ui, visible: &mut bool) {
     // ── Deleted items summary ─────────────────────────────────────────────────
     egui::Frame::new()
         .fill(GREEN_BG)
-        .stroke(Stroke::new(1.0, GREEN_DIM))
+        .stroke(Stroke::new(1.0_f32, GREEN_DIM))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
@@ -456,7 +456,7 @@ fn show_modal_content(ui: &mut egui::Ui, visible: &mut bool) {
         let keep_btn =
             egui::Button::new(RichText::new("Keep Using").size(12.0).color(DARK_TEXT_DIM))
                 .fill(DARK_BG_2)
-                .stroke(Stroke::new(1.0, DARK_BORDER))
+                .stroke(Stroke::new(1.0_f32, DARK_BORDER))
                 .min_size(egui::vec2(btn_w, 32.0));
 
         if ui.add(keep_btn).clicked() {

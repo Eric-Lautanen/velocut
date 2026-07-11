@@ -200,12 +200,18 @@ jobs:
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
           "/c/Program Files/LLVM/bin/clang.exe" --version
+          echo "FFMPEG_DIR=$FFMPEG_DIR"
           echo "Removing conflicting mingw64 ffmpeg headers so bindgen can't pick them up by accident"
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
-          echo "----- verifying removal -----"
-          find /mingw64/include -iname 'avformat.h' -o -iname 'avcodec.h' 2>/dev/null && echo "STILL PRESENT — removal failed" || echo "confirmed removed"
+          echo "----- verifying removal (fixed: find exits 0 even on no match, so check output not exit code) -----"
+          LEFTOVER=$(find /mingw64/include -iname 'avformat.h' -o -iname 'avcodec.h' 2>/dev/null)
+          if [ -n "$LEFTOVER" ]; then echo "STILL PRESENT: $LEFTOVER"; else echo "confirmed removed"; fi
+          echo "----- what version.h does FFMPEG_DIR actually contain? -----"
+          cat "$FFMPEG_DIR/include/libavcodec/version.h" 2>/dev/null | grep -E "LIBAVCODEC_VERSION_(MAJOR|MINOR)" || echo "version.h missing or macros not found at FFMPEG_DIR"
+          echo "----- what did bindgen actually generate for LIBAVCODEC_VERSION? -----"
+          find target -name 'bindings.rs' -path '*ffmpeg-sys*' -exec grep -H "LIBAVCODEC_VERSION" {} \; || echo "no bindings.rs found yet"
           cargo build --release --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure
@@ -213,7 +219,8 @@ jobs:
         run: |
           echo "----- Which avformat.h did bindgen actually see? -----"
           find /c/ffmpeg-velocut/include -name 'avformat.h' -exec ls -la {} \;
-          find /mingw64/include -iname 'avformat.h' 2>/dev/null && echo "^^ CONFLICTING avformat.h FOUND UNDER /mingw64/include" || echo "no conflicting header under /mingw64/include"
+          MINGW_LEFTOVER=$(find /mingw64/include -iname 'avformat.h' 2>/dev/null)
+          if [ -n "$MINGW_LEFTOVER" ]; then echo "^^ CONFLICTING avformat.h FOUND: $MINGW_LEFTOVER"; else echo "no conflicting header under /mingw64/include"; fi
 
           echo "----- Full verbose rebuild capturing bindgen's real clang invocation and warnings -----"
           cargo build --release --features velocut-ui/winresource -vv > /tmp/full_build.log 2>&1 || true

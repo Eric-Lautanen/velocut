@@ -413,7 +413,7 @@ fn paint_card(
     let highlight = is_selected || is_dragging;
     let fill_col = if highlight { DARK_BG_4 } else { DARK_BG_3 };
     let border_col = if highlight { SEL_MULTI } else { DARK_BORDER };
-    let border_w = if highlight { 1.5 } else { 1.0 };
+    let border_w = if highlight { 1.5_f32 } else { 1.0_f32 };
     let name_col = if is_selected {
         DARK_TEXT
     } else {
@@ -568,7 +568,7 @@ fn paint_drag_ghost(
     p.rect_stroke(
         rect,
         egui::CornerRadius::same(6),
-        Stroke::new(1.5, ACCENT),
+        Stroke::new(1.5_f32, ACCENT),
         egui::StrokeKind::Outside,
     );
 

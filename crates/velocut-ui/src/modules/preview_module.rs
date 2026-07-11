@@ -210,14 +210,14 @@ impl EditorModule for PreviewModule {
                 painter.rect_stroke(
                     canvas.expand(2.0),
                     4.0,
-                    Stroke::new(1.5, ACCENT.gamma_multiply(0.55)),
+                    Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.55)),
                     egui::StrokeKind::Outside,
                 );
             } else {
                 painter.rect_stroke(
                     canvas.expand(1.0),
                     4.0,
-                    Stroke::new(1.0, DARK_BORDER),
+                    Stroke::new(1.0_f32, DARK_BORDER),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -255,11 +255,11 @@ impl EditorModule for PreviewModule {
                         let t = ui.input(|i| i.time) as f32;
                         let cx = canvas.center() + egui::vec2(0.0, 20.0);
                         let r = 12.0_f32;
-                        painter.circle_stroke(cx, r, Stroke::new(1.5, Color32::from_gray(35)));
+                        painter.circle_stroke(cx, r, Stroke::new(1.5_f32, Color32::from_gray(35)));
                         let a = t * 3.5;
                         painter.line_segment(
                             [cx, cx + egui::vec2(a.cos() * r, a.sin() * r)],
-                            Stroke::new(2.0, ACCENT),
+                            Stroke::new(2.0_f32, ACCENT),
                         );
                         ui.ctx().request_repaint();
                     }
@@ -279,7 +279,7 @@ impl EditorModule for PreviewModule {
                 while y < canvas.max.y {
                     painter.line_segment(
                         [Pos2::new(canvas.min.x, y), Pos2::new(canvas.max.x, y)],
-                        Stroke::new(0.5, Color32::from_rgba_unmultiplied(255, 255, 255, 3)),
+                        Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 3)),
                     );
                     y += 4.0;
                 }
@@ -296,7 +296,7 @@ impl EditorModule for PreviewModule {
             painter.rect_stroke(
                 bar_rect,
                 BTN_R,
-                Stroke::new(1.0, DARK_BORDER),
+                Stroke::new(1.0_f32, DARK_BORDER),
                 egui::StrokeKind::Outside,
             );
 
@@ -330,7 +330,7 @@ impl EditorModule for PreviewModule {
                         painter.rect_stroke(
                             r,
                             BTN_R,
-                            Stroke::new(1.0, ACCENT.gamma_multiply(0.35)),
+                            Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.35)),
                             egui::StrokeKind::Outside,
                         );
                     }
@@ -439,14 +439,14 @@ impl EditorModule for PreviewModule {
                     painter.circle_stroke(
                         Pos2::new(c.x + 2.0, c.y),
                         ICON_SZ * 0.85,
-                        Stroke::new(1.5, col.gamma_multiply(0.65)),
+                        Stroke::new(1.5_f32, col.gamma_multiply(0.65)),
                     );
                 }
                 if !muted && vol_val > 0.5 {
                     painter.circle_stroke(
                         Pos2::new(c.x + 2.0, c.y),
                         ICON_SZ * 1.45,
-                        Stroke::new(1.5, col.gamma_multiply(0.35)),
+                        Stroke::new(1.5_f32, col.gamma_multiply(0.35)),
                     );
                 }
                 if muted {
@@ -457,14 +457,14 @@ impl EditorModule for PreviewModule {
                             Pos2::new(ox - 4.0, c.y - 4.0),
                             Pos2::new(ox + 4.0, c.y + 4.0),
                         ],
-                        Stroke::new(1.5, mute_col),
+                        Stroke::new(1.5_f32, mute_col),
                     );
                     painter.line_segment(
                         [
                             Pos2::new(ox + 4.0, c.y - 4.0),
                             Pos2::new(ox - 4.0, c.y + 4.0),
                         ],
-                        Stroke::new(1.5, mute_col),
+                        Stroke::new(1.5_f32, mute_col),
                     );
                 }
             }) {

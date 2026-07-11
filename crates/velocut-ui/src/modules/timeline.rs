@@ -89,7 +89,7 @@ fn tool_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 fn action_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     egui::Button::new(label)
         .fill(ACTION_BTN_FILL)
-        .stroke(Stroke::new(1.0, ACTION_BTN_STROKE))
+        .stroke(Stroke::new(1.0_f32, ACTION_BTN_STROKE))
         .min_size(egui::vec2(0.0, 26.0))
 }
 
@@ -97,7 +97,7 @@ fn action_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 fn playhead_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     egui::Button::new(label)
         .fill(PLAYHEAD_BTN_FILL)
-        .stroke(Stroke::new(1.0, PLAYHEAD_BTN_STROKE))
+        .stroke(Stroke::new(1.0_f32, PLAYHEAD_BTN_STROKE))
         .min_size(egui::vec2(0.0, 26.0))
 }
 
@@ -394,7 +394,7 @@ impl EditorModule for TimelineModule {
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgb(18, 18, 26))
                             .stroke(egui::Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 egui::Color32::from_rgba_unmultiplied(255, 160, 50, 90),
                             ))
                             .corner_radius(egui::CornerRadius::same(8))
@@ -536,7 +536,7 @@ impl EditorModule for TimelineModule {
                         // Label column — pinned to visible left, always on top
                         let label_rect = Rect::from_min_size(Pos2::new(label_col_x, y), egui::vec2(label_col, track_height));
                         label_painter.rect_filled(label_rect, 0.0, DARK_BG_2);
-                        label_painter.rect_stroke(label_rect, 0.0, Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Inside);
+                        label_painter.rect_stroke(label_rect, 0.0, Stroke::new(1.0_f32, DARK_BORDER), egui::StrokeKind::Inside);
                         let label = match t { 0 => "V1", 1 => "A1", 2 => "V2", _ => "A2" };
                         label_painter.text(Pos2::new(label_col_x + label_col * 0.5, y + track_height * 0.5),
                             Align2::CENTER_CENTER, label, FontId::monospace(9.0),
@@ -553,7 +553,7 @@ impl EditorModule for TimelineModule {
                         0.0, Color32::from_rgb(12, 12, 16));
                     label_painter.rect_stroke(
                         Rect::from_min_size(Pos2::new(label_col_x, rect.min.y), egui::vec2(label_col, header_height)),
-                        0.0, Stroke::new(1.0, DARK_BORDER), egui::StrokeKind::Inside);
+                        0.0, Stroke::new(1.0_f32, DARK_BORDER), egui::StrokeKind::Inside);
                     let step = ruler_step(state.timeline_zoom);
                     let mut s = 0.0f64;
                     while s <= max_time + step {
@@ -563,7 +563,7 @@ impl EditorModule for TimelineModule {
                         painter.line_segment(
                             [Pos2::new(x, rect.min.y + header_height - tick_h),
                              Pos2::new(x, rect.min.y + header_height)],
-                            Stroke::new(1.0, Color32::from_gray(60)));
+                            Stroke::new(1.0_f32, Color32::from_gray(60)));
                         if is_major {
                             painter.text(Pos2::new(x + 3.0, rect.min.y + 4.0),
                                 Align2::LEFT_TOP, format_time(s), FontId::monospace(10.0),
@@ -668,13 +668,13 @@ impl EditorModule for TimelineModule {
                                 painter.rect_stroke(
                                     lane_rect,
                                     0.0,
-                                    Stroke::new(1.0, ACCENT.linear_multiply(0.5)),
+                                    Stroke::new(1.0_f32, ACCENT.linear_multiply(0.5)),
                                     egui::StrokeKind::Inside
                                 );
                                 painter.line_segment(
                                     [Pos2::new(line_x, lane_rect.min.y),
                                      Pos2::new(line_x, lane_rect.max.y)],
-                                    Stroke::new(2.0, if snapping {
+                                    Stroke::new(2.0_f32, if snapping {
                                         Color32::from_rgb(255, 200, 50)
                                     } else { ACCENT }));
 
@@ -703,7 +703,7 @@ impl EditorModule for TimelineModule {
                         painter.rect_filled(hr, 0.0,
                             Color32::from_rgba_unmultiplied(100, 160, 255, 22));
                         painter.rect_stroke(hr, 0.0,
-                            Stroke::new(1.0, ACCENT.linear_multiply(0.45)),
+                            Stroke::new(1.0_f32, ACCENT.linear_multiply(0.45)),
                             egui::StrokeKind::Inside);
                     }
                     // ── Timeline Clips ─────────────────────────────────────────────
@@ -786,7 +786,7 @@ impl EditorModule for TimelineModule {
 
                         // Border
                         painter.rect_stroke(clip_rect, 4,
-                            Stroke::new(if is_selected { 1.5 } else { 1.0 },
+                            Stroke::new(if is_selected { 1.5_f32 } else { 1.0_f32 },
                                 if is_selected { ACCENT } else { DARK_BORDER }),
                             egui::StrokeKind::Outside);
 
@@ -834,7 +834,7 @@ impl EditorModule for TimelineModule {
                             );
                             painter.rect_stroke(
                                 badge_rect, 4.0,
-                                Stroke::new(1.0, badge_color),
+                                Stroke::new(1.0_f32, badge_color),
                                 egui::StrokeKind::Outside,
                             );
                             painter.text(
@@ -857,7 +857,7 @@ impl EditorModule for TimelineModule {
                                 else { Color32::from_gray(165) };
                             let fr = Rect::from_center_size(fc, egui::vec2(18.0, 14.0));
                             painter.rect_filled(fr, 4.0, fcol.linear_multiply(if fopen { 0.35 } else { 0.30 }));
-                            painter.rect_stroke(fr, 4.0, Stroke::new(1.0, fcol), egui::StrokeKind::Outside);
+                            painter.rect_stroke(fr, 4.0, Stroke::new(1.0_f32, fcol), egui::StrokeKind::Outside);
                             painter.text(fc, Align2::CENTER_CENTER, "🎨", FontId::proportional(9.0), fcol);
                             Some((fr, fc, fopen))
                         } else { None };
@@ -1131,7 +1131,7 @@ impl EditorModule for TimelineModule {
                             painter.rect_stroke(
                                 badge_rect,
                                 5.0,
-                                Stroke::new(1.0, badge_color),
+                                Stroke::new(1.0_f32, badge_color),
                                 egui::StrokeKind::Outside,
                             );
                             // Icon: comes from the active transition's impl, or ✂ for Cut.
@@ -1195,10 +1195,10 @@ impl EditorModule for TimelineModule {
                     let ph_x = time_origin_x + (clamped_time as f32 * state.timeline_zoom);
                     painter.line_segment(
                         [Pos2::new(ph_x + 1.0, rect.min.y), Pos2::new(ph_x + 1.0, rect.max.y)],
-                        Stroke::new(1.0, Color32::from_black_alpha(60)));
+                        Stroke::new(1.0_f32, Color32::from_black_alpha(60)));
                     painter.line_segment(
                         [Pos2::new(ph_x, rect.min.y), Pos2::new(ph_x, rect.max.y)],
-                        Stroke::new(2.0, ACCENT));
+                        Stroke::new(2.0_f32, ACCENT));
                     painter.add(egui::Shape::convex_polygon(
                         vec![Pos2::new(ph_x - 6.0, rect.min.y),
                              Pos2::new(ph_x + 6.0, rect.min.y),
@@ -1218,7 +1218,7 @@ impl EditorModule for TimelineModule {
                         let label_y = rect.min.y - label_h - 6.0;
                         let pill    = Rect::from_min_size(Pos2::new(label_x, label_y), egui::vec2(label_w, label_h));
                         fg_painter.rect_filled(pill, egui::CornerRadius::same(3), Color32::from_rgba_unmultiplied(10, 10, 14, 220));
-                        fg_painter.rect_stroke(pill, egui::CornerRadius::same(3), Stroke::new(1.0, ACCENT.linear_multiply(0.4)), egui::StrokeKind::Inside);
+                        fg_painter.rect_stroke(pill, egui::CornerRadius::same(3), Stroke::new(1.0_f32, ACCENT.linear_multiply(0.4)), egui::StrokeKind::Inside);
                         fg_painter.galley(Pos2::new(label_x + pad.x, label_y + pad.y), galley, ACCENT);
                     }
 
@@ -1276,7 +1276,7 @@ impl EditorModule for TimelineModule {
                     .show(ui.ctx(), |ui| {
                         egui::Frame::new()
                             .fill(DARK_BG_3)
-                            .stroke(Stroke::new(1.0, DARK_BORDER))
+                            .stroke(Stroke::new(1.0_f32, DARK_BORDER))
                             .corner_radius(egui::CornerRadius::same(6))
                             .inner_margin(egui::Margin::same(10))
                             .shadow(egui::Shadow {
@@ -1319,7 +1319,7 @@ impl EditorModule for TimelineModule {
                                                 .color(if cut_selected { Color32::BLACK } else { DARK_TEXT_DIM }),
                                         )
                                         .fill(if cut_selected { ACCENT } else { DARK_BG_2 })
-                                        .stroke(Stroke::new(1.0, if cut_selected { ACCENT } else { DARK_BORDER }))
+                                        .stroke(Stroke::new(1.0_f32, if cut_selected { ACCENT } else { DARK_BORDER }))
                                         .min_size(egui::vec2(80.0, 26.0));
                                         if ui.add(cut_btn).clicked() {
                                             cmd.push(EditorCommand::RemoveTransition(after_clip_id));
@@ -1340,7 +1340,7 @@ impl EditorModule for TimelineModule {
                                                     .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
                                             )
                                             .fill(if selected { ACCENT } else { DARK_BG_2 })
-                                            .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }))
+                                            .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { DARK_BORDER }))
                                             .min_size(egui::vec2(80.0, 26.0));
                                             if ui.add(btn).clicked() {
                                                 // Preserve duration if switching between transitions,
@@ -1441,7 +1441,7 @@ impl EditorModule for TimelineModule {
                         .show(ui.ctx(), |ui| {
                             egui::Frame::new()
                                 .fill(Color32::from_rgba_unmultiplied(18, 18, 24, 215))
-                                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
+                                .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
                                 .corner_radius(egui::CornerRadius::same(7))
                                 .inner_margin(egui::Margin::same(margin as _))
                                 .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(120) })
@@ -1583,7 +1583,7 @@ impl EditorModule for TimelineModule {
                         .show(ui.ctx(), |ui| {
                             egui::Frame::new()
                                 .fill(Color32::from_rgba_unmultiplied(18, 18, 24, 215))
-                                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
+                                .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 40)))
                                 .corner_radius(egui::CornerRadius::same(7))
                                 .inner_margin(egui::Margin::same(10))
                                 .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(120) })
@@ -1628,7 +1628,7 @@ impl EditorModule for TimelineModule {
                                                         .color(if selected { Color32::BLACK } else { DARK_TEXT_DIM }),
                                                 )
                                                 .fill(if selected { ACCENT } else { DARK_BG_2 })
-                                                .stroke(Stroke::new(1.0, if selected { ACCENT } else { DARK_BORDER }));
+                                                .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { DARK_BORDER }));
                                                 if ui.add_sized([57.0, 24.0], btn).clicked() {
                                                     let mut p = FilterParams::from_preset(*kind);
                                                     p.strength = cur_filter.strength;
@@ -1845,7 +1845,7 @@ fn draw_waveform(
         let x = clip_rect.min.x + i as f32;
         painter.line_segment(
             [Pos2::new(x, mid_y - half), Pos2::new(x, mid_y + half)],
-            Stroke::new(1.0, wave_color),
+            Stroke::new(1.0_f32, wave_color),
         );
     }
 
@@ -1891,7 +1891,7 @@ fn draw_waveform(
                     let half = vol * progress * (h * 0.44);
                     let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
                     if let Some(p) = prev {
-                        painter.line_segment([p, pt], Stroke::new(1.5, ramp_color));
+                        painter.line_segment([p, pt], Stroke::new(1.5_f32, ramp_color));
                     }
                     prev = Some(pt);
                 }
@@ -1919,7 +1919,7 @@ fn draw_waveform(
                     let half = vol * remain_progress * (h * 0.44);
                     let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
                     if let Some(p) = prev {
-                        painter.line_segment([p, pt], Stroke::new(1.5, ramp_color));
+                        painter.line_segment([p, pt], Stroke::new(1.5_f32, ramp_color));
                     }
                     prev = Some(pt);
                 }
