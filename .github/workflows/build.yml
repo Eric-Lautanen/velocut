@@ -148,9 +148,26 @@ jobs:
           sudo apt-get install -y \
             build-essential nasm yasm git cmake pkg-config \
             libx264-dev clang libclang-dev curl \
-            libva-dev libva-drm2 libdrm-dev
+            libva-dev libva-drm2 libdrm-dev \
+            libasound2-dev
+
+      - name: Cache built libvpl + FFmpeg static libs
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/ffmpeg-static
+            /usr/local/lib/libvpl.a
+            /usr/local/lib/pkgconfig/vpl.pc
+            /usr/local/include/vpl
+          # Bust the cache automatically whenever FFMPEG_VERSION changes or this
+          # workflow file's build steps (configure flags, pinned versions, etc.)
+          # are edited. Adjust the hashFiles glob if your workflow file lives
+          # somewhere other than .github/workflows/.
+          key: ffmpeg-linux-${{ env.FFMPEG_VERSION }}-${{ hashFiles('.github/workflows/*.yml') }}
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           git clone --depth=1 https://github.com/intel/libvpl.git
@@ -171,6 +188,7 @@ jobs:
           echo "libvpl version: $(pkg-config --modversion vpl)"
 
       - name: Install NVIDIA NVENC/NVDEC headers
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           git clone --depth=1 -b n12.2.72.0 https://github.com/FFmpeg/nv-codec-headers.git
@@ -178,6 +196,7 @@ jobs:
           sudo make install
 
       - name: Install AMD AMF headers
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           git clone --depth=1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
@@ -185,6 +204,7 @@ jobs:
           sudo cp -r AMF/amf/public/include/* /usr/local/include/AMF/
 
       - name: Build FFmpeg (static, with HW accel)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         env:
           PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
         run: |
@@ -274,7 +294,15 @@ jobs:
         run: |
           brew install nasm yasm pkg-config cmake x264 llvm ffmpeg
 
+      - name: Cache built FFmpeg static libs
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: /opt/ffmpeg-macos
+          key: ffmpeg-macos-${{ env.FFMPEG_VERSION }}-${{ hashFiles('.github/workflows/*.yml') }}
+
       - name: Build FFmpeg (static, with VideoToolbox)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git
