@@ -182,7 +182,7 @@ jobs:
           # MSYS2's mingw-w64-x86_64-clang, to avoid the bindgen/libclang
           # layout bug that opaques AVFormatContext.
           LIBCLANG_PATH: /c/Program Files/LLVM/bin
-          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include"
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
           "/c/Program Files/LLVM/bin/clang.exe" --version
@@ -384,7 +384,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install nasm yasm pkg-config cmake x264 llvm
+          brew install nasm yasm pkg-config cmake x264 llvm@18
 
       - name: Cache built FFmpeg static libs
         id: cache-ffmpeg
@@ -439,7 +439,7 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
-          LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
+          LIBCLANG_PATH: /opt/homebrew/opt/llvm@18/lib
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
           export PKG_CONFIG_PATH="/opt/ffmpeg-macos/lib/pkgconfig:$PKG_CONFIG_PATH"
