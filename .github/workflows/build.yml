@@ -59,10 +59,22 @@ jobs:
           cp -r AMF/amf/public/include/* /mingw64/include/AMF/
 
       - name: Build FFmpeg (static, with HW accel)
+        env:
+          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
         run: |
           cd "$GITHUB_WORKSPACE"
           git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
+          # Fail fast: confirm libvpl's pkg-config file is visible before
+          # ./configure, which otherwise reports a confusing
+          # "libvpl >= 2.6 not found" later.
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+          pkg-config --exists --print-errors 'vpl >= 2.6' || {
+            echo "vpl.pc not found; searching /mingw64 for it..."
+            find /mingw64 -name 'vpl.pc' || true
+            exit 1
+          }
+          echo "libvpl version: $(pkg-config --modversion vpl)"
           ./configure \
             --prefix=/c/ffmpeg-velocut \
             --target-os=mingw32 \
