@@ -45,10 +45,19 @@ jobs:
             mingw-w64-x86_64-yasm
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-clang
             mingw-w64-x86_64-x264
             make
             git
+
+      # Pin a known-good LLVM/libclang instead of relying on MSYS2's
+      # mingw-w64-x86_64-clang, which tracks upstream LLVM releases and has
+      # been observed to trigger a bindgen/libclang layout bug on newer clang
+      # versions that opaques AVFormatContext. Installing a native Windows LLVM
+      # build via Chocolatey and pointing LIBCLANG_PATH at it avoids the bug
+      # without needing to modify the MSYS2 package set.
+      - name: Install pinned LLVM for bindgen
+        shell: pwsh
+        run: choco install llvm --version=18.1.8 -y
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
         # Built from source instead of using the mingw-w64-x86_64-libvpl
@@ -169,7 +178,10 @@ jobs:
         env:
           FFMPEG_DIR: /c/ffmpeg-velocut
           PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
-          LIBCLANG_PATH: /mingw64/bin
+          # Point at the pinned Chocolatey LLVM install (18.1.8) instead of
+          # MSYS2's mingw-w64-x86_64-clang, to avoid the bindgen/libclang
+          # layout bug that opaques AVFormatContext.
+          LIBCLANG_PATH: /c/Program Files/LLVM/bin
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
@@ -434,7 +446,15 @@ jobs:
 
       - name: Diagnose AVFormatContext bindgen failure
         if: failure()
+        env:
+          FFMPEG_DIR: /opt/ffmpeg-macos
+          LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
         run: |
+          export PKG_CONFIG_PATH="/opt/ffmpeg-macos/lib/pkgconfig:$PKG_CONFIG_PATH"
+          echo "----- PKG_CONFIG_PATH as seen by this step -----"
+          echo "$PKG_CONFIG_PATH"
+          pkg-config --exists --print-errors libavutil && echo "libavutil found OK" || echo "libavutil pkg-config lookup FAILED"
+     
           echo "----- Is avformat.h actually installed, and does it look complete? -----"
           ls -la /opt/ffmpeg-macos/include/libavformat/ || true
           wc -l /opt/ffmpeg-macos/include/libavformat/avformat.h || true
