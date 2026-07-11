@@ -130,6 +130,14 @@ jobs:
           make -j$(nproc)
           make install
 
+      - name: Dump FFmpeg config.log on failure
+        if: failure()
+        run: |
+          echo "----- config.log (last 200 lines) -----"
+          tail -n 200 "$GITHUB_WORKSPACE/ffmpeg-src/ffbuild/config.log" || true
+          echo "----- grep for vpl -----"
+          grep -i -A5 -B5 vpl "$GITHUB_WORKSPACE/ffmpeg-src/ffbuild/config.log" || true
+
       - name: Rename .dll.a stubs for true static linking
         run: |
           mv /mingw64/lib/libx264.dll.a /mingw64/lib/libx264.dll.a.bak || true
@@ -171,7 +179,8 @@ jobs:
             build-essential nasm yasm git cmake pkg-config \
             libx264-dev clang libclang-dev curl \
             libva-dev libva-drm2 libdrm-dev \
-            libasound2-dev
+            libasound2-dev \
+            libx11-dev
 
       - name: Cache built libvpl + FFmpeg static libs
         id: cache-ffmpeg
@@ -305,7 +314,9 @@ jobs:
           # because --enable-vaapi was passed to FFmpeg's own ./configure,
           # so we have to link them in manually here or the final binary
           # fails with "undefined symbol: vaXxx" at link time.
-          RUSTFLAGS: "-l va -l va-drm -l va-x11"
+          # hwcontext_vaapi.c also uses the DRM and X11 VAAPI backends
+          # (drmGetVersion, XOpenDisplay, etc.), so those need linking too.
+          RUSTFLAGS: "-l va -l va-drm -l va-x11 -l drm -l X11"
         run: |
           cargo build --release
 
@@ -325,7 +336,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install nasm yasm pkg-config cmake x264 llvm ffmpeg
+          brew install nasm yasm pkg-config cmake x264 llvm
 
       - name: Cache built FFmpeg static libs
         id: cache-ffmpeg
@@ -380,9 +391,12 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
-          # Include Homebrew's pkgconfig dir so the brew-installed ffmpeg
-          # headers/libs are found by bindgen + the linker.
-          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig:/opt/homebrew/lib/pkgconfig
+          # Only point at our own custom-built FFmpeg's pkgconfig — do NOT
+          # add Homebrew's pkgconfig dir here. A stray Homebrew `ffmpeg`
+          # formula previously caused bindgen to pick up a different,
+          # incompatible avformat.h, producing opaque/empty struct bindings
+          # (AVFormatContext showing only an `_address` field).
+          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
           # Homebrew's llvm provides libclang.dylib — required by the bindgen
           # build script in ffmpeg-sys-the-third.
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
