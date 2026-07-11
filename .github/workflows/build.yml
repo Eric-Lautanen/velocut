@@ -13,6 +13,13 @@ env:
   RUST_BACKTRACE: 1
   # FFmpeg source tag — must match the version the fork expects (ffmpeg-8.1).
   FFMPEG_VERSION: "n8.1"
+  # Bump this manually whenever you change FFmpeg's ./configure flags,
+  # pinned dependency versions (libvpl, nv-codec-headers, etc.), or anything
+  # else that should invalidate the cached FFmpeg build. Editing unrelated
+  # parts of this file (the cargo build step, artifact upload, etc.) will
+  # NOT bust the cache, since the key below only depends on this number —
+  # not a hash of the whole file.
+  FFMPEG_BUILD_REV: "1"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -175,11 +182,11 @@ jobs:
             /usr/local/lib/libvpl.a
             /usr/local/lib/pkgconfig/vpl.pc
             /usr/local/include/vpl
-          # Bust the cache automatically whenever FFMPEG_VERSION changes or this
-          # workflow file's build steps (configure flags, pinned versions, etc.)
-          # are edited. Adjust the hashFiles glob if your workflow file lives
-          # somewhere other than .github/workflows/.
-          key: ffmpeg-linux-${{ env.FFMPEG_VERSION }}-${{ hashFiles('.github/workflows/*.yml') }}
+          # Bust the cache when FFMPEG_VERSION or FFMPEG_BUILD_REV change
+          # (bump FFMPEG_BUILD_REV above whenever you edit the configure
+          # flags or pinned versions in the steps below). Unrelated edits
+          # elsewhere in this file no longer force a rebuild.
+          key: ffmpeg-linux-${{ env.FFMPEG_VERSION }}-rev${{ env.FFMPEG_BUILD_REV }}
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
@@ -285,15 +292,20 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-static
-          # Include /usr/local/lib/pkgconfig so libvpl's pkg-config is found.
+          # Include /usr/local/lib/pkgconfig so libvpl's pkg-config is found
+          # (used by bindgen / other crates that do call pkg-config directly).
           PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig:/usr/local/lib/pkgconfig
           # libclang-dev installs to /usr/lib/llvm-14/lib on ubuntu-22.04.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
-          # Force the pkg-config crate to request --static output so the
-          # Libs.private transitive deps (-lva, -lva-drm, -lva-x11, etc.)
-          # are emitted. Without this, Cargo links non-statically and the
-          # VAAPI libs are silently dropped, causing undefined references.
-          PKG_CONFIG_ALL_STATIC: "1"
+          # When FFMPEG_DIR is set, ffmpeg-sys-the-third's build.rs skips
+          # pkg-config entirely and links a small hardcoded list of system
+          # libs (asound, x264, z, vpl, pthread, m, stdc++, dl) — it doesn't
+          # know about VAAPI. The compiled libavcodec.a/libavutil.a *do*
+          # reference libva symbols (vaCreateBuffer, vaBeginPicture, etc.)
+          # because --enable-vaapi was passed to FFmpeg's own ./configure,
+          # so we have to link them in manually here or the final binary
+          # fails with "undefined symbol: vaXxx" at link time.
+          RUSTFLAGS: "-l va -l va-drm -l va-x11"
         run: |
           cargo build --release
 
@@ -320,7 +332,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/ffmpeg-macos
-          key: ffmpeg-macos-${{ env.FFMPEG_VERSION }}-${{ hashFiles('.github/workflows/*.yml') }}
+          key: ffmpeg-macos-${{ env.FFMPEG_VERSION }}-rev${{ env.FFMPEG_BUILD_REV }}
 
       - name: Build FFmpeg (static, with VideoToolbox)
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
