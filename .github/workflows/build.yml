@@ -170,9 +170,13 @@ jobs:
           FFMPEG_DIR: /c/ffmpeg-velocut
           PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
           LIBCLANG_PATH: /mingw64/bin
-          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 -I/mingw64/include"
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
+          echo "Removing conflicting mingw64 ffmpeg headers so bindgen can't pick them up by accident"
+          rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
+                 /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
+                 /mingw64/include/libswresample
           cargo build --release --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure
@@ -422,14 +426,10 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
-          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
-          # Homebrew's llvm provides libclang.dylib — required by the bindgen
-          # build script in ffmpeg-sys-the-third.
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
-          # Force the pkg-config crate to request --static output so the
-          # Libs.private transitive deps are emitted.
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
+          export PKG_CONFIG_PATH="/opt/ffmpeg-macos/lib/pkgconfig:$PKG_CONFIG_PATH"
           cargo build --release
 
       - name: Diagnose AVFormatContext bindgen failure
