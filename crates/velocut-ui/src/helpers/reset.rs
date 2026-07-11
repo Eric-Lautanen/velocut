@@ -114,6 +114,7 @@ pub fn delete_app_data_dir() {
 /// On non-Windows platforms the two paths are identical; deduplication ensures
 /// we only scan once.
 pub fn delete_temp_files() {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut tmp_dirs: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
 
     // On Windows we need to sweep the real Windows temp directory, which MSYS2

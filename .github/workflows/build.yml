@@ -125,6 +125,9 @@ jobs:
           PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
           LIBCLANG_PATH: /mingw64/bin
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 -I/mingw64/include"
+          # Force the pkg-config crate to request --static output so the
+          # Libs.private transitive deps (e.g. -lva, -lva-drm) are emitted.
+          PKG_CONFIG_ALL_STATIC: "1"
         run: |
           cargo build --release --features velocut-ui/winresource
 
@@ -220,6 +223,7 @@ jobs:
             --disable-doc \
             --disable-network \
             --disable-everything \
+            --disable-bzlib \
             --enable-avcodec \
             --enable-avformat \
             --enable-avfilter \
@@ -273,6 +277,11 @@ jobs:
           PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig:/usr/local/lib/pkgconfig
           # libclang-dev installs to /usr/lib/llvm-14/lib on ubuntu-22.04.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
+          # Force the pkg-config crate to request --static output so the
+          # Libs.private transitive deps (-lva, -lva-drm, -lva-x11, etc.)
+          # are emitted. Without this, Cargo links non-statically and the
+          # VAAPI libs are silently dropped, causing undefined references.
+          PKG_CONFIG_ALL_STATIC: "1"
         run: |
           cargo build --release
 
@@ -316,6 +325,7 @@ jobs:
             --disable-doc \
             --disable-network \
             --disable-everything \
+            --disable-bzlib \
             --enable-avcodec \
             --enable-avformat \
             --enable-avfilter \
@@ -352,6 +362,9 @@ jobs:
           # Homebrew's llvm provides libclang.dylib — required by the bindgen
           # build script in ffmpeg-sys-the-third.
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
+          # Force the pkg-config crate to request --static output so the
+          # Libs.private transitive deps are emitted.
+          PKG_CONFIG_ALL_STATIC: "1"
         run: |
           cargo build --release
 
