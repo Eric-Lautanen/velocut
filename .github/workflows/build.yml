@@ -7,6 +7,19 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      build_windows:
+        description: "Build Windows"
+        type: boolean
+        default: true
+      build_linux:
+        description: "Build Linux"
+        type: boolean
+        default: true
+      build_macos:
+        description: "Build macOS"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +40,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.build_windows
     defaults:
       run:
         shell: msys2 {0}
@@ -217,6 +231,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-22.04
+    if: github.event_name != 'workflow_dispatch' || inputs.build_linux
     steps:
       - uses: actions/checkout@v4
 
@@ -379,6 +394,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build-macos:
     runs-on: macos-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.build_macos
     steps:
       - uses: actions/checkout@v4
 
