@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # FFmpeg source tag — must match the version the fork expects (ffmpeg-8.1).
-  FFMPEG_VERSION: "n8.0.1"
+  FFMPEG_VERSION: "n8.1"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -148,8 +148,7 @@ jobs:
           sudo apt-get install -y \
             build-essential nasm yasm git cmake pkg-config \
             libx264-dev clang libclang-dev curl \
-            libva-dev libva-drm2 libdrm-dev \
-            libvpl-dev
+            libva-dev libva-drm2 libdrm-dev
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
         run: |
@@ -158,11 +157,18 @@ jobs:
           cd libvpl
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
                 -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
                 -DCMAKE_PREFIX_PATH=/usr/local
           cmake --build build -j$(nproc)
           sudo cmake --install build
           # Make the installed pkg-config file discoverable.
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          # Fail fast with a clear message instead of a confusing error later
+          # inside FFmpeg's ./configure if the .pc file didn't land where expected.
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+          echo "vpl.pc found at: $(find /usr/local -name 'vpl.pc')"
+          pkg-config --exists --print-errors 'vpl >= 2.6'
+          echo "libvpl version: $(pkg-config --modversion vpl)"
 
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
@@ -207,7 +213,7 @@ jobs:
             --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg,prores,dnxhd,vorbis,opus,aac,mp3,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ac3,eac3,dts,png \
             --enable-encoder=libx264,aac,png \
             --enable-filter=scale,format,aformat,concat,atrim,trim,setpts,asetpts,fps,blend,volume,amix,aresample,color,overlay,pad,crop,rotate \
-            --enable-bsf=h264_mp4toannexb,aac_adtostoasc,hevc_mp4toannexb \
+            --enable-bsf=h264_mp4toannexb,aac_adtstoasc,hevc_mp4toannexb \
             --enable-parser=h264,hevc,aac,mp3,vp8,vp9,av1,ac3,mpeg4video,opus,vorbis,png \
             --enable-libx264 \
             --enable-gpl \
