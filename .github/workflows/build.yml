@@ -19,7 +19,7 @@ env:
   # parts of this file (the cargo build step, artifact upload, etc.) will
   # NOT bust the cache, since the key below only depends on this number —
   # not a hash of the whole file.
-  FFMPEG_BUILD_REV: "1"
+  FFMPEG_BUILD_REV: "2"
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -47,9 +47,29 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-clang
             mingw-w64-x86_64-x264
-            mingw-w64-x86_64-libvpl
             make
             git
+
+      - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
+        # Built from source instead of using the mingw-w64-x86_64-libvpl
+        # pacman package: that package's static pkg-config metadata has
+        # been unreliable for FFmpeg's configure link-test (see
+        # https://github.com/oneapi-src/oneVPL/issues/110), which is the
+        # likely cause of "ERROR: libvpl >= 2.6 not found" even when the
+        # pkg-config version check on its own passes. Mirrors the Linux
+        # job, which builds libvpl from source and does not hit this.
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/intel/libvpl.git
+          cd libvpl
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DCMAKE_INSTALL_PREFIX=/mingw64 \
+                -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build -j$(nproc)
+          cmake --install build
+          echo "vpl.pc found at: $(find /mingw64 -name 'vpl.pc')"
+          pkg-config --exists --print-errors 'vpl >= 2.6'
+          echo "libvpl version: $(pkg-config --modversion vpl)"
 
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
@@ -391,11 +411,6 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
-          # Only point at our own custom-built FFmpeg's pkgconfig — do NOT
-          # add Homebrew's pkgconfig dir here. A stray Homebrew `ffmpeg`
-          # formula previously caused bindgen to pick up a different,
-          # incompatible avformat.h, producing opaque/empty struct bindings
-          # (AVFormatContext showing only an `_address` field).
           PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
           # Homebrew's llvm provides libclang.dylib — required by the bindgen
           # build script in ffmpeg-sys-the-third.
@@ -405,6 +420,24 @@ jobs:
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
           cargo build --release
+
+      - name: Diagnose AVFormatContext bindgen failure
+        if: failure()
+        run: |
+          echo "----- Is avformat.h actually installed, and does it look complete? -----"
+          ls -la /opt/ffmpeg-macos/include/libavformat/ || true
+          wc -l /opt/ffmpeg-macos/include/libavformat/avformat.h || true
+
+          echo "----- Does the struct body survive a plain clang preprocess? -----"
+          echo '#include <libavformat/avformat.h>' > /tmp/probe.c
+          clang -E -I/opt/ffmpeg-macos/include /tmp/probe.c -o /tmp/avformat.i 2>/tmp/clang_errors.txt
+          echo "--- clang stderr (truncated) ---"
+          head -n 100 /tmp/clang_errors.txt
+          echo "--- struct AVFormatContext body, if present ---"
+          grep -A 15 "^struct AVFormatContext {" /tmp/avformat.i | head -n 20 || echo "STRUCT BODY NOT FOUND IN PREPROCESSED OUTPUT"
+
+          echo "----- Re-running cargo build verbosely to capture bindgen's actual clang args -----"
+          cargo build --release -vv 2>&1 | grep -B2 -A2 -i "avformat\|bindgen\|running.*clang" | head -n 300 || true
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
