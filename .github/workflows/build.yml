@@ -47,7 +47,7 @@ jobs:
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
           cd "$GITHUB_WORKSPACE"
-          git clone --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
+          git clone --depth=1 -b n12.2.72.0 https://github.com/FFmpeg/nv-codec-headers.git
           cd nv-codec-headers
           make PREFIX=/mingw64 install
 
@@ -173,7 +173,7 @@ jobs:
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
           cd /tmp
-          git clone --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
+          git clone --depth=1 -b n12.2.72.0 https://github.com/FFmpeg/nv-codec-headers.git
           cd nv-codec-headers
           sudo make install
 
