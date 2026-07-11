@@ -156,9 +156,12 @@ jobs:
           git clone --depth=1 https://github.com/intel/libvpl.git
           cd libvpl
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-                -DCMAKE_INSTALL_PREFIX=/usr/local
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_PREFIX_PATH=/usr/local
           cmake --build build -j$(nproc)
           sudo cmake --install build
+          # Make the installed pkg-config file discoverable.
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
@@ -228,7 +231,8 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-static
-          PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig
+          # Include /usr/local/lib/pkgconfig so libvpl's pkg-config is found.
+          PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig:/usr/local/lib/pkgconfig
           # libclang-dev installs to /usr/lib/llvm-14/lib on ubuntu-22.04.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
         run: |
