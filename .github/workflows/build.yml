@@ -46,21 +46,21 @@ jobs:
 
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
-          cd /c/github
+          cd "$GITHUB_WORKSPACE"
           git clone --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
           cd nv-codec-headers
           make PREFIX=/mingw64 install
 
       - name: Install AMD AMF headers
         run: |
-          cd /c/github
+          cd "$GITHUB_WORKSPACE"
           git clone --depth=1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
           mkdir -p /mingw64/include/AMF
           cp -r AMF/amf/public/include/* /mingw64/include/AMF/
 
       - name: Build FFmpeg (static, with HW accel)
         run: |
-          cd /c/github
+          cd "$GITHUB_WORKSPACE"
           git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
           ./configure \
@@ -119,9 +119,11 @@ jobs:
 
       - name: Build velocut
         env:
-          FFMPEG_DIR: C:\ffmpeg-velocut
-          PKG_CONFIG_PATH: C:\ffmpeg-velocut\lib\pkgconfig;C:\msys64\mingw64\lib\pkgconfig
-          LIBCLANG_PATH: C:\msys64\mingw64\bin
+          # Use MSYS2-style path so the build.rs `env::var("FFMPEG_DIR")` branch
+          # resolves correctly inside the msys2 shell.
+          FFMPEG_DIR: /c/ffmpeg-velocut
+          PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
+          LIBCLANG_PATH: /mingw64/bin
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 -I/mingw64/include"
         run: |
           cargo build --release --features velocut-ui/winresource
@@ -146,8 +148,17 @@ jobs:
           sudo apt-get install -y \
             build-essential nasm yasm git cmake pkg-config \
             libx264-dev clang libclang-dev curl \
-            libva-dev libva-drm2 libdrm-dev \
-            libvpl-dev
+            libva-dev libva-drm2 libdrm-dev
+
+      - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
+        run: |
+          cd /tmp
+          git clone --depth=1 https://github.com/intel/libvpl.git
+          cd libvpl
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j$(nproc)
+          sudo cmake --install build
 
       - name: Install NVIDIA NVENC/NVDEC headers
         run: |
@@ -189,7 +200,7 @@ jobs:
             --enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg,prores,dnxhd,vorbis,opus,aac,mp3,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ac3,eac3,dts,png \
             --enable-encoder=libx264,aac,png \
             --enable-filter=scale,format,aformat,concat,atrim,trim,setpts,asetpts,fps,blend,volume,amix,aresample,color,overlay,pad,crop,rotate \
-            --enable-bsf=h264_mp4toannexb,aac_adtstoasc,hevc_mp4toannexb \
+            --enable-bsf=h264_mp4toannexb,aac_adtostoasc,hevc_mp4toannexb \
             --enable-parser=h264,hevc,aac,mp3,vp8,vp9,av1,ac3,mpeg4video,opus,vorbis,png \
             --enable-libx264 \
             --enable-gpl \
@@ -218,6 +229,7 @@ jobs:
         env:
           FFMPEG_DIR: /opt/ffmpeg-static
           PKG_CONFIG_PATH: /opt/ffmpeg-static/lib/pkgconfig
+          # libclang-dev installs to /usr/lib/llvm-14/lib on ubuntu-22.04.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
         run: |
           cargo build --release
@@ -238,7 +250,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install nasm yasm pkg-config cmake x264
+          brew install nasm yasm pkg-config cmake x264 llvm
 
       - name: Build FFmpeg (static, with VideoToolbox)
         run: |
@@ -285,7 +297,9 @@ jobs:
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
           PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
-          LIBCLANG_PATH: $(brew --prefix llvm)/lib
+          # Homebrew's llvm provides libclang.dylib — required by the bindgen
+          # build script in ffmpeg-sys-the-third.
+          LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
         run: |
           cargo build --release
 
