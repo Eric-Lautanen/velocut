@@ -57,7 +57,7 @@ jobs:
       # without needing to modify the MSYS2 package set.
       - name: Install pinned LLVM for bindgen
         shell: pwsh
-        run: choco install llvm --version=18.1.8 -y
+        run: choco install llvm --version=18.1.8 -y --allow-downgrade
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
         # Built from source instead of using the mingw-w64-x86_64-libvpl
@@ -185,6 +185,7 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
+          "/c/Program Files/LLVM/bin/clang.exe" --version
           echo "Removing conflicting mingw64 ffmpeg headers so bindgen can't pick them up by accident"
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
