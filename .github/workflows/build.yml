@@ -148,7 +148,8 @@ jobs:
           sudo apt-get install -y \
             build-essential nasm yasm git cmake pkg-config \
             libx264-dev clang libclang-dev curl \
-            libva-dev libva-drm2 libdrm-dev
+            libva-dev libva-drm2 libdrm-dev \
+            libvpl-dev
 
       - name: Build libvpl (Intel QSV >= 2.6 required by FFmpeg 8.x)
         run: |
@@ -257,7 +258,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install nasm yasm pkg-config cmake x264 llvm
+          brew install nasm yasm pkg-config cmake x264 llvm ffmpeg
 
       - name: Build FFmpeg (static, with VideoToolbox)
         run: |
@@ -303,7 +304,9 @@ jobs:
       - name: Build velocut
         env:
           FFMPEG_DIR: /opt/ffmpeg-macos
-          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig
+          # Include Homebrew's pkgconfig dir so the brew-installed ffmpeg
+          # headers/libs are found by bindgen + the linker.
+          PKG_CONFIG_PATH: /opt/ffmpeg-macos/lib/pkgconfig:/opt/homebrew/lib/pkgconfig
           # Homebrew's llvm provides libclang.dylib — required by the bindgen
           # build script in ffmpeg-sys-the-third.
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
