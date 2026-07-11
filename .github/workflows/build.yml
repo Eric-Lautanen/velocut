@@ -233,10 +233,18 @@ jobs:
             --enable-filter=scale_qsv,vpp_qsv \
             --extra-cflags="-I/usr/local/include -I/usr/local/include/vpl" \
             --extra-ldflags="-L/usr/local/lib" \
-            --extra-libs="-lpthread -lm" \
+            --extra-libs="-lstdc++ -lpthread -lm -ldl" \
             --pkg-config-flags="--static"
           make -j$(nproc)
           sudo make install
+
+      - name: Dump FFmpeg config.log on failure
+        if: failure()
+        run: |
+          echo "----- config.log (last 200 lines) -----"
+          tail -n 200 /tmp/FFmpeg/ffbuild/config.log || true
+          echo "----- grep for vpl -----"
+          grep -i -A5 -B5 vpl /tmp/FFmpeg/ffbuild/config.log || true
 
       - name: Build velocut
         env:
