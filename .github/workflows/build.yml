@@ -209,7 +209,7 @@ jobs:
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi"
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
           cargo build --release --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure
