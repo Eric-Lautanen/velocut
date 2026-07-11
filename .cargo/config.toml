@@ -1,7 +1,8 @@
-[env]
-FFMPEG_DIR = "C:\\ffmpeg-velocut"
-PKG_CONFIG_PATH = "C:\\ffmpeg-velocut\\lib\\pkgconfig;C:\\msys64\\mingw64\\lib\\pkgconfig"
-
+# NOTE: FFMPEG_DIR / PKG_CONFIG_PATH are intentionally NOT set here.
+# Cargo's [env] section is global and would leak Windows paths
+# (C:\ffmpeg-velocut) into macOS/Linux builds, causing bindgen to
+# generate opaque structs against a nonexistent include dir. Each
+# platform's CI job sets these env vars explicitly in build.yml.
 [target.x86_64-pc-windows-gnu]
 rustflags = [
   "-L", "/mingw64/lib",
