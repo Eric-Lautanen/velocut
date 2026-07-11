@@ -178,10 +178,13 @@ jobs:
           sudo cp -r AMF/amf/public/include/* /usr/local/include/AMF/
 
       - name: Build FFmpeg (static, with HW accel)
+        env:
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
         run: |
           cd /tmp
           git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git
           cd FFmpeg
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
           ./configure \
             --prefix=/opt/ffmpeg-static \
             --disable-shared \
