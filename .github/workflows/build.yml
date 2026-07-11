@@ -167,6 +167,7 @@ jobs:
             --enable-encoder=h264_qsv,hevc_qsv,av1_qsv \
             --enable-decoder=h264_qsv,hevc_qsv \
             --enable-filter=scale_qsv,vpp_qsv \
+            --disable-vaapi \
             --extra-cflags="-I/mingw64/include -I/mingw64/include/vpl" \
             --extra-ldflags="-L/mingw64/lib -static" \
             --extra-libs="-lstdc++" \
@@ -208,6 +209,7 @@ jobs:
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
+          export RUSTFLAGS="-L /mingw64/lib -l vpl"
           cargo build --release --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure
