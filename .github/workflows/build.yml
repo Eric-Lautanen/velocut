@@ -167,17 +167,27 @@ jobs:
 
       - name: Build velocut
         env:
-          # Use MSYS2-style path so the build.rs `env::var("FFMPEG_DIR")` branch
-          # resolves correctly inside the msys2 shell.
           FFMPEG_DIR: /c/ffmpeg-velocut
           PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
           LIBCLANG_PATH: /mingw64/bin
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 -I/mingw64/include"
-          # Force the pkg-config crate to request --static output so the
-          # Libs.private transitive deps (e.g. -lva, -lva-drm) are emitted.
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
           cargo build --release --features velocut-ui/winresource
+
+      - name: Diagnose AVFormatContext opaque-struct failure
+        if: failure()
+        run: |
+          echo "----- Which avformat.h did bindgen actually see? -----"
+          find /c/ffmpeg-velocut/include -name 'avformat.h' -exec ls -la {} \;
+          find /mingw64/include -iname 'avformat.h' 2>/dev/null && echo "^^ CONFLICTING avformat.h FOUND UNDER /mingw64/include" || echo "no conflicting header under /mingw64/include"
+
+          echo "----- Full verbose rebuild capturing bindgen's real clang invocation and warnings -----"
+          cargo build --release --features velocut-ui/winresource -vv > /tmp/full_build.log 2>&1 || true
+          echo "----- clang/bindgen warnings on AVFormatContext -----"
+          grep -n -i "AVFormatContext\|cannot compute\|opaque\|warning:" /tmp/full_build.log | head -n 100
+          echo "----- last 150 lines of full log -----"
+          tail -n 150 /tmp/full_build.log
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -437,8 +447,13 @@ jobs:
           echo "--- struct AVFormatContext body, if present ---"
           grep -A 15 "^struct AVFormatContext {" /tmp/avformat.i | head -n 20 || echo "STRUCT BODY NOT FOUND IN PREPROCESSED OUTPUT"
 
-          echo "----- Re-running cargo build verbosely to capture bindgen's actual clang args -----"
-          cargo build --release -vv 2>&1 | grep -B2 -A2 -i "avformat\|bindgen\|running.*clang" | head -n 300 || true
+          echo "----- Full verbose rebuild, unfiltered, to a log file -----"
+          cargo build --release -vv > /tmp/full_build.log 2>&1 || true
+          echo "----- last 150 lines of full build log (this is where the panic message lives) -----"
+          tail -n 150 /tmp/full_build.log
+          echo "----- explicit panic/error grep (context only, not a filter on the log itself) -----"
+          grep -n -i "panicked\|error\[\|error:" /tmp/full_build.log || echo "no panic/error string matched — check the tail above manually"
+
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
