@@ -5,7 +5,9 @@
 **A fast, native desktop video editor written in Rust.**
 
 ![Rust](https://img.shields.io/badge/Rust-1.96+-orange?style=flat-square&logo=rust)
-![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows)
+![Windows](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows)
+![Linux](https://img.shields.io/badge/Platform-Linux-yellow?style=flat-square&logo=linux)
+![macOS](https://img.shields.io/badge/Platform-macos-silver?style=flat-square&logo=apple)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 ![egui](https://img.shields.io/badge/UI-egui%200.34-purple?style=flat-square)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-static-red?style=flat-square)
@@ -53,8 +55,8 @@ The UI is built with [egui](https://github.com/emilk/egui) / [eframe](https://gi
 | Platform | Status |
 |----------|--------|
 | Windows (MINGW64) | ✅ Supported |
-| Linux | 🔬 Untested |
-| macOS | 🔬 Untested |
+| Linux | 🛠️ Built, untested |
+| macOS | 🛠️ Built, untested |
 
 ---
 
