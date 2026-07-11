@@ -105,7 +105,7 @@ jobs:
             --enable-encoder=h264_qsv,hevc_qsv,av1_qsv \
             --enable-decoder=h264_qsv,hevc_qsv \
             --enable-filter=scale_qsv,vpp_qsv \
-            --extra-cflags="-I/mingw64/include" \
+            --extra-cflags="-I/mingw64/include -I/mingw64/include/vpl" \
             --extra-ldflags="-L/mingw64/lib -static" \
             --pkg-config-flags="--static"
           make -j$(nproc)
@@ -231,7 +231,7 @@ jobs:
             --enable-encoder=h264_qsv,hevc_qsv,av1_qsv \
             --enable-decoder=h264_qsv,hevc_qsv \
             --enable-filter=scale_qsv,vpp_qsv \
-            --extra-cflags="-I/usr/local/include" \
+            --extra-cflags="-I/usr/local/include -I/usr/local/include/vpl" \
             --extra-ldflags="-L/usr/local/lib" \
             --extra-libs="-lpthread -lm" \
             --pkg-config-flags="--static"
