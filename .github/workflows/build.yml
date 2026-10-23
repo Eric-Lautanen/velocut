@@ -82,13 +82,33 @@ jobs:
         # likely cause of "ERROR: libvpl >= 2.6 not found" even when the
         # pkg-config version check on its own passes. Mirrors the Linux
         # job, which builds libvpl from source and does not hit this.
+        #
+        # BUILD_SHARED_LIBS=OFF keeps the result a static libvpl.a that FFmpeg
+        # links in, so the app stays one self-contained executable.
+        #
+        # The clone is pinned to a commit: it used to follow master, which is
+        # how this step broke with no change on our side.
+        #
+        # windows.h is force-included because libvpl's own headers define a
+        # wcscpy_s shim for ancient MSVC under `#if _MSC_VER < 1400` — true on
+        # MinGW, where _MSC_VER is undefined — and then include windows.h.
+        # mingw-w64 14's stralign.h calls wcscpy_s inside an inline, so the shim
+        # macro expands there and the build dies with "expected ')' before ';'".
+        # Parsing windows.h first removes the collision; the shim still serves
+        # libvpl's own call sites.
         run: |
           cd "$GITHUB_WORKSPACE"
-          git clone --depth=1 https://github.com/intel/libvpl.git
+          rm -rf libvpl
+          git init --quiet libvpl
           cd libvpl
+          git remote add origin https://github.com/intel/libvpl.git
+          git fetch --depth=1 origin 674d015bcb294bc39fa276e99a652ea045423e82
+          git checkout --quiet FETCH_HEAD
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
                 -DCMAKE_INSTALL_PREFIX=/mingw64 \
-                -DCMAKE_INSTALL_LIBDIR=lib
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_C_FLAGS="-include windows.h" \
+                -DCMAKE_CXX_FLAGS="-include windows.h"
           cmake --build build -j$(nproc)
           cmake --install build
           echo "vpl.pc found at: $(find /mingw64 -name 'vpl.pc')"
