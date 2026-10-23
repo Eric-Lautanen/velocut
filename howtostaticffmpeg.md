@@ -337,6 +337,11 @@ mv /mingw64/lib/libz.dll.a /mingw64/lib/libz.dll.a.bak
 
 # If linking libvpl statically
 mv /mingw64/lib/libvpl.dll.a /mingw64/lib/libvpl.dll.a.bak 2>/dev/null || true
+
+# libvpl's C++ dispatcher pulls in libstdc++; keep it static too, or the exe
+# needs libstdc++-6.dll (and winpthreads alongside it)
+mv /mingw64/lib/libstdc++.dll.a /mingw64/lib/libstdc++.dll.a.bak 2>/dev/null || true
+mv /mingw64/lib/libwinpthread.dll.a /mingw64/lib/libwinpthread.dll.a.bak 2>/dev/null || true
 ```
 
 > **After pacman updates:** These files may come back. Re-check if you see `zlib1.dll` or `libx264-165.dll` errors.
@@ -1013,6 +1018,10 @@ You built FFmpeg without `--enable-avdevice`. The `ffmpeg-sys-the-third` bindgen
 ### "Can't find section .llvmbc"
 LTO is enabled. Set `lto = false` in `[profile.release]` in workspace `Cargo.toml`.
 
+### DLL popup on launch: `libstdc++-6.dll`
+
+The C++ runtime was linked dynamically. Rename `/mingw64/lib/libstdc++.dll.a` to `.bak` and rebuild; the linker then picks `libstdc++.a`. Check `objdump -p velocut.exe | grep "DLL Name"` to confirm.
+
 ### DLL popup on launch: `libva.dll`, `libva_win32.dll`
 You re-enabled VA-API or forgot to disable it. If targeting Windows software-only, add `--disable-vaapi` to your configure. If you want hardware support, these DLLs should be on the user's system — they're part of the Intel driver or AMD Mesa Windows build.
 
@@ -1115,6 +1124,7 @@ Expected output (only Apple system dylibs):
 - [ ] `/mingw64/lib/libx264.dll.a` renamed to `.bak`
 - [ ] `/mingw64/lib/libz.dll.a` renamed to `.bak`
 - [ ] `/mingw64/lib/libvpl.dll.a` renamed to `.bak` (if present)
+- [ ] `/mingw64/lib/libstdc++.dll.a` and `libwinpthread.dll.a` renamed to `.bak`
 - [ ] `ffmpeg-sys-the-third` forked and `link_to_libraries()` updated
 - [ ] `lto = false` in workspace `Cargo.toml`
 - [ ] `cargo update -p ffmpeg-sys-the-third` run after any fork changes

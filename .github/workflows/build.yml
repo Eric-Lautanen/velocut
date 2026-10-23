@@ -209,6 +209,13 @@ jobs:
           mv /mingw64/lib/libx264.dll.a /mingw64/lib/libx264.dll.a.bak || true
           mv /mingw64/lib/libz.dll.a /mingw64/lib/libz.dll.a.bak || true
           mv /mingw64/lib/libvpl.dll.a /mingw64/lib/libvpl.dll.a.bak || true
+          # libvpl's C++ dispatcher objects demand libstdc++ symbols; the import
+          # stub wins over libstdc++.a by default, which leaves the exe needing
+          # libstdc++-6.dll beside it.
+          mv /mingw64/lib/libstdc++.dll.a /mingw64/lib/libstdc++.dll.a.bak || true
+          # The static C++ runtime uses winpthreads; keep that static too so it
+          # cannot reintroduce a dll dependency.
+          mv /mingw64/lib/libwinpthread.dll.a /mingw64/lib/libwinpthread.dll.a.bak || true
 
       - name: Build velocut
         env:
@@ -230,9 +237,7 @@ jobs:
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
-          # libvpl's dispatcher is C++, so the link pulls in libstdc++; without
-          # this the exe imports libstdc++-6.dll and is not self-contained.
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32 -C link-arg=-static-libstdc++"
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
           cargo build --release --features velocut-ui/winresource
 
       # Runs on the release artifacts the step above already produced, so it costs
@@ -252,9 +257,7 @@ jobs:
           # libvpl.a call the registry API, and ld resolves archives left to
           # right — a plain -l lands before later repeats of -lvpl and leaves
           # __imp_Reg* unresolved. link-arg is appended after every archive.
-          # -static-libstdc++ keeps the test binaries on the same self-contained
-          # link the release build uses.
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32 -C link-arg=-static-libstdc++"
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
           # Same feature set as the build above, so the release binary that
           # gets uploaded is still the one produced by the Build step.
           cargo test --release --workspace --features velocut-ui/winresource --no-fail-fast
