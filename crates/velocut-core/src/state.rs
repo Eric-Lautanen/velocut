@@ -3,7 +3,7 @@
 // Serializable via serde. Used by both velocut-ui and velocut-core consumers.
 use crate::transitions::TimelineTransition;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -325,6 +325,44 @@ impl ProjectState {
         }
     }
 
+    /// Resolve the source media file behind a separated-audio library entry.
+    ///
+    /// `extract_audio_track` gives the A-row clip its own library entry so the
+    /// bin can show it as audio. That entry is derived data: its real source is
+    /// the video file of the V-row clip it is linked to. `audio_path` (the WAV
+    /// in the temp dir) is transient and cleared on save, so callers that need
+    /// to re-extract audio after a restart must go through this lookup instead
+    /// of trusting the entry's own `path`.
+    ///
+    /// Returns `None` for standalone audio entries, broken links, or clips that
+    /// no longer sit on the timeline.
+    pub fn audio_library_source(&self, lib_id: Uuid) -> Option<PathBuf> {
+        let audio_clip = self
+            .timeline
+            .iter()
+            .find(|c| c.media_id == lib_id && c.track_row % 2 == 1)?;
+        let partner_id = audio_clip.linked_clip_id?;
+        let video_partner = self
+            .timeline
+            .iter()
+            .find(|c| c.id == partner_id && c.linked_clip_id == Some(audio_clip.id))?;
+        self.library
+            .iter()
+            .find(|l| l.id == video_partner.media_id)
+            .map(|l| l.path.clone())
+    }
+
+    /// Whether any library entry other than `except` still plays from `path`.
+    ///
+    /// The V row entry and its separated A row entry reference the same temp
+    /// WAV. Deleting one of them must not queue that WAV for cleanup while the
+    /// other still depends on it, or the survivor goes silent.
+    pub fn audio_path_in_use(&self, path: &Path, except: Uuid) -> bool {
+        self.library
+            .iter()
+            .any(|c| c.id != except && c.audio_path.as_deref() == Some(path))
+    }
+
     /// Place a library clip on the timeline.
     /// `preferred_row` is the track row the user targeted (from DnD hover y).
     /// Enforces type safety: video clips land on even rows (V1=0, V2=2),
@@ -383,6 +421,12 @@ impl ProjectState {
             snapped = track_end; // butt up directly after previous clip
         }
 
+        // A drop is a ripple too: make room under the snapped span instead of
+        // letting the new clip land on top of an existing one. Ripple (rather
+        // than clamping the drop) keeps the clip where the user aimed; the row
+        // moves out of its way.
+        self.make_room_on_row(row, snapped, duration, &[]);
+
         self.timeline.push(TimelineClip {
             id: Uuid::new_v4(),
             media_id,
@@ -429,7 +473,10 @@ impl ProjectState {
             duration: clip.duration,
             track_row: audio_row,
             source_offset: clip.source_offset,
-            volume: 1.0,
+            // Carry the video clip's gain across: the user set it before
+            // extracting, and the A row clip is what actually produces audio
+            // afterwards. Resetting to 1.0 made the separated track louder.
+            volume: clip.volume,
             linked_clip_id: Some(clip_id),
             audio_muted: false,
             fade_in_secs: clip.fade_in_secs,
@@ -447,26 +494,260 @@ impl ProjectState {
         Some(audio_id)
     }
 
+    /// Keep a separated audio track locked to its video clip after a trim or move.
+    ///
+    /// `from` is the clip whose timeline geometry just changed. Its partner is
+    /// updated to the same `start_time`, `duration` and `source_offset`. The V
+    /// row clip is the anchor, so calling this with an A row clip is a no-op —
+    /// that leaves room to nudge audio manually when correcting drift.
+    ///
+    /// The update only happens when both clips still point at each other, so a
+    /// stale `linked_clip_id` (partner deleted or undone) is ignored rather than
+    /// teleporting an unrelated clip.
+    pub fn sync_linked_clip(&mut self, from: Uuid) {
+        let Some(src) = self.timeline.iter().find(|c| c.id == from) else {
+            return;
+        };
+        let (start_time, duration, source_offset) =
+            (src.start_time, src.duration, src.source_offset);
+        let Some(partner) = self.linked_partner_mut(from) else {
+            return;
+        };
+        partner.start_time = start_time;
+        partner.duration = duration;
+        partner.source_offset = source_offset;
+    }
+
+    /// The partner of `from`, only while both clips still point at each other.
+    ///
+    /// The V row clip is the anchor: an A row origin returns `None` so the
+    /// separated audio can still be nudged independently. Stale links (partner
+    /// deleted or undone) are ignored instead of moving an unrelated clip.
+    fn linked_partner_mut(&mut self, from: Uuid) -> Option<&mut TimelineClip> {
+        let src = self.timeline.iter().find(|c| c.id == from)?;
+        if src.track_row % 2 == 1 {
+            return None;
+        }
+        let partner_id = src.linked_clip_id?;
+        self.timeline
+            .iter_mut()
+            .find(|c| c.id == partner_id && c.linked_clip_id == Some(from))
+    }
+
+    /// Mirror the video clip's fade envelope onto its separated audio clip.
+    ///
+    /// The fade sliders live on the V row clip in the UI, but after
+    /// `extract_audio_track` the audio is produced by the A row clip — both the
+    /// preview mixer and the encoder read the A row envelope. Without this the
+    /// sliders look active yet change nothing audible.
+    pub fn sync_linked_fades(&mut self, from: Uuid) {
+        let Some(src) = self.timeline.iter().find(|c| c.id == from) else {
+            return;
+        };
+        let (fade_in_secs, fade_in_start_secs, fade_out_secs, fade_out_end_secs) = (
+            src.fade_in_secs,
+            src.fade_in_start_secs,
+            src.fade_out_secs,
+            src.fade_out_end_secs,
+        );
+        let Some(partner) = self.linked_partner_mut(from) else {
+            return;
+        };
+        partner.fade_in_secs = fade_in_secs;
+        partner.fade_in_start_secs = fade_in_start_secs;
+        partner.fade_out_secs = fade_out_secs;
+        partner.fade_out_end_secs = fade_out_end_secs;
+    }
+
+    /// Mirror the video clip's gain onto its separated audio clip.
+    ///
+    /// After `extract_audio_track` the A row clip is what produces audio and
+    /// what the encoder reads for clip volume, so dragging the V clip's volume
+    /// badge would otherwise be a silent no-op — the same trap the fade
+    /// envelope had before `sync_linked_fades`.
+    pub fn sync_linked_volume(&mut self, from: Uuid) {
+        let Some(volume) = self
+            .timeline
+            .iter()
+            .find(|c| c.id == from)
+            .map(|c| c.volume)
+        else {
+            return;
+        };
+        if let Some(partner) = self.linked_partner_mut(from) {
+            partner.volume = volume;
+        }
+    }
+
+    /// Shift clips on `row` right just far enough to fit `[start, start + duration)`.
+    ///
+    /// Used by drop and by the per-frame move ripple. The push is deliberately
+    /// collision-gated and minimal: only the first clip that overlaps the new
+    /// span — and everything to its right — is shifted, and only by the overlap
+    /// it actually has. That makes the operation idempotent, which matters
+    /// because a drag re-sends its move every frame: an unconditional "push
+    /// everything at/after the anchor by the clip duration" would add the full
+    /// duration on each frame and send the row to infinity.
+    ///
+    /// A clip entirely left of `start` is treated as a legacy overlap: it is
+    /// pushed right so it begins exactly at the new span's end, never pulled
+    /// left (moving further left later cannot drag it back).
+    ///
+    /// A shifted clip carries its separated-audio partner with it: the pair is
+    /// one unit when the row moves out of someone else's way, even though a
+    /// direct drag of the A clip is still a manual nudge (`sync_linked_clip`).
+    /// Without this, rippling a row that holds a V clip would leave its A clip
+    /// behind and silently desync the export.
+    ///
+    /// Returns the distance shifted, 0.0 when the span already fits.
+    pub fn make_room_on_row(
+        &mut self,
+        row: usize,
+        start: f64,
+        duration: f64,
+        except: &[Uuid],
+    ) -> f64 {
+        // Everything this call moves, so a partner reached from two directions
+        // moves once and the cascade terminates.
+        let mut moved = except.to_vec();
+        let mut total = 0.0;
+        self.make_room_inner(row, start, duration, &mut moved, &mut total, true);
+        total
+    }
+
+    fn make_room_inner(
+        &mut self,
+        row: usize,
+        start: f64,
+        duration: f64,
+        moved: &mut Vec<Uuid>,
+        total: &mut f64,
+        count_shift: bool,
+    ) {
+        // Same tolerance the UI uses for butt-joins, so an exact adjacency
+        // (`end == neighbour.start`) never reads as an overlap.
+        const EPS: f64 = 1.0e-6;
+        let end = start + duration;
+
+        let blocker = self
+            .timeline
+            .iter()
+            .filter(|c| c.track_row == row && !moved.contains(&c.id))
+            .filter(|c| c.start_time < end - EPS && c.start_time + c.duration > start + EPS)
+            .map(|c| c.start_time)
+            .fold(f64::INFINITY, f64::min);
+
+        if !blocker.is_finite() {
+            return;
+        }
+        let shift = end - blocker;
+        // Every overlapping clip moves by this one shift. It looks like more
+        // movement than "just clear the overlap": a clip that overlaps the
+        // landing span only from the LEFT (a legacy overlap reaching well past
+        // `start`) is pushed all the way to `end`, not merely nudged. That is
+        // deliberate — shifting by `overlap` instead would leave the pushed
+        // pair still covering part of the span, and clearing it would need a
+        // second pass over the same clip.
+        if shift <= EPS {
+            return;
+        }
+        if count_shift {
+            *total += shift;
+        }
+
+        let ids: Vec<Uuid> = self
+            .timeline
+            .iter()
+            .filter(|c| {
+                c.track_row == row && !moved.contains(&c.id) && c.start_time >= blocker - EPS
+            })
+            .map(|c| c.id)
+            .collect();
+
+        let mut shifted: Vec<(Uuid, usize, f64, f64)> = Vec::new();
+        for id in ids {
+            if let Some(c) = self.timeline.iter_mut().find(|c| c.id == id) {
+                c.start_time += shift;
+                moved.push(id);
+                shifted.push((id, c.track_row, c.start_time, c.duration));
+            }
+        }
+
+        // Carry each shifted clip's partner along, then let the partner's row
+        // ripple for its new span. The partner keeps exactly `shift` — only its
+        // bystanders move — so the pair's geometry stays locked.
+        for (id, _, _, _) in shifted {
+            let Some(partner) = self.mutual_partner(id) else {
+                continue;
+            };
+            if moved.contains(&partner) {
+                continue;
+            }
+            let promoted = self.timeline.iter_mut().find(|c| c.id == partner).map(|c| {
+                c.start_time += shift;
+                (c.track_row, c.start_time, c.duration)
+            });
+            moved.push(partner);
+            if let Some((prow, pstart, pduration)) = promoted {
+                self.make_room_inner(prow, pstart, pduration, moved, total, false);
+            }
+        }
+    }
+
+    /// The clip `id` points at, only when that clip points back.
+    ///
+    /// Unlike [`Self::linked_partner_mut`] this works from either side: ripple
+    /// needs to carry the pair regardless of which row it is shifting.
+    fn mutual_partner(&self, id: Uuid) -> Option<Uuid> {
+        let partner = self.timeline.iter().find(|c| c.id == id)?.linked_clip_id?;
+        self.timeline
+            .iter()
+            .any(|c| c.id == partner && c.linked_clip_id == Some(id))
+            .then_some(partner)
+    }
+
     pub fn delete_selected(&mut self) {
         if let Some(id) = self.selected_timeline_clip.take() {
             self.timeline.retain(|c| c.id != id);
         }
     }
 
-    pub fn delete_selected_library(&mut self) -> Option<std::path::PathBuf> {
-        if let Some(id) = self.selected_library_clip.take() {
-            if let Some(apath) = self
-                .library
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.audio_path.clone())
-            {
-                self.pending_audio_cleanup.push(apath.clone());
+    /// Remove a library entry and every timeline clip that references it.
+    ///
+    /// Returns the entry's temp WAV when no other entry still plays from it,
+    /// so the caller can queue it for deletion. A surviving V clip whose
+    /// separated A partner was removed is un-linked and un-muted: leaving it
+    /// muted with a dangling link is silent video with no way back but undo.
+    pub fn remove_library_clip(&mut self, lib_id: Uuid) -> Option<PathBuf> {
+        let wav = self
+            .library
+            .iter()
+            .find(|l| l.id == lib_id)
+            .and_then(|l| l.audio_path.clone());
+        let doomed: Vec<Uuid> = self
+            .timeline
+            .iter()
+            .filter(|c| c.media_id == lib_id)
+            .map(|c| c.id)
+            .collect();
+        for clip in &mut self.timeline {
+            if clip.linked_clip_id.is_some_and(|p| doomed.contains(&p)) {
+                clip.linked_clip_id = None;
+                clip.audio_muted = false;
             }
-            self.library.retain(|c| c.id != id);
-            self.timeline.retain(|c| c.media_id != id);
         }
-        None
+        self.library.retain(|l| l.id != lib_id);
+        self.timeline.retain(|c| c.media_id != lib_id);
+        wav.filter(|path| !self.audio_path_in_use(path, lib_id))
+    }
+
+    pub fn delete_selected_library(&mut self) -> Option<PathBuf> {
+        let id = self.selected_library_clip.take()?;
+        let wav = self.remove_library_clip(id);
+        if let Some(path) = wav.clone() {
+            self.pending_audio_cleanup.push(path);
+        }
+        wav
     }
 
     pub fn total_duration(&self) -> f64 {
@@ -478,5 +759,542 @@ impl ProjectState {
 
     pub fn active_video_ratio(&self) -> f32 {
         crate::helpers::geometry::aspect_ratio_value(self.aspect_ratio)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_clip(
+        state: &mut ProjectState,
+        start_time: f64,
+        duration: f64,
+        track_row: usize,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        state.timeline.push(TimelineClip {
+            id,
+            media_id: Uuid::new_v4(),
+            start_time,
+            duration,
+            track_row,
+            source_offset: 0.0,
+            volume: 1.0,
+            linked_clip_id: None,
+            audio_muted: false,
+            fade_in_secs: 0.0,
+            fade_in_start_secs: 0.0,
+            fade_out_secs: 0.0,
+            fade_out_end_secs: 0.0,
+            filter: crate::filters::FilterParams::none(),
+        });
+        id
+    }
+
+    /// Create a linked V/A pair the way extract_audio_track does.
+    fn linked_pair(state: &mut ProjectState) -> (Uuid, Uuid) {
+        let video = push_clip(state, 0.0, 10.0, 0);
+        let audio = push_clip(state, 0.0, 10.0, 1);
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .linked_clip_id = Some(audio);
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == audio)
+            .unwrap()
+            .linked_clip_id = Some(video);
+        (video, audio)
+    }
+
+    fn clip(state: &ProjectState, id: Uuid) -> &TimelineClip {
+        state.timeline.iter().find(|c| c.id == id).unwrap()
+    }
+
+    fn push_library(state: &mut ProjectState, path: &str, clip_type: ClipType) -> Uuid {
+        let id = Uuid::new_v4();
+        state.library.push(LibraryClip {
+            id,
+            path: path.into(),
+            name: path.to_string(),
+            duration: 10.0,
+            clip_type,
+            thumbnail_path: None,
+            duration_probed: true,
+            waveform_peaks: Vec::new(),
+            video_size: None,
+            audio_path: None,
+            audio_trimmed_offset: 0.0,
+        });
+        id
+    }
+
+    #[test]
+    fn sync_linked_clip_copies_trimmed_head_geometry() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        // Simulate trimming 2s off the head: start and source offset move,
+        // duration shrinks, tail stays put.
+        let v = state.timeline.iter_mut().find(|c| c.id == video).unwrap();
+        v.start_time = 2.0;
+        v.source_offset = 2.0;
+        v.duration = 8.0;
+        state.sync_linked_clip(video);
+
+        let a = clip(&state, audio);
+        assert_eq!(a.start_time, 2.0);
+        assert_eq!(a.source_offset, 2.0);
+        assert_eq!(a.duration, 8.0);
+        assert_eq!(a.track_row, 1, "partner must stay on its audio row");
+    }
+
+    #[test]
+    fn sync_linked_clip_copies_move() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .start_time = 12.5;
+        state.sync_linked_clip(video);
+
+        assert_eq!(clip(&state, audio).start_time, 12.5);
+    }
+
+    #[test]
+    fn sync_linked_clip_ignores_audio_origin() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        // Nudging the A clip is allowed to break the lock — the video anchor
+        // must not be dragged along.
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == audio)
+            .unwrap()
+            .start_time = 1.0;
+        state.sync_linked_clip(audio);
+
+        assert_eq!(clip(&state, video).start_time, 0.0);
+    }
+
+    #[test]
+    fn sync_linked_clip_ignores_stale_link() {
+        let mut state = ProjectState::default();
+        let (video, _audio) = linked_pair(&mut state);
+        let stranger = push_clip(&mut state, 30.0, 4.0, 1);
+
+        // Point the video at a clip that does not point back.
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .linked_clip_id = Some(stranger);
+        state.sync_linked_clip(video);
+
+        assert_eq!(clip(&state, stranger).start_time, 30.0);
+        assert_eq!(clip(&state, stranger).duration, 4.0);
+    }
+
+    #[test]
+    fn sync_linked_fades_mirrors_video_envelope() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        let v = state.timeline.iter_mut().find(|c| c.id == video).unwrap();
+        v.fade_in_secs = 0.5;
+        v.fade_in_start_secs = 0.25;
+        v.fade_out_secs = 0.75;
+        v.fade_out_end_secs = 0.1;
+        state.sync_linked_fades(video);
+
+        let a = clip(&state, audio);
+        assert_eq!(a.fade_in_secs, 0.5);
+        assert_eq!(a.fade_in_start_secs, 0.25);
+        assert_eq!(a.fade_out_secs, 0.75);
+        assert_eq!(a.fade_out_end_secs, 0.1);
+    }
+
+    #[test]
+    fn sync_linked_volume_mirrors_video_gain() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .volume = 0.4;
+        state.sync_linked_volume(video);
+
+        assert_eq!(clip(&state, audio).volume, 0.4);
+        assert!(
+            (clip(&state, video).volume - 0.4).abs() < 1e-6,
+            "the video clip keeps its own gain too"
+        );
+    }
+
+    #[test]
+    fn sync_linked_volume_ignores_audio_origin() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == audio)
+            .unwrap()
+            .volume = 0.2;
+        state.sync_linked_volume(audio);
+
+        assert_eq!(
+            clip(&state, video).volume,
+            1.0,
+            "editing the separated track must not drag the video clip's gain"
+        );
+    }
+
+    #[test]
+    fn sync_linked_fades_leaves_geometry_alone() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .start_time = 5.0;
+        state.sync_linked_fades(video);
+
+        assert_eq!(clip(&state, audio).start_time, 0.0);
+    }
+
+    #[test]
+    fn extract_audio_carries_gain_and_links_both_ways() {
+        let mut state = ProjectState::default();
+        let media_id = Uuid::new_v4();
+        state.library.push(LibraryClip {
+            id: media_id,
+            path: "C:\\test\\clip.mp4".into(),
+            name: "clip".to_string(),
+            duration: 10.0,
+            clip_type: ClipType::Video,
+            thumbnail_path: None,
+            duration_probed: true,
+            waveform_peaks: Vec::new(),
+            video_size: None,
+            audio_path: None,
+            audio_trimmed_offset: 0.0,
+        });
+        let video = push_clip(&mut state, 1.0, 6.0, 0);
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .media_id = media_id;
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .volume = 0.35;
+        state
+            .timeline
+            .iter_mut()
+            .find(|c| c.id == video)
+            .unwrap()
+            .fade_in_secs = 0.4;
+
+        let audio = state.extract_audio_track(video).unwrap();
+        let a = clip(&state, audio);
+        assert_eq!(a.volume, 0.35, "gain must survive separation");
+        assert_eq!(a.fade_in_secs, 0.4, "fade envelope must survive separation");
+        assert_eq!(a.start_time, 1.0);
+        assert_eq!(a.duration, 6.0);
+        assert_eq!(a.linked_clip_id, Some(video));
+        assert_eq!(clip(&state, video).linked_clip_id, Some(audio));
+        assert!(clip(&state, video).audio_muted);
+    }
+
+    /// Build the V/A library + timeline shape `ExtractAudioTrack` leaves behind
+    /// in the app: the A clip points at its own audio library entry, whose real
+    /// source is the linked video file.
+    fn separated_pair(state: &mut ProjectState) -> (Uuid, Uuid, Uuid, Uuid) {
+        let video_lib = push_library(state, "C:\\test\\clip.mp4", ClipType::Video);
+        let audio_lib = push_library(state, "C:\\test\\clip.mp4", ClipType::Audio);
+        let video_clip = push_clip(state, 0.0, 10.0, 0);
+        let audio_clip = push_clip(state, 0.0, 10.0, 1);
+        for (clip_id, media_id, link, muted) in [
+            (video_clip, video_lib, Some(audio_clip), true),
+            (audio_clip, audio_lib, Some(video_clip), false),
+        ] {
+            let c = state.timeline.iter_mut().find(|c| c.id == clip_id).unwrap();
+            c.media_id = media_id;
+            c.linked_clip_id = link;
+            c.audio_muted = muted;
+        }
+        (video_lib, audio_lib, video_clip, audio_clip)
+    }
+
+    #[test]
+    fn audio_library_source_follows_the_link_to_the_video_file() {
+        let mut state = ProjectState::default();
+        let (video_lib, audio_lib, _video, _audio) = separated_pair(&mut state);
+        state.set_audio_path(video_lib, "C:\\temp\\velocut_audio_v.wav".into(), 0.0);
+
+        assert_eq!(
+            state.audio_library_source(audio_lib),
+            Some(PathBuf::from("C:\\test\\clip.mp4")),
+            "separated audio must be re-derivable from the linked video clip"
+        );
+    }
+
+    #[test]
+    fn audio_library_source_ignores_standalone_audio() {
+        let mut state = ProjectState::default();
+        let lib = push_library(&mut state, "C:\\test\\music.mp3", ClipType::Audio);
+        let a1 = push_clip(&mut state, 0.0, 10.0, 1);
+        let a2 = push_clip(&mut state, 0.0, 10.0, 3);
+        for clip_id in [a1, a2] {
+            state
+                .timeline
+                .iter_mut()
+                .find(|c| c.id == clip_id)
+                .unwrap()
+                .media_id = lib;
+        }
+
+        assert_eq!(state.audio_library_source(lib), None);
+    }
+
+    #[test]
+    fn audio_path_in_use_reports_shared_wavs_only() {
+        let mut state = ProjectState::default();
+        let first = push_library(&mut state, "C:\\test\\a.mp4", ClipType::Video);
+        let second = push_library(&mut state, "C:\\test\\a.mp4", ClipType::Audio);
+        let wav = PathBuf::from("C:\\temp\\velocut_audio_shared.wav");
+        state.set_audio_path(first, wav.clone(), 0.0);
+        state.set_audio_path(second, wav.clone(), 0.0);
+
+        assert!(state.audio_path_in_use(&wav, first));
+        assert!(state.audio_path_in_use(&wav, second));
+
+        state.library.retain(|l| l.id != first && l.id != second);
+        assert!(!state.audio_path_in_use(&wav, first));
+    }
+
+    #[test]
+    fn remove_library_clip_unmutes_surviving_video_partner() {
+        let mut state = ProjectState::default();
+        let (_video_lib, audio_lib, video_clip, audio_clip) = separated_pair(&mut state);
+
+        let wav = state.remove_library_clip(audio_lib);
+
+        assert!(wav.is_none(), "no WAV was attached to the A entry");
+        assert!(state.timeline.iter().all(|c| c.id != audio_clip));
+        let video = clip(&state, video_clip);
+        assert_eq!(video.linked_clip_id, None);
+        assert!(
+            !video.audio_muted,
+            "deleting the separated track must restore V audio"
+        );
+    }
+
+    #[test]
+    fn remove_library_clip_keeps_a_wav_another_entry_still_uses() {
+        let mut state = ProjectState::default();
+        let (video_lib, audio_lib, _video, _audio) = separated_pair(&mut state);
+        let wav = PathBuf::from("C:\\temp\\velocut_audio_shared.wav");
+        state.set_audio_path(video_lib, wav.clone(), 0.0);
+        state.set_audio_path(audio_lib, wav.clone(), 0.0);
+
+        assert_eq!(state.remove_library_clip(audio_lib), None);
+        assert_eq!(
+            state
+                .library
+                .iter()
+                .find(|l| l.id == video_lib)
+                .unwrap()
+                .audio_path,
+            Some(wav)
+        );
+    }
+
+    #[test]
+    fn remove_library_clip_returns_unreferenced_wav() {
+        let mut state = ProjectState::default();
+        let (video_lib, _audio_lib, _video, audio_clip) = separated_pair(&mut state);
+        let wav = PathBuf::from("C:\\temp\\velocut_audio_v.wav");
+        state.set_audio_path(video_lib, wav.clone(), 0.0);
+
+        assert_eq!(state.remove_library_clip(video_lib), Some(wav));
+        assert!(state.library.iter().all(|l| l.id != video_lib));
+        // The separated A clip outlives the video entry as standalone audio.
+        assert_eq!(state.timeline.len(), 1);
+        assert_eq!(state.timeline[0].id, audio_clip);
+        assert_eq!(state.timeline[0].linked_clip_id, None);
+    }
+
+    // ── make_room_on_row ──────────────────────────────────────────────────────
+
+    #[test]
+    fn make_room_leaves_a_fitting_span_alone() {
+        let mut state = ProjectState::default();
+        let right = push_clip(&mut state, 10.0, 2.0, 0);
+
+        assert_eq!(state.make_room_on_row(0, 0.0, 5.0, &[]), 0.0);
+        assert_eq!(clip(&state, right).start_time, 10.0);
+    }
+
+    #[test]
+    fn make_room_pushes_the_blocker_and_everything_after_it() {
+        let mut state = ProjectState::default();
+        let blocker = push_clip(&mut state, 2.0, 4.0, 0);
+        let later = push_clip(&mut state, 8.0, 2.0, 0);
+
+        // [1, 4) lands on the blocker; push it (and the later clip) by 2s.
+        assert_eq!(state.make_room_on_row(0, 1.0, 3.0, &[]), 2.0);
+        assert_eq!(clip(&state, blocker).start_time, 4.0);
+        assert_eq!(clip(&state, later).start_time, 10.0);
+    }
+
+    #[test]
+    fn make_room_only_touches_the_target_row() {
+        let mut state = ProjectState::default();
+        let other_row = push_clip(&mut state, 2.0, 4.0, 1);
+
+        state.make_room_on_row(0, 0.0, 6.0, &[]);
+        assert_eq!(clip(&state, other_row).start_time, 2.0);
+    }
+
+    #[test]
+    fn make_room_excludes_the_moving_clip_and_its_partner() {
+        let mut state = ProjectState::default();
+        let moving = push_clip(&mut state, 0.0, 4.0, 0);
+        let partner = push_clip(&mut state, 0.0, 4.0, 1);
+
+        let shift = state.make_room_on_row(0, 0.0, 4.0, &[moving, partner]);
+        assert_eq!(shift, 0.0);
+        assert_eq!(clip(&state, moving).start_time, 0.0);
+    }
+
+    #[test]
+    fn make_room_is_idempotent_across_drag_frames() {
+        let mut state = ProjectState::default();
+        let moving = push_clip(&mut state, 0.0, 2.0, 0);
+        let blocker = push_clip(&mut state, 10.0, 5.0, 0);
+        state.timeline.retain(|c| c.id != moving);
+
+        // Simulate 100 frames of a slow 10s drag. The blocker must follow the
+        // moving edge, not gain a full clip duration per frame.
+        for frame in 1..=100 {
+            state.make_room_on_row(0, frame as f64 * 0.1, 2.0, &[]);
+        }
+        assert!(
+            (clip(&state, blocker).start_time - 12.0).abs() < 1e-6,
+            "blocker ended at {}, expected the moved span's end (12.0)",
+            clip(&state, blocker).start_time
+        );
+    }
+
+    #[test]
+    fn make_room_never_pulls_a_clip_back_left() {
+        let mut state = ProjectState::default();
+        let blocker = push_clip(&mut state, 2.0, 4.0, 0);
+
+        // Land inside the blocker: it moves to the new span's end.
+        assert_eq!(state.make_room_on_row(0, 1.0, 3.0, &[]), 2.0);
+        let after_first = clip(&state, blocker).start_time;
+        // Dragging further left shrinks the needed room; the clip stays put.
+        assert_eq!(state.make_room_on_row(0, 0.5, 3.0, &[]), 0.0);
+        assert_eq!(clip(&state, blocker).start_time, after_first);
+    }
+
+    #[test]
+    fn make_room_carries_a_linked_pair_together() {
+        let mut state = ProjectState::default();
+        let (video, audio) = linked_pair(&mut state);
+        // The pair sits at 10.0..20.0; a span ending at 15.0 lands on it.
+        for id in [video, audio] {
+            state
+                .timeline
+                .iter_mut()
+                .find(|c| c.id == id)
+                .unwrap()
+                .start_time = 10.0;
+        }
+
+        let shift = state.make_room_on_row(0, 0.0, 15.0, &[]);
+
+        assert_eq!(shift, 5.0);
+        assert_eq!(clip(&state, video).start_time, 15.0);
+        assert_eq!(
+            clip(&state, audio).start_time,
+            15.0,
+            "the separated A clip must not be left behind by a ripple"
+        );
+    }
+
+    #[test]
+    fn make_room_cascades_through_a_partner_row() {
+        let mut state = ProjectState::default();
+        // V1/A1 pair at 10.0, plus a standalone A clip butt-joined at 20.0.
+        let (video, audio) = linked_pair(&mut state);
+        for id in [video, audio] {
+            state
+                .timeline
+                .iter_mut()
+                .find(|c| c.id == id)
+                .unwrap()
+                .start_time = 10.0;
+        }
+        let bystander = push_clip(&mut state, 20.0, 1.0, 1);
+
+        // Span [0, 15) pushes the pair by 5; the A's new span [15, 25) then
+        // pushes the bystander clear instead of overlapping it.
+        state.make_room_on_row(0, 0.0, 15.0, &[]);
+
+        assert_eq!(clip(&state, video).start_time, 15.0);
+        assert_eq!(clip(&state, audio).start_time, 15.0);
+        assert!(
+            clip(&state, bystander).start_time >= 25.0 - 1e-6,
+            "A-row bystander was not pushed clear of the moved pair"
+        );
+    }
+
+    #[test]
+    fn add_to_timeline_ripples_off_an_occupied_spot() {
+        let mut state = ProjectState::default();
+        let existing = push_clip(&mut state, 0.0, 2.0, 0);
+        // Library duration 2s, so the drop spans [1, 3) and collides.
+        let lib = push_library(&mut state, "C:\\test\\drop.mp4", ClipType::Video);
+        state
+            .library
+            .iter_mut()
+            .find(|l| l.id == lib)
+            .unwrap()
+            .duration = 2.0;
+
+        state.add_to_timeline(lib, 1.0, 0);
+
+        let dropped = state.timeline.iter().find(|c| c.media_id == lib).unwrap();
+        assert_eq!(dropped.start_time, 1.0, "the drop keeps its snapped spot");
+        assert!(
+            clip(&state, existing).start_time >= dropped.start_time + dropped.duration - 1e-6,
+            "the existing clip must be pushed clear of the drop"
+        );
     }
 }
