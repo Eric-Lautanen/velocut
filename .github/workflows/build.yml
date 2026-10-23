@@ -52,11 +52,12 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          # nasm only: MSYS2 no longer publishes mingw-w64-x86_64-yasm, and
+          # FFmpeg's x86 asm path uses nasm anyway.
           install: >-
             mingw-w64-x86_64-rust
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-yasm
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-x264
