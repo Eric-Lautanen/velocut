@@ -12,11 +12,12 @@
 //     ├── audio_stream        — rodio OutputStream (must outlive all sinks)
 //     └── audio_sinks         — per-clip Sink map (managed by audio_module only)
 
+use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
 use crate::velocut_log;
 use eframe::egui;
 use rodio::{MixerDeviceSink, Player};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use velocut_core::media_types::PlaybackFrame;
 use velocut_core::state::ProjectState;
@@ -76,6 +77,19 @@ pub struct CacheContext {
 
     /// Last time each media_id was accessed (for time-based eviction).
     pub scrub_texture_access: std::collections::HashMap<Uuid, std::time::Instant>,
+
+    /// Persistent GPU texture handles for the playback path, keyed by media_id.
+    ///
+    /// Same contract as `scrub_textures`, and deliberately a separate map: the
+    /// `frame_cache` entry for a clip is usually a clone of a scrub or thumbnail
+    /// texture, and `TextureHandle::set()` writes through the shared Arc — mutating
+    /// one of those would overwrite the pixels `frame_bucket_cache` and
+    /// `thumbnail_cache` still point at. Owning the handle here means every `set`
+    /// only ever touches pixels the playback path produced itself.
+    ///
+    /// Stores `(handle, width, height)` so a dimension change is detectable in O(1)
+    /// and falls back to a fresh allocation, exactly like the scrub path.
+    pub pb_textures: HashMap<Uuid, (egui::TextureHandle, u32, u32)>,
 }
 
 impl CacheContext {
@@ -89,6 +103,7 @@ impl CacheContext {
             frame_cache_bytes: 0,
             scrub_textures: HashMap::new(),
             scrub_texture_access: std::collections::HashMap::new(),
+            pb_textures: HashMap::new(),
         }
     }
 
@@ -156,6 +171,7 @@ impl CacheContext {
         self.frame_bucket_cache.clear();
         self.scrub_textures.clear();
         self.scrub_texture_access.clear();
+        self.pb_textures.clear();
         self.pending_pb_frame = None;
         self.frame_cache_bytes = 0;
     }
@@ -198,6 +214,17 @@ pub struct PlaybackContext {
     /// Wall-clock instant the scrub head last moved (for 150 ms L3 debounce).
     pub scrub_last_moved: Option<std::time::Instant>,
 
+    /// Counter handed out as `req_seq` on every scrub-path request (L2 exact,
+    /// L2b coarse, L2/HQ transition, L3 HQ). Monotone within the session.
+    pub scrub_req_seq: u64,
+
+    /// Highest `req_seq` accepted into the display path so far. A scrub or
+    /// transition result whose sequence is older arrived out of order from one
+    /// of the concurrent decode executors — e.g. a slow L2 blend finishing
+    /// after the idle-triggered L3 HQ blend — and must never overwrite the
+    /// newer frame already shown.
+    pub scrub_seq_watermark: u64,
+
     /// Which clip the live-playback thread is currently decoding.
     pub playback_media_id: Option<Uuid>,
 
@@ -220,6 +247,8 @@ impl PlaybackContext {
             last_frame_req: None,
             scrub_coarse_req: None,
             scrub_last_moved: None,
+            scrub_req_seq: 0,
+            scrub_seq_watermark: 0,
             playback_media_id: None,
             prev_playing: false,
             audio_was_playing: false,
@@ -235,6 +264,9 @@ impl PlaybackContext {
         self.last_frame_req = None;
         self.scrub_coarse_req = None;
         self.scrub_last_moved = None;
+        // The sequence counter must NOT reset here: in-flight results from the
+        // old project still carry seq numbers below the running counter, and a
+        // reset could let them through the watermark gate.
         self.playback_media_id = None;
         self.prev_playing = false;
         self.audio_was_playing = false;
@@ -260,6 +292,37 @@ pub struct AppContext {
     pub audio_stream: Option<MixerDeviceSink>,
     pub audio_sinks: HashMap<Uuid, Player>,
     pub audio_overlay_sinks: HashMap<Uuid, rodio::Player>,
+
+    /// Library ids whose WAV temp file was (re-)written by an accepted
+    /// `MediaResult::AudioPath`. Written by `ingest_media_results`, consumed
+    /// and cleared by the AudioModule each tick: every rodio sink belongs to a
+    /// session of that WAV file — the old extraction — and the re-extraction
+    /// rewrote the file under the open decoder, so live sinks must be drained
+    /// and their tracking state cleared so they rebuild from the new content.
+    /// Keyed by library id; AudioModule resolves the timeline clips through
+    /// `TimelineClip::media_id`.
+    pub pending_audio_wav_rebuild: HashSet<Uuid>,
+}
+
+/// A decoded video frame routed to `AppContext::ingest_video_frame`.
+///
+/// `id` is the media id the decoder was asked for, `req_ts` the source-file
+/// timestamp of that request, and `coarse`/`transition` classify the request
+/// tier so ingest can store the result in the right lane (see the fn docs).
+struct VideoFrameResult {
+    id: Uuid,
+    req_ts: f64,
+    /// Echoed UI request sequence (`MediaResult` field `req_seq`). 0 means
+    /// untracked and bypasses the watermark gate.
+    seq: u64,
+    /// Echoed blend factor (transition results only; 0.0 otherwise). Compared
+    /// against the active zone's alpha in the transition freshness gate.
+    alpha: f32,
+    coarse: bool,
+    transition: bool,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
 }
 
 impl AppContext {
@@ -275,6 +338,7 @@ impl AppContext {
             audio_stream: None,
             audio_sinks: HashMap::new(),
             audio_overlay_sinks: HashMap::new(),
+            pending_audio_wav_rebuild: HashSet::new(),
         }
     }
 
@@ -302,18 +366,27 @@ impl AppContext {
         // loop typically executes 0 or 1 iterations per frame.
         while let Ok(result) = self.media_worker.scrub_rx.try_recv() {
             match result {
-                // Single-clip scrub frame (regular scrub thread)
+                // Single-clip scrub frame (exact or coarse scrub thread)
                 MediaResult::VideoFrame {
                     id,
+                    req_ts,
+                    req_seq,
                     width,
                     height,
                     data,
                 } => {
                     self.ingest_video_frame(
-                        id,
-                        width,
-                        height,
-                        data,
+                        VideoFrameResult {
+                            id,
+                            req_ts,
+                            seq: req_seq,
+                            alpha: 0.0,
+                            coarse: false,
+                            transition: false,
+                            width,
+                            height,
+                            data,
+                        },
                         state,
                         &mut needs_repaint,
                         ctx,
@@ -322,15 +395,25 @@ impl AppContext {
                 // Blended transition frame (transition scrub thread)
                 MediaResult::TransitionVideoFrame {
                     id,
+                    req_ts,
+                    req_seq,
+                    alpha,
                     width,
                     height,
                     data,
                 } => {
                     self.ingest_video_frame(
-                        id,
-                        width,
-                        height,
-                        data,
+                        VideoFrameResult {
+                            id,
+                            req_ts,
+                            seq: req_seq,
+                            alpha,
+                            coarse: false,
+                            transition: true,
+                            width,
+                            height,
+                            data,
+                        },
                         state,
                         &mut needs_repaint,
                         ctx,
@@ -348,9 +431,25 @@ impl AppContext {
                     id,
                     path,
                     trimmed_offset,
+                    generation,
                 } => {
-                    velocut_log!("[audio] AudioPath arrived id={id} path={} trimmed_offset={trimmed_offset:.3}", path.display());
-                    state.set_audio_path(id, path, trimmed_offset);
+                    // Session-generation gate: see `audio_path_is_current`.
+                    if !audio_path_is_current(&self.media_worker, id, generation) {
+                        let expected = self.media_worker.audio_generation_of(id);
+                        velocut_log!(
+                            "[audio] dropping stale AudioPath id={id} gen={generation} expected={expected} path={}",
+                            path.display()
+                        );
+                    } else {
+                        velocut_log!("[audio] AudioPath arrived id={id} path={} trimmed_offset={trimmed_offset:.3}", path.display());
+                        state.set_audio_path(id, path, trimmed_offset);
+                        // The WAV file was rewritten on disk. Every live sink
+                        // is a session of the OLD extraction — drain it and
+                        // clear its tracking so AudioModule rebuilds from the
+                        // new content on the next tick.
+                        self.pending_audio_wav_rebuild.insert(id);
+                        needs_repaint = true;
+                    }
                 }
 
                 MediaResult::Duration { id, seconds } => {
@@ -403,19 +502,28 @@ impl AppContext {
                 }
 
                 // VideoFrame on the shared channel = HQ one-shot frame from
-                // extract_frame_hq.  Scrub frames no longer arrive here —
-                // they travel on scrub_rx and are consumed above.
+                // request_frame_hq / extract_frame_hq.  Scrub frames travel on
+                // scrub_rx and are consumed above.
                 MediaResult::VideoFrame {
                     id,
+                    req_ts,
+                    req_seq,
                     width,
                     height,
                     data,
                 } => {
                     self.ingest_video_frame(
-                        id,
-                        width,
-                        height,
-                        data,
+                        VideoFrameResult {
+                            id,
+                            req_ts,
+                            seq: req_seq,
+                            alpha: 0.0,
+                            coarse: false,
+                            transition: false,
+                            width,
+                            height,
+                            data,
+                        },
                         state,
                         &mut needs_repaint,
                         ctx,
@@ -467,31 +575,95 @@ impl AppContext {
         }
     }
 
-    /// Shared logic for handling a VideoFrame result from either channel.
+    /// Shared logic for handling a video-frame result from either channel.
     ///
-    /// Factored out so both the scrub_rx fast path and the shared rx path
-    /// (HQ frames from extract_frame_hq) go through identical bucket-cache
-    /// and frame_cache logic without duplication.
-    #[allow(clippy::too_many_arguments)]
+    /// Factored out so the scrub_rx fast path and the shared rx path (HQ
+    /// one-shot frames) go through identical bucket-cache and frame_cache
+    /// logic without duplication.
+    ///
+    /// `req_ts` is the source timestamp the decoder was requested for, `coarse`
+    /// marks an L2b look-ahead prefetch, `transition` marks a blended zone
+    /// frame. All three attributes let the ingest reject results that belong
+    /// to a position the playhead has already left — without this gate, a
+    /// slow or out-of-order decode overwrites the live frame with a stale one
+    /// and the frame then persists in the caches.
     fn ingest_video_frame(
         &mut self,
-        id: Uuid,
-        width: u32,
-        height: u32,
-        mut data: Vec<u8>,
+        frame: VideoFrameResult,
         state: &mut ProjectState,
         needs_repaint: &mut bool,
         ctx: &egui::Context,
     ) {
+        let VideoFrameResult {
+            id,
+            req_ts,
+            seq,
+            alpha,
+            coarse,
+            transition,
+            width,
+            height,
+            data,
+        } = frame;
+        let mut data = data;
+        // ── Freshness gate ───────────────────────────────────────────────────
+        // Animate only results whose request matches the current playhead.
+        // Blend frames must align with the zone actually under the playhead;
+        // single-clip frames must align with the video clip covering it.
+        if transition {
+            let fresh = clip_query::active_transition_at(state).is_some_and(|z| {
+                (z.clip_a_source_ts - req_ts).abs() <= 0.5
+                    // Two results from different moments of the same zone (or
+                    // a neighbouring zone sharing the same clip pair) cannot be
+                    // told apart by timestamp alone — clip_a_source_ts is a
+                    // per-zone-pair constant. A wrong-alpha blend replacing a
+                    // correct one is exactly the preview-flush class the seq
+                    // watermark fixed for executor races, so the blend factor
+                    // must also still match the playhead's zone position.
+                    && transition_alpha_fresh(z.alpha, alpha)
+            });
+            if !fresh {
+                return;
+            }
+        } else if coarse {
+            // Coarse prefetches are only meaningful while the coarse request
+            // they belong to is still the latest one for this media id.
+            let fresh = self
+                .playback
+                .scrub_coarse_req
+                .is_some_and(|(rid, cb)| rid == id && (cb as f64 * 2.0 - req_ts).abs() < 0.01);
+            if !fresh {
+                return;
+            }
+        } else {
+            let fresh =
+                clip_query::video_clip_at_time(state, state.current_time).is_some_and(|c| {
+                    c.media_id == id
+                        && (state.current_time - c.start_time + c.source_offset - req_ts).abs()
+                            <= 0.5
+                });
+            if !fresh {
+                return;
+            }
+        }
+        // ── Out-of-order completion gate (sequence watermark) ─────────────────
+        // The scrub executors run CONCURRENTLY (persistent L2/L2b slot threads,
+        // one-shot HQ threads, the persistent transition thread all feed the
+        // same result channel), so completions can arrive out of request order.
+        // A result older than what has already been accepted must never replace
+        // a newer frame: a slow L2 transition blend finishing after the
+        // idle-triggered L3 HQ blend would otherwise downgrade the displayed
+        // frame from native-res to panel-res. `seq == 0` marks an untracked
+        // (legacy/PNG-path) sender and bypasses the gate. Coarse prefetches are
+        // excluded — they are never displayed and only warm the coarse bucket.
+        if !coarse && seq != 0 {
+            if !seq_accepts(self.playback.scrub_seq_watermark, seq) {
+                return;
+            }
+            self.playback.scrub_seq_watermark = seq;
+        }
         {
-            let active_filter = state
-                .timeline
-                .iter()
-                .find(|c| {
-                    c.track_row % 2 == 0
-                        && state.current_time >= c.start_time
-                        && state.current_time < c.start_time + c.duration
-                })
+            let active_filter = clip_query::video_clip_at_time(state, state.current_time)
                 .map(|c| c.filter.clone())
                 .unwrap_or_default();
 
@@ -558,47 +730,146 @@ impl AppContext {
             self.cache.scrub_texture_access.remove(&old_id);
         }
 
-        // Derive the ¼s bucket key for frame_bucket_cache.
-        // playback.last_frame_req stores exact f64 ts - convert here.
-        let (bucket, is_coarse) = self
-            .playback
-            .last_frame_req
-            .filter(|(rid, _)| *rid == id)
-            .map(|(_, ts)| ((ts * 4.0) as u32, false))
-            .or_else(|| {
-                self.playback
-                    .scrub_coarse_req
-                    .filter(|(rid, _)| *rid == id)
-                    .map(|(_, cb)| (cb * 8, true))
-            })
-            .unwrap_or_else(|| {
-                state
-                    .timeline
-                    .iter()
-                    .find(|c| c.media_id == id)
-                    .map(|c| {
-                        // Match the local_t formula in video_module::tick():
-                        // source-relative time = timeline time + source_offset.
-                        let lt = (state.current_time - c.start_time + c.source_offset).max(0.0);
-                        ((lt * 4.0) as u32, false)
-                    })
-                    .unwrap_or((0, false))
-            });
+        // Bucket key comes from the REQUEST's own timestamp — the request is
+        // the single source of truth, so a result can never be mis-bucketed
+        // under a later request's position (the old last_frame_req-derived key
+        // stored coarse frames in fine buckets when both tiers were in flight).
+        let bucket = (req_ts * 4.0) as u32;
 
         let tex = self.cache.insert_bucket_frame(
-            (id, bucket, is_coarse),
+            (id, bucket, coarse),
             tex,
             width as usize,
             height as usize,
             state.current_time,
         );
 
-        // During playback the pb channel owns frame_cache — a late-arriving
-        // scrub result would overwrite the correct playback frame with a
-        // wrong-position one.  Skip the frame_cache write while playing.
-        if !state.is_playing {
+        // Coarse prefetch frames are warm-up only — they must never become the
+        // displayed frame. During playback the pb channel owns frame_cache —
+        // a late-arriving scrub result would overwrite the correct playback
+        // frame with a wrong-position one. Skip the write while playing.
+        if !coarse && !state.is_playing {
             self.cache.frame_cache.insert(id, tex);
             *needs_repaint = true;
         }
+    }
+}
+
+/// Body of the `MediaResult::AudioPath` session-generation gate, split out so
+/// tests can pin the superseded-extraction cases without a full ingest
+/// round-trip — the ingest-side analog of the video path's `recv_session_frame`.
+///
+/// WAV-extraction requests for the same library id supersede each other and
+/// the two WAVs can carry different content windows, while the accepted
+/// result's `trimmed_offset` drives the `wav_seek_t` seek math. Accepting a
+/// result whose request has since been superseded would make the seek math
+/// describe a window the current WAV does not hold.
+fn audio_path_is_current(worker: &MediaWorker, id: Uuid, generation: u64) -> bool {
+    worker.audio_generation_of(id) == generation
+}
+
+/// Monotone accept rule for out-of-order decode completions.
+///
+/// `watermark` is the highest accepted sequence so far. `seq == 0` marks an
+/// untracked (legacy, PNG-path) sender and is always accepted.
+fn seq_accepts(watermark: u64, seq: u64) -> bool {
+    seq == 0 || seq >= watermark
+}
+
+/// Blend-factor fitness of a transition result against the active zone.
+///
+/// The seq watermark already rejects out-of-order completions, so this rule
+/// only has to catch the remaining staleness class: a result whose alpha no
+/// longer matches the playhead's position in the zone (a fast scrub that got
+/// a far-away-alpha blend as the last accepted one). Fine-grained mismatches
+/// (a few percent) are kept — no better frame is in flight and rejecting
+/// them would just freeze the preview on the older blend.
+const TRANSITION_ALPHA_GAP: f32 = 0.05;
+
+fn transition_alpha_fresh(zone_alpha: f32, result_alpha: f32) -> bool {
+    (zone_alpha - result_alpha).abs() <= TRANSITION_ALPHA_GAP
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::seq_accepts;
+
+    #[test]
+    fn slow_l2_blend_cannot_downgrade_a_accepted_l3_hq_result() {
+        // The exact scenario from the Area A audit: L3 HQ blend (seq 8) is
+        // accepted, then a slow L2 blend (seq 7) finishes and must be rejected.
+        let mut watermark = 0u64;
+        for seq in [3u64, 5, 8] {
+            assert!(seq_accepts(watermark, seq), "seq {seq} must be accepted");
+            watermark = watermark.max(seq);
+        }
+        assert!(
+            !seq_accepts(watermark, 7),
+            "seq 7 arrives after seq 8 → reject"
+        );
+        // A fresh request (seq 9) is still accepted afterwards.
+        assert!(seq_accepts(watermark, 9));
+    }
+
+    #[test]
+    fn in_order_results_are_all_accepted() {
+        for seq in [1u64, 2, 3, 4] {
+            assert!(seq_accepts(seq - 1, seq), "watermark {seq}-1, seq {seq}");
+        }
+    }
+
+    #[test]
+    fn untracked_senders_always_pass() {
+        assert!(seq_accepts(1000, 0));
+    }
+
+    #[test]
+    fn wrong_alpha_blends_are_rejected_close_ones_kept() {
+        use super::{transition_alpha_fresh, TRANSITION_ALPHA_GAP};
+        // Cross-zone / far-position blends must not replace the displayed one.
+        assert!(!transition_alpha_fresh(0.9, 0.2));
+        assert!(!transition_alpha_fresh(0.0, 0.5));
+        // A blend within the tolerance is kept even when it is slightly off.
+        assert!(transition_alpha_fresh(0.30, 0.302));
+        assert!(transition_alpha_fresh(0.0, TRANSITION_ALPHA_GAP));
+        assert!(!transition_alpha_fresh(0.0, TRANSITION_ALPHA_GAP * 2.0));
+    }
+}
+
+#[cfg(test)]
+mod audio_path_gate_tests {
+    //! The WAV-extraction session gate (see `audio_path_is_current`): extraction
+    //! requests for the same library id supersede each other and the ingest may
+    //! only accept a result stamped with the id's latest generation.
+
+    use super::audio_path_is_current;
+    use velocut_media::MediaWorker;
+
+    #[test]
+    fn stale_audio_path_rejected_and_current_accepted() {
+        let worker = MediaWorker::new();
+        let id = uuid::Uuid::new_v4();
+
+        // Missing paths are fine: the request's epoch is bumped synchronously
+        // on the caller thread, which is what we pin; extraction soft-fails.
+        worker.extract_audio_trimmed(id, std::path::PathBuf::from("m1.wav"), 0.0, f64::MAX);
+        let gen1 = worker.audio_generation_of(id);
+        assert_ne!(gen1, 0);
+        assert!(audio_path_is_current(&worker, id, gen1));
+
+        // A second request for the same id supersedes the first.
+        worker.extract_audio_trimmed(id, std::path::PathBuf::from("m2.wav"), 1.5, 3.0);
+        let gen2 = worker.audio_generation_of(id);
+        assert_ne!(gen1, gen2);
+        assert!(
+            !audio_path_is_current(&worker, id, gen1),
+            "a superseded extraction's AudioPath must be rejected"
+        );
+        assert!(audio_path_is_current(&worker, id, gen2));
+
+        // A result for an id that has never had a request is always stale:
+        // the counter starts at 1 and the accessor defaults to 0.
+        let other = uuid::Uuid::new_v4();
+        assert!(!audio_path_is_current(&worker, other, gen2));
     }
 }

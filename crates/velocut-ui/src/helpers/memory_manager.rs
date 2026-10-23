@@ -227,6 +227,9 @@ impl MemoryManager {
         // is no reason to hold those GPU allocations any longer.
         let textures_before = cache.scrub_textures.len();
         cache.scrub_textures.clear();
+        // Same reasoning for the playback handles: one GPU texture per clip played
+        // since the last flush, held so playback can `set()` instead of allocating.
+        cache.pb_textures.clear();
 
         ctx.forget_all_images();
 

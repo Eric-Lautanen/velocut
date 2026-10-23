@@ -163,10 +163,6 @@ impl Default for ExportModule {
 }
 
 impl EditorModule for ExportModule {
-    fn name(&self) -> &str {
-        "Export"
-    }
-
     fn ui(
         &mut self,
         ui: &mut Ui,

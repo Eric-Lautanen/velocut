@@ -17,16 +17,99 @@ use velocut_core::commands::EditorCommand;
 use velocut_core::media_types::{PlaybackFrame, PlaybackTransitionSpec, TransitionScrubRequest};
 use velocut_core::state::ProjectState;
 use velocut_core::transitions::TransitionKind;
+use velocut_media::{FrameRequest, MediaWorker};
 
 pub struct VideoModule;
+
+/// Drain the playback channel, returning the next frame that belongs to the
+/// current playback session.
+///
+/// Every Start/StartBlend/Stop bumps the worker's session generation; frames
+/// produced under an older session are discarded here instead of being shown.
+/// This closes the cross-session wrong-alpha window: the `pb_rx` flush inside
+/// `start_playback`/`start_blend_playback` is not atomic with the pb thread's
+/// blocking sends, and a dropped `Stop` lets the dying session keep producing —
+/// in both cases the in-flight frames can carry a matching clip id and a
+/// timestamp inside the ±0.5 s windows but content blended under the OLD spec
+/// (old alpha), and the id/timestamp-only guards would accept them.
+/// Returns `None` once the channel holds nothing but stale frames (or nothing).
+fn recv_session_frame(worker: &MediaWorker) -> Option<PlaybackFrame> {
+    recv_gen(&worker.pb_rx, worker.playback_generation())
+}
+
+/// Body of the session-generation gate, split out so tests can feed a channel
+/// directly and pin each cross-session rejection case from the audit.
+fn recv_gen(
+    pb_rx: &crossbeam_channel::Receiver<PlaybackFrame>,
+    expected: u64,
+) -> Option<PlaybackFrame> {
+    loop {
+        match pb_rx.try_recv() {
+            Ok(f) if f.generation == expected => return Some(f),
+            Ok(_) => continue, // stale generation — cross-session frame
+            Err(_) => return None,
+        }
+    }
+}
+
+/// How many playback textures may stay allocated. Playback touches one clip at a
+/// time (transitions included — the frame carries the primary clip's id), so this
+/// only has to cover the clips a session bounced between recently.
+const MAX_PB_TEXTURES: usize = 4;
+
+/// Upload one playback frame into `id`'s persistent texture.
+///
+/// `load_texture` with a fresh name allocates a GPU texture, registers it, and —
+/// since egui frees textures whose last handle dropped — destroys the previous
+/// frame's: one alloc/free pair, plus a discarded preview-sized `ColorImage`, per
+/// displayed frame. Reusing a `TextureHandle` and calling `set()` on it is a plain
+/// in-place upload, which is what the scrub path already does.
+///
+/// The handle is taken from `pb_textures`, not from `frame_cache`: the frame_cache
+/// entry for a clip is often a clone of a scrub or thumbnail texture, and `set()`
+/// writes through the Arc — mutating one of those would corrupt the pixels that
+/// `frame_bucket_cache` and `thumbnail_cache` still reference.
+fn upload_playback_texture(
+    ctx: &mut AppContext,
+    egui_ctx: &egui::Context,
+    id: Uuid,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let image =
+        || egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba);
+    let reusable = matches!(
+        ctx.cache.pb_textures.get(&id),
+        Some((_, w, h)) if *w == width && *h == height
+    );
+    if reusable {
+        let (handle, _, _) = ctx.cache.pb_textures.get_mut(&id).unwrap();
+        handle.set(image(), egui::TextureOptions::LINEAR);
+        let tex = handle.clone();
+        ctx.cache.frame_cache.insert(id, tex);
+        return;
+    }
+    // Cold path: first frame for this clip, or its preview size changed.
+    let tex = egui_ctx.load_texture(format!("pb-{id}"), image(), egui::TextureOptions::LINEAR);
+    ctx.cache.frame_cache.insert(id, tex.clone());
+    ctx.cache.pb_textures.insert(id, (tex, width, height));
+    if ctx.cache.pb_textures.len() > MAX_PB_TEXTURES {
+        if let Some(old) = ctx.cache.pb_textures.keys().copied().find(|k| *k != id) {
+            ctx.cache.pb_textures.remove(&old);
+        }
+    }
+}
 
 impl VideoModule {
     // ── Public helpers ────────────────────────────────────────────────────────
 
     /// Returns the media_id of the timeline clip currently under the playhead.
     /// Used by app.rs to do the thumbnail→frame swap for the preview panel.
+    /// Video rows only — the preview must never treat an extracted A-row audio
+    /// clip as the clip whose frame is displayed.
     pub fn active_media_id(state: &ProjectState) -> Option<Uuid> {
-        clip_query::clip_at_time(state, state.current_time).map(|c| c.media_id)
+        clip_query::video_clip_at_time(state, state.current_time).map(|c| c.media_id)
     }
 
     // ── poll_playback ─────────────────────────────────────────────────────────
@@ -38,8 +121,11 @@ impl VideoModule {
     /// and only promote a frame to frame_cache once wall-clock current_time
     /// has caught up to that frame's PTS.
     pub fn poll_playback(state: &ProjectState, ctx: &mut AppContext, egui_ctx: &egui::Context) {
-        // Find clip under playhead — we need both pb_local_t and media_id.
-        let current_clip = clip_query::clip_at_time(state, state.current_time);
+        // Find VIDEO clip under playhead — we need both pb_local_t and media_id.
+        // clip_at_time alone matches A-row audio clips whose span starts before
+        // or outlives their V-row partner, which made the preview decode an
+        // audio source as video and compute a wrong local_t.
+        let current_clip = clip_query::video_clip_at_time(state, state.current_time);
         let current_media_id = current_clip.map(|c| c.media_id);
         let pb_local_t: Option<f64> =
             current_clip.map(|c| (state.current_time - c.start_time + c.source_offset).max(0.0));
@@ -94,11 +180,19 @@ impl VideoModule {
         //    but never discarded — permanent freeze. The too_old guard here
         //    discards it immediately so the slot opens for the next frame.
         if let Some(pending) = &ctx.cache.pending_pb_frame {
+            // Session generation must match too: a frame queued before a
+            // start/stop can never be shown under the new session, even when
+            // its id and timestamp still look right.
+            let wrong_gen = pending.generation != ctx.media_worker.playback_generation();
             let wrong_clip = current_media_id.map(|id| id != pending.id).unwrap_or(true);
+            // Same 0.5 s staleness threshold the drain/deduct loop and the
+            // promote gate below use. The previous 3.0 s window let a frame
+            // that could never promote (0.5–3 s behind) sit in the slot,
+            // blocking fresher frames.
             let too_old = pb_local_t
-                .map(|lt| pending.timestamp < lt - 3.0)
+                .map(|lt| pending.timestamp < lt - 0.5)
                 .unwrap_or(false);
-            if wrong_clip || too_old {
+            if wrong_gen || wrong_clip || too_old {
                 ctx.cache.pending_pb_frame = None;
             }
         }
@@ -110,7 +204,7 @@ impl VideoModule {
         // stale frame takes a full tick to evict via the wrong_clip guard above —
         // up to 4 frames × 16ms = ~64ms of showing nothing at the transition.
         if ctx.cache.pending_pb_frame.is_none() {
-            while let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
+            while let Some(f) = recv_session_frame(&ctx.media_worker) {
                 let stale = current_media_id.is_some_and(|id| id != f.id);
                 if stale {
                     continue;
@@ -138,14 +232,11 @@ impl VideoModule {
                 .map(|f| f.timestamp < too_old_threshold)
                 .unwrap_or(false)
             {
-                match ctx.media_worker.pb_rx.try_recv() {
-                    Ok(newer) => {
-                        ctx.cache.pending_pb_frame = Some(newer);
-                    }
-                    Err(_) => {
-                        ctx.cache.pending_pb_frame = None;
-                        break;
-                    }
+                if let Some(newer) = recv_session_frame(&ctx.media_worker) {
+                    ctx.cache.pending_pb_frame = Some(newer);
+                } else {
+                    ctx.cache.pending_pb_frame = None;
+                    break;
                 }
             }
 
@@ -160,8 +251,8 @@ impl VideoModule {
             {
                 let mut best = ctx.cache.pending_pb_frame.take();
                 loop {
-                    match ctx.media_worker.pb_rx.try_recv() {
-                        Ok(f) => {
+                    match recv_session_frame(&ctx.media_worker) {
+                        Some(f) => {
                             if f.timestamp >= too_old_threshold && f.timestamp <= too_far_ahead {
                                 // Found a good frame within window.
                                 ctx.cache.pending_pb_frame = Some(f);
@@ -175,7 +266,7 @@ impl VideoModule {
                                 best = Some(f);
                             }
                         }
-                        Err(_) => {
+                        None => {
                             ctx.cache.pending_pb_frame = best;
                             break;
                         }
@@ -192,9 +283,10 @@ impl VideoModule {
             .map(|f: &PlaybackFrame| {
                 pb_local_t
                     .map(|lt| {
-                        // Lower bound: frame must not be more than 3s behind.
-                        // Upper bound: frame must not be more than 0.5s ahead.
-                        f.timestamp >= lt - 3.0 && f.timestamp <= lt + 0.5
+                        // Both bounds use the same 0.5 s window as the drain
+                        // loop above, so a frame outside it can never promote
+                        // and will have been discarded there already.
+                        f.timestamp >= lt - 0.5 && f.timestamp <= lt + 0.5
                     })
                     .unwrap_or(true)
             })
@@ -219,19 +311,11 @@ impl VideoModule {
                     apply_filter_rgba(&mut f.data, &active_filter);
                 }
 
-                let tex = egui_ctx.load_texture(
-                    format!("pb-{}", f.id),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [f.width as usize, f.height as usize],
-                        &f.data,
-                    ),
-                    egui::TextureOptions::LINEAR,
-                );
-                ctx.cache.frame_cache.insert(f.id, tex);
+                upload_playback_texture(ctx, egui_ctx, f.id, f.width, f.height, &f.data);
                 egui_ctx.request_repaint();
                 // Pre-fill pending for next tick.
                 if ctx.cache.pending_pb_frame.is_none() {
-                    while let Ok(f) = ctx.media_worker.pb_rx.try_recv() {
+                    while let Some(f) = recv_session_frame(&ctx.media_worker) {
                         let stale = current_media_id.is_some_and(|id| id != f.id);
                         if stale {
                             continue;
@@ -245,6 +329,17 @@ impl VideoModule {
     }
 
     // ── tick ──────────────────────────────────────────────────────────────────
+    /// The next monotone scrub-request sequence number.
+    ///
+    /// Every scrub-path request (L2 exact, L2b coarse, L2/HQ transition, L3 HQ)
+    /// gets one at send time; the media worker echoes it back on the result so
+    /// ingest can reject out-of-order completions from the concurrent decode
+    /// executors (see the watermark gate in `AppContext::ingest_video_frame`).
+    fn next_scrub_seq(ctx: &mut AppContext) -> u64 {
+        ctx.playback.scrub_req_seq += 1;
+        ctx.playback.scrub_req_seq
+    }
+
     /// 3-layer scrub + playback start/stop. Call every frame from app::update().
     pub fn tick(
         state: &ProjectState,
@@ -256,9 +351,9 @@ impl VideoModule {
         let just_stopped = !state.is_playing && ctx.playback.prev_playing;
         ctx.playback.prev_playing = state.is_playing;
 
-        // clip_at_time is the shared helper — same predicate as poll_playback above,
-        // single source of truth, no risk of the two copies drifting.
-        let current_clip = clip_query::clip_at_time(state, state.current_time).cloned();
+        // clip_query::video_clip_at_time is the shared helper — video rows only,
+        // single source of truth, no risk of the copies drifting.
+        let current_clip = clip_query::video_clip_at_time(state, state.current_time).cloned();
 
         // ── Playback mode ─────────────────────────────────────────────────────
         if state.is_playing {
@@ -288,9 +383,11 @@ impl VideoModule {
                     if let Some(lib) = clip_query::library_entry_for(state, clip) {
                         let local_ts =
                             (state.current_time - clip.start_time + clip.source_offset).max(0.0);
-                        // Pass aspect=0.0 → LiveDecoder opens at native source resolution.
-                        // The pb thread is the preview player; it must be full quality.
-                        // crop_uv_rect in preview_module handles any AR mismatch on the GPU.
+                        // Pass aspect=0.0 → without preview_size the pb decoder opens at
+                        // native source resolution and crop_uv_rect corrects AR on the GPU.
+                        // With preview_size known, the decoder forces panel dimensions and
+                        // center-crops the source to the canvas AR itself
+                        // (center_crop_and_scale_cached) — both converge on the same visual.
                         if let Some(spec) = build_incoming_blend_spec(state, clip)
                             .or_else(|| build_blend_spec(state, clip))
                         {
@@ -442,15 +539,22 @@ impl VideoModule {
             // showing nothing (which caused the visible flicker at zone entry).
             {
                 let search_range = if zone.is_some() { 2u32 } else { 8u32 };
+                // Search both directions, nearest-first: scrubbing FORWARD into a
+                // region whose only cached frames lie ahead previously found
+                // nothing because the search subtracted buckets only.
                 let found_nearby = (0..=search_range).find_map(|delta| {
-                    let b = fine_bucket.saturating_sub(delta);
                     // Only look at fine-bucket entries (is_coarse=false) for L1.
-                    // Coarse prefetch entries are stored with is_coarse=true so they
-                    // never collide with fine-bucket lookups.
-                    ctx.cache
-                        .frame_bucket_cache
-                        .get(&(clip.media_id, b, false))
-                        .map(|(tex, _)| tex.clone())
+                    // Coarse prefetch entries are stored with is_coarse=true so
+                    // they never collide with fine-bucket lookups.
+                    let lookup = |b: u32| {
+                        ctx.cache
+                            .frame_bucket_cache
+                            .get(&(clip.media_id, b, false))
+                            .map(|(tex, _)| tex.clone())
+                    };
+                    let minus = lookup(fine_bucket.saturating_sub(delta));
+                    let plus = lookup(fine_bucket + delta);
+                    minus.or(plus)
                 });
                 if let Some(cached) = found_nearby {
                     ctx.cache.frame_cache.insert(clip.media_id, cached);
@@ -478,6 +582,7 @@ impl VideoModule {
                 let path_b =
                     clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
                 if let (Some(pa), Some(pb)) = (path_a, path_b) {
+                    let seq = Self::next_scrub_seq(ctx);
                     ctx.media_worker
                         .request_transition_frame(TransitionScrubRequest {
                             // Tag with the CURRENT clip's media_id, not always zone.clip_a.media_id.
@@ -498,16 +603,22 @@ impl VideoModule {
                             clip_b_ts: zone.clip_b_source_ts,
                             alpha: zone.alpha,
                             kind: zone.transition.kind,
+                            req_seq: seq,
                         });
                 }
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 let aspect = state.active_video_ratio();
+                let seq = Self::next_scrub_seq(ctx);
                 ctx.media_worker.request_frame(
-                    lib.id,
-                    lib.path.clone(),
-                    local_t,
-                    aspect,
-                    preview_size,
+                    FrameRequest {
+                        id: lib.id,
+                        path: lib.path.clone(),
+                        timestamp: local_t,
+                        aspect,
+                        preview_size,
+                        req_seq: seq,
+                    },
+                    false,
                 );
             }
 
@@ -521,15 +632,20 @@ impl VideoModule {
                     ctx.playback.scrub_coarse_req = Some(coarse_key);
                     if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                         let aspect = state.active_video_ratio();
-                        // Mark this as a coarse prefetch so ingest_video_frame stores
-                        // it with is_coarse=true, preventing collision with fine-bucket
-                        // entries in the bucket cache.
+                        let seq = Self::next_scrub_seq(ctx);
+                        // Coarse prefetch: routed to its own slot and tier-tagged so
+                        // the result is stored with is_coarse=true and can never
+                        // displace an exact scrub request or land in frame_cache.
                         ctx.media_worker.request_frame(
-                            lib.id,
-                            lib.path.clone(),
-                            coarse_bucket as f64 * 2.0,
-                            aspect,
-                            preview_size,
+                            FrameRequest {
+                                id: lib.id,
+                                path: lib.path.clone(),
+                                timestamp: coarse_bucket as f64 * 2.0,
+                                aspect,
+                                preview_size,
+                                req_seq: seq,
+                            },
+                            true,
                         );
                     }
                 }
@@ -571,6 +687,7 @@ impl VideoModule {
                 let path_b =
                     clip_query::library_entry_for(state, zone.clip_b).map(|l| l.path.clone());
                 if let (Some(pa), Some(pb)) = (path_a, path_b) {
+                    let seq = Self::next_scrub_seq(ctx);
                     ctx.media_worker
                         .request_transition_frame_hq(TransitionScrubRequest {
                             clip_a_id: clip.media_id,
@@ -581,14 +698,21 @@ impl VideoModule {
                             clip_b_ts: zone.clip_b_source_ts,
                             alpha: zone.alpha,
                             kind: zone.transition.kind,
+                            req_seq: seq,
                         });
                     ctx.playback.scrub_last_moved = None;
                 }
             } else if let Some(lib) = clip_query::library_entry_for(state, &clip) {
                 // Use local_t (exact playhead position), not the quantised fine_bucket,
                 // so the HQ decode lands on the precise frame the user is looking at.
-                ctx.media_worker
-                    .request_frame_hq(lib.id, lib.path.clone(), local_t, preview_size);
+                let seq = Self::next_scrub_seq(ctx);
+                ctx.media_worker.request_frame_hq(
+                    lib.id,
+                    lib.path.clone(),
+                    local_t,
+                    preview_size,
+                    seq,
+                );
                 ctx.playback.scrub_last_moved = None;
             }
         }
@@ -598,10 +722,6 @@ impl VideoModule {
 // ── EditorModule (no panel) ───────────────────────────────────────────────────
 
 impl EditorModule for VideoModule {
-    fn name(&self) -> &str {
-        "Video"
-    }
-
     fn ui(
         &mut self,
         _ui: &mut egui::Ui,
@@ -631,28 +751,41 @@ fn build_blend_spec(
         .iter()
         .find(|tr| tr.after_clip_id == clip.id && tr.kind.kind != TransitionKind::Cut)?;
 
-    // Find the next V-row video clip (butted up against this one's end via snap-to-end).
+    // Find the next video clip on the SAME row, butted up against this one's
+    // end. Before this was constrained by `track_row % 2 == 0` — V1 and V2
+    // matched each other, so a clip ending where an unrelated V2 clip began
+    // invented a playback blend across the two layers (the same phantom-blend
+    // bug `active_transition_at` fixed for the preview).
     let clip_end = clip.start_time + clip.duration;
     let next_clip = state
         .timeline
         .iter()
-        .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
-        // Snapped clips are exactly adjacent; allow a small epsilon for float drift.
-        .find(|c| (c.start_time - clip_end).abs() < 0.05)?;
+        .filter(|c| c.track_row == clip.track_row && !clip_query::is_extracted_audio_clip(c))
+        // Snapped clips are exactly adjacent; use the same epsilon as the zone
+        // math so scrub preview and playback agree on where a transition exists.
+        .find(|c| (c.start_time - clip_end).abs() < clip_query::ADJACENCY_EPS)?;
 
     let next_lib = clip_query::library_entry_for(state, next_clip)?;
 
+    // Effective duration clamped to what both clips can host. A slider value
+    // larger than the clips must behave the same in playback as in the preview
+    // (which clamps via `active_transition_at`), otherwise the exported video
+    // blends over spans the timeline view does not show.
+    let d_eff = tr.kind.clamped_secs(clip.duration, next_clip.duration);
+    if d_eff <= 0.0 {
+        return None;
+    }
+
     // Source timestamp in clip_a at which blending begins.
-    // Transition is centered on the cut: blend starts D/2 before clip_a ends.
-    let blend_start_ts =
-        (clip.source_offset + clip.duration - tr.kind.duration_secs as f64 / 2.0).max(0.0);
+    // Transition is centered on the cut: blend starts d_eff/2 before clip_a ends.
+    let blend_start_ts = (clip.source_offset + clip.duration - d_eff / 2.0).max(0.0);
 
     Some(PlaybackTransitionSpec {
         clip_b_id: next_clip.media_id,
         clip_b_path: next_lib.path.clone(),
         clip_b_source_start: next_clip.source_offset,
         blend_start_ts,
-        duration: tr.kind.duration_secs,
+        duration: d_eff as f32,
         kind: tr.kind.kind,
         alpha_start: 0.0, // clip_a side: ramps 0.0 → 0.5 at cut
         invert_ab: false,
@@ -672,21 +805,17 @@ fn build_incoming_blend_spec(
 ) -> Option<PlaybackTransitionSpec> {
     let clip_b_start = clip_b.start_time;
 
-    // Find the preceding V-row clip (clip_a).
+    // Find the preceding video clip on the SAME row as clip_b (see the
+    // cross-layer note in `build_blend_spec`).
     let clip_a = state
         .timeline
         .iter()
-        .filter(|c| c.track_row % 2 == 0 && !clip_query::is_extracted_audio_clip(c))
-        .find(|c| (c.start_time + c.duration - clip_b_start).abs() < 0.05);
+        .filter(|c| c.track_row == clip_b.track_row && !clip_query::is_extracted_audio_clip(c))
+        .find(|c| (c.start_time + c.duration - clip_b_start).abs() < clip_query::ADJACENCY_EPS);
 
     let clip_a = match clip_a {
         Some(c) => c,
         None => {
-            eprintln!(
-                "[blend_in] clip_a not found for clip_b.start_time={:.3} \
-                 (no V-row clip ends within 0.05s of that point — gap or first clip)",
-                clip_b_start
-            );
             return None;
         }
     };
@@ -700,25 +829,18 @@ fn build_incoming_blend_spec(
     let tr = match tr {
         Some(t) => t,
         None => {
-            eprintln!(
-                "[blend_in] no non-Cut transition found after clip_a id={} — no blend",
-                clip_a.id
-            );
             return None;
         }
     };
 
-    let half_d = tr.kind.duration_secs as f64 / 2.0;
+    // Same clamp as the outgoing spec and the preview zone math: playback must
+    // not blend across more timeline than `active_transition_at` reports.
+    let d_eff = tr.kind.clamped_secs(clip_a.duration, clip_b.duration);
+    let half_d = d_eff / 2.0;
     let elapsed = (state.current_time - clip_b_start).max(0.0);
 
-    eprintln!(
-        "[blend_in] guard: current_time={:.3} clip_b_start={:.3} elapsed={:.3} \
-         half_d={:.3} duration={:.3} kind={:?}",
-        state.current_time, clip_b_start, elapsed, half_d, tr.kind.duration_secs, tr.kind.kind
-    );
-
     // In-zone guard: only activate when we are still inside the incoming blend
-    // half, i.e. [clip_b_start, clip_b_start + D/2).
+    // half, i.e. [clip_b_start, clip_b_start + half_d).
     //
     // A generous 2-frame budget (≈ 67 ms at 30 fps) is added beyond half_d to
     // tolerate stable_dt overshoots and minor frame-rate dips. Without this
@@ -729,20 +851,12 @@ fn build_incoming_blend_spec(
     // and avoids the cost of opening a spurious secondary decoder.
     const TWO_FRAMES: f64 = 2.0 / 30.0;
     if elapsed >= half_d + TWO_FRAMES {
-        eprintln!(
-            "[blend_in] GUARD TRIGGERED — elapsed {:.3} >= half_d+2f {:.3}; \
-             returning None (hard cut will follow). \
-             This is the clip_b blend bug if you see it during normal playback.",
-            elapsed,
-            half_d + TWO_FRAMES
-        );
         return None;
     }
 
     let clip_a_lib = match clip_query::library_entry_for(state, clip_a) {
         Some(l) => l,
         None => {
-            eprintln!("[blend_in] clip_a library entry missing — no blend");
             return None;
         }
     };
@@ -761,23 +875,259 @@ fn build_incoming_blend_spec(
     // jump at the start of the clip_b blend half (circle size pop for iris, etc.).
     let alpha_start = 0.5_f32;
 
-    // Secondary decoder: clip_a's tail, starting at the last D/2 of clip_a's source.
+    // Secondary decoder: clip_a's tail, starting at the last half_d of clip_a's source.
     let clip_a_tail = (clip_a.source_offset + clip_a.duration - half_d).max(0.0);
-
-    eprintln!(
-        "[blend_in] returning Some: alpha_start={:.3} clip_a_tail={:.3} \
-         clip_b.source_offset={:.3}",
-        alpha_start, clip_a_tail, clip_b.source_offset
-    );
 
     Some(PlaybackTransitionSpec {
         clip_b_id: clip_a.media_id, // secondary = clip_a tail
         clip_b_path: clip_a_lib.path.clone(),
         clip_b_source_start: clip_a_tail,
         blend_start_ts: clip_b.source_offset, // blend from clip_b's first frame
-        duration: tr.kind.duration_secs,      // full D; alpha_start offsets into it
+        duration: d_eff as f32,               // full D; alpha_start offsets into it
         kind: tr.kind.kind,
         alpha_start,     // dynamic: 0.5 + elapsed/duration, clamped to [0.5, 1.0]
         invert_ab: true, // primary=clip_b is "b"; secondary=clip_a is "a"
     })
+}
+
+#[cfg(test)]
+mod session_gate_tests {
+    //! Pins the playback session-generation gate — the pb-path analog of the
+    //! scrub-path seq watermark. See the audit: old-session frames can carry a
+    //! matching clip id and a timestamp inside the ±0.5 s windows at a session
+    //! boundary, but their pixels were blended under the OLD spec (old alpha).
+
+    use super::recv_gen;
+    use uuid::Uuid;
+    use velocut_core::media_types::{FrameBuf, PlaybackFrame};
+
+    fn frame(gen: u64, id: Uuid, ts: f64) -> PlaybackFrame {
+        PlaybackFrame {
+            id,
+            timestamp: ts,
+            width: 1,
+            height: 1,
+            data: FrameBuf::detached(vec![0u8; 4]),
+            generation: gen,
+        }
+    }
+
+    #[test]
+    fn frames_of_a_superseded_session_are_skipped_even_with_matching_id_and_window() {
+        // Audit case 1 — pause/resume inside the same clip's transition half:
+        // the fresh StartBlend targets the same clip id at a nearby timeline
+        // position, so wrong_clip/too_old would accept these old-session
+        // frames. Only the generation separates them.
+        let id = Uuid::new_v4();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        tx.send(frame(1, id, 3.00)).unwrap(); // old incoming half, alpha≈0.52
+        tx.send(frame(1, id, 3.05)).unwrap(); // old incoming half, alpha≈0.68
+        tx.send(frame(2, id, 3.02)).unwrap(); // fresh session, correct alpha
+
+        let got = recv_gen(&rx, 2).unwrap();
+        assert_eq!(got.generation, 2);
+        assert_eq!(got.timestamp, 3.02);
+        // The stale ones never surfaced.
+        assert!(recv_gen(&rx, 2).is_none());
+    }
+
+    #[test]
+    fn the_same_asset_reused_across_zones_is_still_rejected_by_generation() {
+        // Audit case 2 — the asset is reused back-to-back on the timeline, so
+        // the old and new clips share a media_id. id alone cannot discriminate
+        // the sessions; the generation gate must.
+        let id = Uuid::new_v4();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        tx.send(frame(4, id, 7.40)).unwrap(); // zone 1's blend output
+        tx.send(frame(5, id, 7.42)).unwrap(); // zone 2's fresh frame
+
+        let got = recv_gen(&rx, 5).unwrap();
+        assert_eq!(got.generation, 5);
+    }
+
+    #[test]
+    fn a_dropped_stop_leaves_only_rejectable_frames() {
+        // Audit case 3 — stop_playback bumps the generation even when its Stop
+        // command is dropped, so a session the pb thread is still finishing
+        // (or will never finish until the channel fills) cannot surface.
+        let id = Uuid::new_v4();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        tx.send(frame(3, id, 1.10)).unwrap();
+        tx.send(frame(3, id, 1.15)).unwrap();
+        // Session bumped to 4 by the (lost) stop.
+        assert!(recv_gen(&rx, 4).is_none());
+        // Channel fully drained, nothing left behind.
+        assert!(recv_gen(&rx, 4).is_none());
+    }
+
+    #[test]
+    fn the_current_session_passes_through_untouched() {
+        let id = Uuid::new_v4();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        tx.send(frame(7, id, 2.00)).unwrap();
+        tx.send(frame(7, Uuid::new_v4(), 2.05)).unwrap();
+
+        let first = recv_gen(&rx, 7).unwrap();
+        assert_eq!((first.id, first.timestamp, first.generation), (id, 2.00, 7));
+        let second = recv_gen(&rx, 7).unwrap();
+        assert_eq!(second.generation, 7);
+        assert!(recv_gen(&rx, 7).is_none());
+    }
+}
+
+#[cfg(test)]
+mod texture_reuse_tests {
+    //! Pins the playback texture policy: one persistent `TextureHandle` per clip,
+    //! updated in place, instead of an alloc+free pair for every displayed frame.
+    //!
+    //! Assertions go through the `TextureManager` rather than through pixels: a
+    //! queued `TexturesDelta` names the texture it writes to, so "did this upload
+    //! touch the thumbnail's texture?" and "how many textures did six frames
+    //! allocate?" are both answerable headlessly. A full `set()` also coalesces any
+    //! pending delta for the same texture id, which is why six uploads leave one
+    //! entry.
+
+    use super::{upload_playback_texture, MAX_PB_TEXTURES};
+    use crate::context::AppContext;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+    use velocut_media::MediaWorker;
+
+    fn clip(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    fn rgba(w: usize, h: usize, fill: u8) -> Vec<u8> {
+        vec![fill; w * h * 4]
+    }
+
+    fn ctx() -> AppContext {
+        AppContext::new(MediaWorker::new())
+    }
+
+    /// Textures egui itself allocates (the font atlas), so counts can be asserted
+    /// as "how many did playback add" rather than against a magic constant.
+    fn baseline(egui_ctx: &egui::Context) -> usize {
+        let allocated = egui_ctx.tex_manager().read().num_allocated();
+        // Drop egui's own queued uploads so later delta checks see only playback's.
+        drained_writes(egui_ctx);
+        allocated
+    }
+
+    /// Ids written to by the deltas queued since the last drain.
+    fn drained_writes(egui_ctx: &egui::Context) -> Vec<egui::TextureId> {
+        egui_ctx
+            .tex_manager()
+            .write()
+            .take_delta()
+            .set
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn six_playback_frames_allocate_one_texture() {
+        let egui_ctx = egui::Context::default();
+        let mut ctx = ctx();
+        let c = clip(1);
+        let pixels = rgba(16, 8, 40);
+        let base = baseline(&egui_ctx);
+
+        for _ in 0..6 {
+            upload_playback_texture(&mut ctx, &egui_ctx, c, 16, 8, &pixels);
+        }
+
+        // One GPU texture for the clip, and the displayed handle is that texture.
+        assert_eq!(egui_ctx.tex_manager().read().num_allocated(), base + 1);
+        let (tex, w, h) = &ctx.cache.pb_textures[&c];
+        assert_eq!((*w, *h), (16, 8));
+        assert_eq!(ctx.cache.frame_cache[&c].id(), tex.id());
+        assert_eq!(tex.size(), [16, 8]);
+
+        // Six in-place uploads, coalesced into the latest one per texture id.
+        // Before the change this was six distinct textures, each with its own name.
+        let writes = drained_writes(&egui_ctx);
+        assert_eq!(writes, vec![tex.id()]);
+    }
+
+    #[test]
+    fn playback_never_writes_through_a_shared_texture() {
+        // When the playhead enters a clip, frame_cache is seeded with a clone of the
+        // thumbnail or a scrub-bucket texture. Writing through that handle would
+        // rewrite the pixels the timeline thumbnail (and every bucket entry sharing
+        // it) still points at, so playback must allocate its own texture even though
+        // the size matches.
+        let egui_ctx = egui::Context::default();
+        let mut ctx = ctx();
+        let c = clip(2);
+        let pixels = rgba(16, 8, 40);
+
+        let shared = egui_ctx.load_texture(
+            "thumb",
+            egui::ColorImage::from_rgba_unmultiplied([16, 8], &rgba(16, 8, 200)),
+            egui::TextureOptions::LINEAR,
+        );
+        let base = baseline(&egui_ctx);
+        ctx.cache.thumbnail_cache.insert(c, shared.clone());
+        ctx.cache.frame_cache.insert(c, shared.clone());
+        drained_writes(&egui_ctx);
+
+        upload_playback_texture(&mut ctx, &egui_ctx, c, 16, 8, &pixels);
+
+        let pb = ctx.cache.pb_textures[&c].0.id();
+        assert_ne!(pb, shared.id());
+        assert_eq!(ctx.cache.frame_cache[&c].id(), pb);
+        // The uploaded texture is the only one written to: the shared handle's
+        // texture still holds the thumbnail's own pixels.
+        assert_eq!(drained_writes(&egui_ctx), vec![pb]);
+        assert_eq!(egui_ctx.tex_manager().read().num_allocated(), base + 1);
+    }
+
+    #[test]
+    fn a_preview_size_change_reallocates_once() {
+        let egui_ctx = egui::Context::default();
+        let mut ctx = ctx();
+        let c = clip(3);
+        let base = baseline(&egui_ctx);
+
+        upload_playback_texture(&mut ctx, &egui_ctx, c, 16, 8, &rgba(16, 8, 1));
+        let first = ctx.cache.pb_textures[&c].0.id();
+
+        upload_playback_texture(&mut ctx, &egui_ctx, c, 16, 16, &rgba(16, 16, 2));
+        let (tex, w, h) = &ctx.cache.pb_textures[&c];
+        assert_eq!((*w, *h), (16, 16));
+        assert_ne!(tex.id(), first);
+        assert_eq!(tex.size(), [16, 16]);
+        assert_eq!(ctx.cache.frame_cache[&c].id(), tex.id());
+        // Only the current size is held; the old texture is released with its handle.
+        assert_eq!(ctx.cache.pb_textures.len(), 1);
+        assert_eq!(egui_ctx.tex_manager().read().num_allocated(), base + 1);
+    }
+
+    #[test]
+    fn playback_textures_stay_capped() {
+        let egui_ctx = egui::Context::default();
+        let mut ctx = ctx();
+        let pixels = rgba(16, 8, 7);
+
+        for n in 0..(MAX_PB_TEXTURES as u8 + 3) {
+            upload_playback_texture(&mut ctx, &egui_ctx, clip(n), 16, 8, &pixels);
+        }
+
+        assert_eq!(ctx.cache.pb_textures.len(), MAX_PB_TEXTURES);
+        // The clip uploaded last always keeps its texture, cap or no cap.
+        let last = clip(MAX_PB_TEXTURES as u8 + 2);
+        assert_eq!(
+            ctx.cache.frame_cache[&last].id(),
+            ctx.cache.pb_textures[&last].0.id()
+        );
+        let live: HashSet<_> = ctx
+            .cache
+            .pb_textures
+            .values()
+            .map(|(t, ..)| t.id())
+            .collect();
+        assert_eq!(live.len(), MAX_PB_TEXTURES);
+    }
 }

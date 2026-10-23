@@ -4398,6 +4398,7 @@ dependencies = [
 name = "velocut-ui"
 version = "0.1.7"
 dependencies = [
+ "crossbeam-channel",
  "eframe",
  "egui",
  "egui_extras",

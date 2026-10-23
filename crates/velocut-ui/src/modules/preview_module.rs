@@ -1,5 +1,6 @@
 // crates/velocut-ui/src/modules/preview.rs
 use super::EditorModule;
+use crate::helpers::clip_query;
 use crate::modules::ThumbnailCache;
 use crate::theme::{ACCENT, DARK_BG_2, DARK_BG_3, DARK_BORDER};
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -84,10 +85,6 @@ impl PreviewModule {
 }
 
 impl EditorModule for PreviewModule {
-    fn name(&self) -> &str {
-        "Preview"
-    }
-
     fn ui(
         &mut self,
         ui: &mut Ui,
@@ -223,12 +220,14 @@ impl EditorModule for PreviewModule {
             }
             painter.rect_filled(canvas, 3.0, Color32::BLACK);
 
-            let current_clip = state.timeline.iter().find(|c| {
-                state.current_time >= c.start_time && state.current_time < c.start_time + c.duration
-            });
+            // Video rows only. An A-row extracted-audio clip whose span covers
+            // the playhead must never be treated as "current" here: the preview
+            // would look up the audio source's thumbnail instead of the video
+            // frame the playhead is on.
+            let current_clip = clip_query::video_clip_at_time(state, state.current_time);
 
             if let Some(clip) = current_clip {
-                if let Some(media) = state.library.iter().find(|m| m.id == clip.media_id) {
+                if let Some(media) = clip_query::library_entry_for(state, clip) {
                     // Update held_frame whenever we have a fresh decoded frame.
                     // This persists across ticks so clip transitions and scrub latency
                     // never drop back to the thumbnail — we show the last good frame instead.

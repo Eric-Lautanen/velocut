@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 velocut-core  = { path = "../velocut-core" }
 velocut-media = { path = "../velocut-media" }
+# The playback session-generation gate in video_module names the raw channel
+# type (see `PlaybackFrame::generation`).
+crossbeam-channel = { workspace = true }
 
 egui              = { workspace = true }
 eframe            = { workspace = true }
@@ -21,6 +24,11 @@ rfd               = { workspace = true }
 ffmpeg-the-third  = { workspace = true }
 rodio             = { workspace = true }
 png               = { workspace = true }
+
+[dev-dependencies]
+# Tests feed a real playback channel to the session-generation gate in
+# video_module (`recv_gen`), which needs the raw channel type.
+crossbeam-channel = { workspace = true }
 
 [build-dependencies]
 winresource = { version = "0.1", optional = true }

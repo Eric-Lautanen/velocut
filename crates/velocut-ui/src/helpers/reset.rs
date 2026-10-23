@@ -114,8 +114,13 @@ pub fn delete_app_data_dir() {
 /// On non-Windows platforms the two paths are identical; deduplication ensures
 /// we only scan once.
 pub fn delete_temp_files() {
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    // Only the Windows block below appends to this list, so the binding is
+    // `mut` there and immutable everywhere else — two cfgs instead of
+    // suppressing unused_mut on the shared declaration.
+    #[cfg(target_os = "windows")]
     let mut tmp_dirs: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
+    #[cfg(not(target_os = "windows"))]
+    let tmp_dirs: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
 
     // On Windows we need to sweep the real Windows temp directory, which MSYS2
     // builds may never see via std::env::temp_dir() or %TEMP% — both get

@@ -77,10 +77,6 @@ impl Default for LibraryModule {
 }
 
 impl EditorModule for LibraryModule {
-    fn name(&self) -> &str {
-        "Media Library"
-    }
-
     fn ui(
         &mut self,
         ui: &mut Ui,

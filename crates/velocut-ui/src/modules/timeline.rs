@@ -102,10 +102,6 @@ fn playhead_btn(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 }
 
 impl EditorModule for TimelineModule {
-    fn name(&self) -> &str {
-        "Timeline"
-    }
-
     fn ui(
         &mut self,
         ui: &mut Ui,
@@ -773,7 +769,19 @@ impl EditorModule for TimelineModule {
                         // · Extracted audio clip (is_extracted_audio_clip): always show waveform.
                         // · Regular audio clip: always show waveform.
                         if !waveform.is_empty() && width > 10.0 && !clip.audio_muted {
-                            draw_waveform(&painter, clip_rect, waveform, render_type, clip.volume, state.volume, clip.fade_in_secs, clip.fade_in_start_secs, clip.fade_out_secs, clip.fade_out_end_secs, clip.duration as f32);
+                            draw_waveform(&painter, clip_rect, &WaveformView {
+                                peaks: waveform,
+                                clip_type: render_type,
+                                clip_volume: clip.volume,
+                                global_volume: state.volume,
+                                source_offset: clip.source_offset as f32,
+                                source_duration: lib.map(|l| l.duration as f32).unwrap_or(0.0),
+                                duration: clip.duration as f32,
+                                fade_in_secs: clip.fade_in_secs,
+                                fade_in_start_secs: clip.fade_in_start_secs,
+                                fade_out_secs: clip.fade_out_secs,
+                                fade_out_end_secs: clip.fade_out_end_secs,
+                            });
                         }
 
                         // Top stripe
@@ -901,7 +909,16 @@ impl EditorModule for TimelineModule {
                         }
                         if right_trim.dragged() {
                             let delta        = right_trim.drag_delta().x as f64 / state.timeline_zoom as f64;
-                            let new_duration = (clip.duration + delta).max(2.0 / 30.0);
+                            // Never let the tail run past the end of the source:
+                            // the preview would freeze on the last frame and the
+                            // encoder would request frames that do not exist.
+                            let max_duration = max_clip_duration(
+                                lib.map(|l| l.duration).unwrap_or(0.0),
+                                clip.source_offset,
+                            );
+                            let new_duration = (clip.duration + delta)
+                                .min(max_duration)
+                                .max(2.0 / 30.0);
                             cmd.push(EditorCommand::TrimClipEnd { id: clip.id, new_duration });
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
@@ -969,21 +986,32 @@ impl EditorModule for TimelineModule {
                                 self.drag_target = Some((clip_id, target_row));
 
                                 // Snap against neighbors in the TARGET row so edge-snapping
-                                // works correctly when moving between tracks.
-                                let neighbors: Vec<f64> = state.timeline.iter()
+                                // works correctly when moving between tracks. Ordered by
+                                // position, not document order — snapshot order was the
+                                // previous lookup order, which made gap-opening depend on
+                                // which clip was dragged onto the timeline first.
+                                let mut neighbors: Vec<SnapEdge> = state
+                                    .timeline
+                                    .iter()
                                     .filter(|c| c.id != clip_id && c.track_row == target_row)
-                                    .flat_map(|c| [c.start_time, c.start_time + c.duration])
+                                    .map(|c| (c.start_time, c.start_time + c.duration))
                                     .collect();
+                                // The playhead is a snap target too — it is how you line a
+                                // clip up with something you just marked.
+                                neighbors.push((state.current_time, f64::NAN));
+                                neighbors.sort_unstable_by(|a, b| {
+                                    a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1))
+                                });
                                 let mut new_start = (clip.start_time + delta_t).max(0.0);
                             if new_start < snap_px {
                                 new_start = 0.0;
                             } else {
-                                for edge in &neighbors {
-                                    if (new_start - edge).abs() < snap_px {
-                                        new_start = *edge;
-                                        break;
-                                    }
-                                }
+                                new_start = snap_clip_start(
+                                    new_start,
+                                    clip.duration,
+                                    &neighbors,
+                                    snap_px,
+                                );
                             }
                             cmd.push(EditorCommand::MoveTimelineClip { id: clip_id, new_start, new_row: target_row });
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1327,9 +1355,11 @@ impl EditorModule for TimelineModule {
 
                                         // One button per registered transition — no hardcoding.
                                         // `col` tracks position within the current row; Cut
-                                        // already occupies column 0 so we start at 1.
-                                        let mut col = 1usize;
-                                        for entry in velocut_core::transitions::registered() {
+                                        // already occupies column 0 so the counter starts at 1.
+                                        for (i, entry) in
+                                            velocut_core::transitions::registered().iter().enumerate()
+                                        {
+                                            let col = i + 1;
                                             if col.is_multiple_of(COLS) {
                                                 ui.end_row();
                                             }
@@ -1355,7 +1385,6 @@ impl EditorModule for TimelineModule {
                                                     kind: entry.build(dur),
                                                 });
                                             }
-                                            col += 1;
                                         }
                                     });
 
@@ -1778,33 +1807,85 @@ fn hotkey_section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
     ui.add_space(6.0);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_waveform(
-    painter: &egui::Painter,
-    clip_rect: Rect,
-    peaks: &[f32],
+/// Everything `draw_waveform` needs to paint one clip's waveform.
+struct WaveformView<'a> {
+    peaks: &'a [f32],
     clip_type: ClipType,
     clip_volume: f32,
     global_volume: f32,
+    /// Seconds into the source file at the clip's left edge.
+    source_offset: f32,
+    /// Full source duration — `peaks` span the whole file.
+    source_duration: f32,
+    /// Timeline-visible duration of the clip.
+    duration: f32,
     fade_in_secs: f32,
     fade_in_start_secs: f32,
     fade_out_secs: f32,
     fade_out_end_secs: f32,
-    duration: f32,
-) {
+}
+
+impl WaveformView<'_> {
+    /// Peak amplitude for column `i` out of `columns`.
+    ///
+    /// `peaks` spans the whole source file, but a clip can show just a slice of
+    /// it (trimmed head, overlay range, separated audio). Mapping each column
+    /// through `[source_offset, source_offset + duration]` makes the drawing
+    /// match the audio that actually plays at that point in the clip.
+    ///
+    /// Falls back to stretching the whole file across the clip when the source
+    /// duration is unknown, which is the old behaviour.
+    fn peak_at(&self, i: usize, columns: usize) -> f32 {
+        let peaks = self.peaks;
+        if peaks.is_empty() {
+            return 0.0;
+        }
+        let frac = if self.source_duration > 0.0 && self.duration > 0.0 {
+            let frac_of_clip = i as f32 / columns.saturating_sub(1).max(1) as f32;
+            ((self.source_offset + frac_of_clip * self.duration) / self.source_duration)
+                .clamp(0.0, 1.0)
+        } else {
+            (i as f32 / columns.max(1) as f32).clamp(0.0, 1.0)
+        };
+        peaks[((frac * peaks.len() as f32) as usize).min(peaks.len() - 1)]
+    }
+}
+
+fn draw_waveform(painter: &egui::Painter, clip_rect: Rect, view: &WaveformView<'_>) {
+    let WaveformView {
+        peaks,
+        clip_type,
+        clip_volume,
+        global_volume,
+        duration,
+        fade_in_secs,
+        fade_in_start_secs,
+        fade_out_secs,
+        fade_out_end_secs,
+        ..
+    } = *view;
+
     if peaks.is_empty() {
         return;
     }
     let w = clip_rect.width();
     let h = clip_rect.height();
     let mid_y = clip_rect.min.y + h * 0.5;
-    let visible = (w as usize).min(peaks.len()).max(1);
-    let step = peaks.len() as f32 / visible as f32;
+    // One bar per pixel, capped so an extreme zoom-out can't emit 30k segments
+    // per clip per frame. Bars are spaced across the FULL clip width either way,
+    // so a very wide clip is never drawn only half-filled.
+    let visible = (w as usize).clamp(1, 4000);
+    let x_step = w / visible as f32;
     let wave_color = if clip_type == ClipType::Audio {
         Color32::from_rgba_unmultiplied(100, 240, 165, 220)
     } else {
         Color32::from_rgba_unmultiplied(160, 200, 255, 38)
     };
+
+    // Peaks are indexed across the whole source file, but a clip may show only a
+    // slice of it (trimmed head, overlay range, separated audio). Map each column
+    // to that source window so the picture matches what plays.
+    let peak_at = |i: usize| -> f32 { view.peak_at(i, visible) };
 
     // Equal-power 3-zone gain: silence → sqrt-ramp → full (fade-in)
     //                          full → sqrt-ramp → silence (fade-out)
@@ -1839,10 +1920,9 @@ fn draw_waveform(
 
     // Draw waveform bars scaled by volume * fade envelope.
     for i in 0..visible {
-        let idx = ((i as f32 * step) as usize).min(peaks.len() - 1);
-        let peak = peaks[idx];
+        let peak = peak_at(i);
         let half = peak * vol * fade_gain(i) * (h * 0.44);
-        let x = clip_rect.min.x + i as f32;
+        let x = clip_rect.min.x + i as f32 * x_step;
         painter.line_segment(
             [Pos2::new(x, mid_y - half), Pos2::new(x, mid_y + half)],
             Stroke::new(1.0_f32, wave_color),
@@ -1859,8 +1939,8 @@ fn draw_waveform(
         if a >= b {
             return;
         }
-        let x0 = clip_rect.min.x + a as f32;
-        let x1 = clip_rect.min.x + b as f32;
+        let x0 = clip_rect.min.x + a as f32 * x_step;
+        let x1 = clip_rect.min.x + b as f32 * x_step;
         painter.rect_filled(
             Rect::from_min_max(Pos2::new(x0, mid_y - 2.0), Pos2::new(x1, mid_y + 2.0)),
             0.0,
@@ -1889,7 +1969,7 @@ fn draw_waveform(
                         .clamp(0.0, 1.0)
                         .sqrt();
                     let half = vol * progress * (h * 0.44);
-                    let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
+                    let pt = Pos2::new(clip_rect.min.x + i as f32 * x_step, mid_y - half);
                     if let Some(p) = prev {
                         painter.line_segment([p, pt], Stroke::new(1.5_f32, ramp_color));
                     }
@@ -1917,7 +1997,7 @@ fn draw_waveform(
                         .clamp(0.0, 1.0)
                         .sqrt();
                     let half = vol * remain_progress * (h * 0.44);
-                    let pt = Pos2::new(clip_rect.min.x + i as f32, mid_y - half);
+                    let pt = Pos2::new(clip_rect.min.x + i as f32 * x_step, mid_y - half);
                     if let Some(p) = prev {
                         painter.line_segment([p, pt], Stroke::new(1.5_f32, ramp_color));
                     }
@@ -1953,3 +2033,163 @@ fn ruler_step(zoom: f32) -> f64 {
     }
 }
 // fit_label moved to crate::helpers::format — imported above.
+
+/// Longest duration a clip can show without reading past the end of its source.
+///
+/// Returns `f64::MAX` while the source duration is unknown (not probed yet), so
+/// an unprobed clip is never frozen to a one-frame length.
+fn max_clip_duration(source_duration: f64, source_offset: f64) -> f64 {
+    if source_duration > 0.0 {
+        (source_duration - source_offset).max(1.0 / 30.0)
+    } else {
+        f64::MAX
+    }
+}
+
+/// Snap a dragging clip so either its head or its tail lands on one of `edges`.
+///
+/// (start_time, end_time) of a neighbor clip on the target row; the playhead
+/// comes through as (time, NAN) — the tail is meaningless for that target.
+type SnapEdge = (f64, f64);
+
+/// Each edge is the (start, end) time pair of a neighbor clip on the target
+/// row (or any time value paired with `NAN` — the playhead). Only the head
+/// used to snap, so a clip dragged right-to-left could never butt up against
+/// the clip after it. Whichever edge is nearer wins; on an exact distance tie
+/// the POSITION-earlier edge is chosen (the list is pre-sorted, so this makes
+/// the result independent of document order), and `new_start` is returned
+/// untouched when nothing is within `tolerance` seconds. On an exact distance
+/// tie the position-earlier edge wins: `edges` is pre-sorted by start and the
+/// strict `<` comparison keeps the first candidate seen.
+fn snap_clip_start(new_start: f64, duration: f64, edges: &[SnapEdge], tolerance: f64) -> f64 {
+    let mut best: Option<(f64, f64)> = None;
+    for (edge, _) in edges {
+        let head = (new_start - *edge).abs();
+        let tail = (new_start + duration - *edge).abs();
+        for (dist, snapped) in [(head, *edge), (tail, *edge - duration)] {
+            // A snap that would push the clip before t=0 cannot line up with
+            // the edge anyway, so treat it as no candidate.
+            if snapped < 0.0 {
+                continue;
+            }
+            if dist < tolerance && best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, snapped));
+            }
+        }
+    }
+    match best {
+        Some((_, snapped)) => snapped,
+        None => new_start,
+    }
+}
+
+#[cfg(test)]
+mod waveform_tests {
+    use super::*;
+
+    fn view<'a>(
+        peaks: &'a [f32],
+        source_offset: f32,
+        source_duration: f32,
+        duration: f32,
+    ) -> WaveformView<'a> {
+        WaveformView {
+            peaks,
+            clip_type: ClipType::Audio,
+            clip_volume: 1.0,
+            global_volume: 1.0,
+            source_offset,
+            source_duration,
+            duration,
+            fade_in_secs: 0.0,
+            fade_in_start_secs: 0.0,
+            fade_out_secs: 0.0,
+            fade_out_end_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn untrimmed_clip_spans_the_whole_file() {
+        let peaks: Vec<f32> = (0..101).map(|i| i as f32).collect();
+        let v = view(&peaks, 0.0, 100.0, 100.0);
+        assert_eq!(v.peak_at(0, 101), 0.0);
+        assert_eq!(v.peak_at(100, 101), 100.0);
+        assert_eq!(v.peak_at(50, 101), 50.0);
+    }
+
+    #[test]
+    fn trimmed_head_starts_at_the_source_offset() {
+        let peaks: Vec<f32> = (0..101).map(|i| i as f32).collect();
+        // 25s into a 100s file, showing 50s.
+        let v = view(&peaks, 25.0, 100.0, 50.0);
+        assert_eq!(v.peak_at(0, 101), 25.0, "left edge must map to 25s");
+        assert_eq!(v.peak_at(100, 101), 75.0, "right edge must map to 75s");
+        assert_eq!(v.peak_at(50, 101), 50.0);
+    }
+
+    #[test]
+    fn unknown_source_duration_falls_back_to_full_file() {
+        let peaks: Vec<f32> = (0..101).map(|i| i as f32).collect();
+        let v = view(&peaks, 50.0, 0.0, 50.0);
+        assert_eq!(v.peak_at(0, 101), 0.0);
+        assert_eq!(v.peak_at(100, 101), 100.0);
+    }
+
+    #[test]
+    fn empty_peaks_are_safe() {
+        let v = view(&[], 0.0, 10.0, 5.0);
+        assert_eq!(v.peak_at(0, 10), 0.0);
+    }
+
+    // ── snap_clip_start ───────────────────────────────────────────────────────
+
+    #[test]
+    fn snap_locks_the_head_to_an_edge() {
+        assert_eq!(snap_clip_start(4.9, 2.0, &[(5.0, 7.0)], 0.25), 5.0);
+    }
+
+    #[test]
+    fn snap_locks_the_tail_to_an_edge() {
+        // Tail is at 7.1, edge at 7.0 → head becomes 5.0.
+        assert_eq!(snap_clip_start(5.1, 2.0, &[(7.0, 9.0)], 0.25), 5.0);
+    }
+
+    #[test]
+    fn snap_prefers_the_nearer_edge() {
+        // Head is 0.02 from 5.0; tail is 0.18 from 9.0. Head wins.
+        assert_eq!(
+            snap_clip_start(5.02, 4.0, &[(5.0, 7.0), (9.0, 11.0)], 0.25),
+            5.0
+        );
+    }
+
+    #[test]
+    fn snap_leaves_distant_positions_alone() {
+        assert_eq!(snap_clip_start(5.5, 2.0, &[(5.0, 7.0)], 0.25), 5.5);
+    }
+
+    #[test]
+    fn snap_never_produces_a_negative_start() {
+        // Tail is 0.6 from the edge at 1.5, which would put the head at -0.5.
+        // The impossible snap is discarded instead of clamping the clip to 0.
+        assert_eq!(snap_clip_start(0.1, 2.0, &[(1.5, 3.5)], 1.0), 0.1);
+    }
+
+    // ── max_clip_duration ─────────────────────────────────────────────────────
+
+    #[test]
+    fn max_duration_is_the_unused_tail_of_the_source() {
+        assert_eq!(max_clip_duration(10.0, 3.0), 7.0);
+    }
+
+    #[test]
+    fn max_duration_is_unbounded_for_unprobed_sources() {
+        assert_eq!(max_clip_duration(0.0, 5.0), f64::MAX);
+    }
+
+    #[test]
+    fn max_duration_keeps_a_usable_minimum() {
+        // Source fully consumed — still allow one frame rather than zero.
+        assert!((max_clip_duration(5.0, 5.0) - 1.0 / 30.0).abs() < 1e-12);
+    }
+}

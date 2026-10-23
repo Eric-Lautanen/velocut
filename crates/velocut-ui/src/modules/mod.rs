@@ -29,9 +29,7 @@ pub type ThumbnailCache = HashMap<Uuid, TextureHandle>;
 /// This avoids a per-module parameter set and keeps the dispatch in `app.rs`
 /// trivial. If the trait signature ever needs to evolve, wrap params in a
 /// `UiContext` struct instead of adding more arguments.
-#[allow(dead_code)]
 pub trait EditorModule {
-    fn name(&self) -> &str;
     fn ui(
         &mut self,
         ui: &mut Ui,
@@ -39,8 +37,7 @@ pub trait EditorModule {
         thumb_cache: &mut ThumbnailCache,
         cmd: &mut Vec<EditorCommand>,
     );
-    /// Called every frame after commands are processed.
-    /// Non-rendering modules (e.g. AudioModule) use this instead of ui().
-    /// Default is a no-op so existing modules don't need to implement it.
-    fn tick(&mut self, _state: &ProjectState, _ctx: &mut crate::context::AppContext) {}
+    // Non-rendering modules (AudioModule, VideoModule) expose an inherent
+    // `tick()` that `app.rs` calls on the concrete type — it is deliberately not
+    // part of this trait, whose only dispatch is `ui()`.
 }
