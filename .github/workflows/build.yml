@@ -212,6 +212,40 @@ jobs:
           export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
           cargo build --release --features velocut-ui/winresource
 
+      # Runs on the release artifacts the step above already produced, so it costs
+      # a test-binary link rather than a second full dependency build. The suite
+      # includes the real FFmpeg encode checks in velocut-media/tests, which are
+      # the only thing that catches export/preview regressions (transition model,
+      # audio gating, output length).
+      - name: Test velocut
+        env:
+          FFMPEG_DIR: /c/ffmpeg-velocut
+          PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
+          LIBCLANG_PATH: /c/Program Files/LLVM/bin
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
+          PKG_CONFIG_ALL_STATIC: "1"
+        run: |
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
+          # Same feature set as the build above, so the release binary that
+          # gets uploaded is still the one produced by the Build step.
+          cargo test --release --workspace --features velocut-ui/winresource --no-fail-fast
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Warnings are reported, not fatal: a toolchain bump can introduce new
+      # lints and should not turn an unrelated PR red.
+      - name: Clippy velocut
+        env:
+          FFMPEG_DIR: /c/ffmpeg-velocut
+          PKG_CONFIG_PATH: /c/ffmpeg-velocut/lib/pkgconfig:/mingw64/lib/pkgconfig
+          LIBCLANG_PATH: /c/Program Files/LLVM/bin
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
+          PKG_CONFIG_ALL_STATIC: "1"
+        run: |
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
+          cargo clippy --workspace --all-targets --features velocut-ui/winresource
+
       - name: Diagnose AVFormatContext opaque-struct failure
         if: failure()
         run: |
