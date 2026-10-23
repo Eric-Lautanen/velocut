@@ -230,7 +230,7 @@ jobs:
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
           cargo build --release --features velocut-ui/winresource
 
       # Runs on the release artifacts the step above already produced, so it costs
@@ -246,7 +246,11 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
+          # -C link-arg rather than -l: the QSV dispatcher objects in the static
+          # libvpl.a call the registry API, and ld resolves archives left to
+          # right — a plain -l lands before later repeats of -lvpl and leaves
+          # __imp_Reg* unresolved. link-arg is appended after every archive.
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
           # Same feature set as the build above, so the release binary that
           # gets uploaded is still the one produced by the Build step.
           cargo test --release --workspace --features velocut-ui/winresource --no-fail-fast
@@ -264,7 +268,7 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid"
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
           cargo clippy --workspace --all-targets --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure

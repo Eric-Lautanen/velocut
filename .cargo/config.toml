@@ -8,4 +8,10 @@ rustflags = [
   "-L", "/mingw64/lib",
   "-L", "/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0",
   "-C", "target-cpu=native",
+  # The QSV dispatcher inside a static libvpl.a calls the Win32 registry API.
+  # It must come after the archives (ld resolves left to right) and it applies
+  # to every link, including the unit- and integration-test binaries that reach
+  # deeper into FFmpeg's QSV encoders than the app does. advapi32 is a system
+  # import library, so the executable stays self-contained.
+  "-C", "link-arg=-ladvapi32",
 ]
