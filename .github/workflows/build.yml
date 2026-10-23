@@ -230,7 +230,9 @@ jobs:
           rm -rf /mingw64/include/libavformat /mingw64/include/libavcodec /mingw64/include/libavutil \
                  /mingw64/include/libavfilter /mingw64/include/libavdevice /mingw64/include/libswscale \
                  /mingw64/include/libswresample
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
+          # libvpl's dispatcher is C++, so the link pulls in libstdc++; without
+          # this the exe imports libstdc++-6.dll and is not self-contained.
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32 -C link-arg=-static-libstdc++"
           cargo build --release --features velocut-ui/winresource
 
       # Runs on the release artifacts the step above already produced, so it costs
@@ -250,7 +252,9 @@ jobs:
           # libvpl.a call the registry API, and ld resolves archives left to
           # right — a plain -l lands before later repeats of -lvpl and leaves
           # __imp_Reg* unresolved. link-arg is appended after every archive.
-          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
+          # -static-libstdc++ keeps the test binaries on the same self-contained
+          # link the release build uses.
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32 -C link-arg=-static-libstdc++"
           # Same feature set as the build above, so the release binary that
           # gets uploaded is still the one produced by the Build step.
           cargo test --release --workspace --features velocut-ui/winresource --no-fail-fast
