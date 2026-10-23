@@ -268,12 +268,13 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu -I/c/ffmpeg-velocut/include -I/mingw64/include -I/mingw64/include/psdk -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include -I/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include-fixed -D__MINGW32__ -D__MINGW64__"
           PKG_CONFIG_ALL_STATIC: "1"
         run: |
-          # `cargo clippy` resolves to the runner's rustup toolchain, whose host
-          # is MSVC. Its host links (proc macros, build scripts) cannot consume
-          # the mingw static libs, so no RUSTFLAGS are passed here, and the GNU
-          # target is selected explicitly so the checked cfg matches the build.
-          rustup target add x86_64-pc-windows-gnu
-          cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets --features velocut-ui/winresource
+          # Run clippy through the MSYS2 toolchain by absolute path. A bare
+          # `cargo clippy` can pick up a rustup clippy-driver, whose MSVC host
+          # then fails to link build scripts against the mingw static libs
+          # (LNK1181: cannot open input file 'vpl.lib').
+          export RUSTFLAGS="-L /mingw64/lib -l vpl -l setupapi -l uuid -C link-arg=-ladvapi32"
+          export RUSTC_WORKSPACE_WRAPPER="$(cygpath -w /mingw64/bin/clippy-driver.exe)"
+          /mingw64/bin/cargo.exe check --workspace --all-targets --features velocut-ui/winresource
 
       - name: Diagnose AVFormatContext opaque-struct failure
         if: failure()
