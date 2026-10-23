@@ -132,6 +132,64 @@ impl TransitionType {
             duration_secs: 0.0,
         }
     }
+
+    /// Duration this transition can actually occupy between two clips.
+    ///
+    /// The blend is a zone CENTRED on the cut, so each side contributes half the
+    /// duration. Half of it must fit inside both neighbours, hence the `2 ×`
+    /// factor. Enforcing it in one place is what keeps the timeline badge, the
+    /// preview zone, the playback blend specs and the encoder from disagreeing
+    /// about how long a transition is: a 3 s transition on a 0.4 s clip used to
+    /// spill outside both clips, put a blend zone under the playhead while it sat
+    /// on the PREDECESSOR clip, and decode past the end of the source on export.
+    ///
+    /// Returns 0.0 for `Cut`.
+    pub fn clamped_secs(&self, clip_a_dur: f64, clip_b_dur: f64) -> f64 {
+        if self.kind == TransitionKind::Cut {
+            return 0.0;
+        }
+        (self.duration_secs as f64)
+            .min(2.0 * clip_a_dur.max(0.0))
+            .min(2.0 * clip_b_dur.max(0.0))
+            .max(0.0)
+    }
+}
+
+#[cfg(test)]
+mod duration_clamp_tests {
+    use super::*;
+
+    fn tr(kind: TransitionKind, secs: f32) -> TransitionType {
+        TransitionType::new(kind, secs)
+    }
+
+    #[test]
+    fn clamped_secs_uses_the_requested_duration_when_clips_are_long() {
+        assert_eq!(
+            tr(TransitionKind::Crossfade, 1.0).clamped_secs(10.0, 10.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn clamped_secs_shortens_to_the_shorter_neighbor() {
+        // Half the zone must fit in each neighbour: 2 × the shorter clip.
+        let three = tr(TransitionKind::Crossfade, 3.0);
+        assert_eq!(three.clamped_secs(0.4, 10.0), 0.8);
+        assert_eq!(three.clamped_secs(10.0, 0.7), 1.4);
+        assert_eq!(three.clamped_secs(10.0, 1.5), 3.0);
+    }
+
+    #[test]
+    fn clamped_secs_is_cut_if_duration_is_zero() {
+        assert_eq!(TransitionType::cut().clamped_secs(1.0, 1.0), 0.0);
+        assert_eq!(tr(TransitionKind::Iris, 0.0).clamped_secs(1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn clamped_secs_never_returns_a_negative_zone() {
+        assert_eq!(tr(TransitionKind::Wipe, 1.0).clamped_secs(-1.0, 5.0), 0.0);
+    }
 }
 
 /// Stored in `ProjectState`, serialized with the project.
@@ -234,6 +292,33 @@ pub trait VideoTransition: Send + Sync {
         height: u32,
         alpha: f32,
     ) -> Vec<u8>;
+
+    /// Blend into `out`, reusing its allocation when it is already big enough.
+    ///
+    /// Playback calls this once per displayed frame during a transition. A fresh
+    /// 5 MB frame buffer costs a page fault every 4 KiB it is written to, so
+    /// allocating one per frame — which `apply_rgba` must do when it returns a
+    /// `Vec` — spends more time faulting pages in than blending. Callers that hold
+    /// a buffer across frames get the blend for the cost of the arithmetic.
+    ///
+    /// Implementations must leave `out` exactly `frame_a.len()` bytes long and
+    /// must overwrite every byte (reused buffers arrive with the previous frame's
+    /// pixels in them).
+    ///
+    /// The default allocates through `apply_rgba`, so an effect that does not
+    /// bother to override this is still correct, just not allocation-free.
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width: u32,
+        height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
+        out.clear();
+        out.extend_from_slice(&self.apply_rgba(frame_a, frame_b, width, height, alpha));
+    }
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -256,4 +341,103 @@ pub fn registered() -> Vec<Box<dyn VideoTransition>> {
 pub fn registry() -> &'static HashMap<TransitionKind, Box<dyn VideoTransition>> {
     static REGISTRY: OnceLock<HashMap<TransitionKind, Box<dyn VideoTransition>>> = OnceLock::new();
     REGISTRY.get_or_init(|| make_entries().into_iter().map(|t| (t.kind(), t)).collect())
+}
+
+#[cfg(test)]
+mod blend_bench;
+
+/// The `apply_rgba` / `apply_rgba_into` contract.
+///
+/// `apply_rgba_into` exists purely so playback can blend into a buffer it owns;
+/// if the two ever disagree, the UI would show one picture and the encoder
+/// another. These tests pin the contract for every registered effect rather than
+/// for the ones written today.
+#[cfg(test)]
+mod buffer_reuse_tests {
+    use super::*;
+
+    const SIZES: [(u32, u32); 3] = [(8, 4), (37, 21), (64, 36)];
+
+    /// Deterministic, non-uniform frames: a blend that reads the wrong plane or
+    /// the wrong row shows up as a byte mismatch instead of matching by accident.
+    fn frames(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        let len = (w * h * 4) as usize;
+        let a = (0..len).map(|i| (i % 251) as u8).collect();
+        let b = (0..len).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn every_transition_blends_the_same_bytes_into_a_caller_owned_buffer() {
+        let mut buf = Vec::new();
+        for (w, h) in SIZES {
+            let (a, b) = frames(w, h);
+            for t in registered() {
+                for step in 0..=10 {
+                    let alpha = step as f32 / 10.0;
+                    let want = t.apply_rgba(&a, &b, w, h, alpha);
+                    // Dirty the buffer first: a reused buffer arrives holding the
+                    // previous frame, and "overwrite every byte" is part of the
+                    // contract — a partially stale frame would show as smeared
+                    // pixels that no other test would catch.
+                    buf.clear();
+                    buf.resize(a.len(), 0xAB);
+                    t.apply_rgba_into(&a, &b, w, h, alpha, &mut buf);
+                    assert_eq!(
+                        buf.len(),
+                        a.len(),
+                        "{} left a {}-byte buffer for a {}-byte frame at {w}×{h}",
+                        t.label(),
+                        buf.len(),
+                        a.len()
+                    );
+                    assert_eq!(
+                        buf,
+                        want,
+                        "{} disagree between apply_rgba and apply_rgba_into at {w}×{h}, alpha={alpha}",
+                        t.label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reused_buffer_is_not_reallocated_or_partially_stale() {
+        let (w, h) = (64, 36);
+        let (a, b) = frames(w, h);
+        let t = registry()
+            .get(&TransitionKind::Crossfade)
+            .expect("crossfade registered");
+
+        // Pre-fill with garbage at the right length: every implementation must
+        // overwrite all of it, because a reused buffer arrives dirty.
+        let mut buf = vec![0xABu8; a.len()];
+        let capacity = buf.capacity();
+
+        for step in 0..=4 {
+            let alpha = step as f32 / 4.0;
+            t.apply_rgba_into(&a, &b, w, h, alpha, &mut buf);
+            assert_eq!(buf.len(), a.len());
+            assert_eq!(buf.capacity(), capacity, "blend reallocated the buffer");
+            assert_eq!(buf, t.apply_rgba(&a, &b, w, h, alpha));
+        }
+    }
+
+    #[test]
+    fn a_resolution_change_resizes_the_reused_buffer() {
+        let t = registry()
+            .get(&TransitionKind::Crossfade)
+            .expect("crossfade registered");
+        let mut buf = Vec::new();
+
+        // Grow, then shrink: playback meets both across a resolution change and
+        // the buffer must follow the frame rather than the other way round.
+        for (w, h) in [(8u32, 4u32), (64, 36), (8, 4)] {
+            let (a, b) = frames(w, h);
+            t.apply_rgba_into(&a, &b, w, h, 0.6, &mut buf);
+            assert_eq!(buf.len(), a.len(), "{w}×{h}");
+            assert_eq!(buf, t.apply_rgba(&a, &b, w, h, 0.6), "{w}×{h}");
+        }
+    }
 }

@@ -13,11 +13,11 @@
 //   3. Compare against current sweep angle using wipe_alpha.
 //   4. Blend frame_a and frame_b at the resulting per-pixel alpha.
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{
-    alloc_frame, blend_byte, ease_in_out_cubic, norm_x, norm_y,
-    split_planes, uv_len, wipe_alpha, y_len,
+    alloc_frame, blend_byte, blend_byte_fixed, ease_in_out_cubic, fixed_inverse, fixed_weight,
+    norm_x, norm_y, split_planes, uv_len, wipe_alpha, y_len,
 };
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 /// Angular feather width in radians — ~8° gives a crisp but anti-aliased edge.
 const FEATHER: f32 = 0.14;
@@ -67,17 +67,20 @@ impl VideoTransition for ClockWipe {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "ClockWipe::apply — frame size mismatch");
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "ClockWipe::apply — frame size mismatch"
+        );
 
         // Sweep goes from 0 → 2π as alpha goes 0 → 1.
         let sweep = ease_in_out_cubic(alpha) * std::f32::consts::TAU;
 
-        let yl  = y_len(width, height);
+        let yl = y_len(width, height);
         let uvl = uv_len(width, height);
         let mut out = alloc_frame(width, height);
 
@@ -88,31 +91,34 @@ impl VideoTransition for ClockWipe {
         for py in 0..height {
             let ny = norm_y(py, height);
             for px in 0..width {
-                let nx    = norm_x(px, width);
+                let nx = norm_x(px, width);
                 let angle = clock_angle(nx, ny);
                 // wipe_alpha(coord=sweep, edge=angle, feather):
                 //   sweep > angle → pixel has been swept → a=1.0 → frame_b
                 //   sweep < angle → not yet swept         → a=0.0 → frame_a
-                let a  = wipe_alpha(sweep, angle, FEATHER);
-                let i  = (py * width + px) as usize;
+                let a = wipe_alpha(sweep, angle, FEATHER);
+                let i = (py * width + px) as usize;
                 out[i] = blend_byte(ya[i], yb[i], a);
             }
         }
 
         // ── Chroma planes (half res) ─────────────────────────────────────────
-        let uw = width  / 2;
+        let uw = width / 2;
         let uh = height / 2;
 
         let mut write_chroma = |src_a: &[u8], src_b: &[u8], off: usize| {
             for py in 0..uh {
                 let ny = norm_y(py, uh);
                 for px in 0..uw {
-                    let nx    = norm_x(px, uw);
+                    let nx = norm_x(px, uw);
                     let angle = clock_angle(nx, ny);
-                    let a     = wipe_alpha(sweep, angle, FEATHER);
-                    let i     = off + (py * uw + px) as usize;
-                    out[i]    = blend_byte(src_a[(py * uw + px) as usize],
-                                          src_b[(py * uw + px) as usize], a);
+                    let a = wipe_alpha(sweep, angle, FEATHER);
+                    let i = off + (py * uw + px) as usize;
+                    out[i] = blend_byte(
+                        src_a[(py * uw + px) as usize],
+                        src_b[(py * uw + px) as usize],
+                        a,
+                    );
                 }
             }
         };
@@ -129,16 +135,33 @@ impl VideoTransition for ClockWipe {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width: u32,
+        height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "ClockWipe::apply_rgba — frame size mismatch");
-        let sweep     = ease_in_out_cubic(alpha) * std::f32::consts::TAU;
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "ClockWipe::apply_rgba_into — frame size mismatch"
+        );
+        let sweep = ease_in_out_cubic(alpha) * std::f32::consts::TAU;
         let row_bytes = (width * 4) as usize;
-        let mut out   = vec![0u8; frame_a.len()];
+        out.resize(frame_a.len(), 0);
         out.par_chunks_mut(row_bytes)
             .zip(frame_a.par_chunks(row_bytes))
             .zip(frame_b.par_chunks(row_bytes))
@@ -146,18 +169,22 @@ impl VideoTransition for ClockWipe {
             .for_each(|(py, ((o_row, a_row), b_row))| {
                 let ny = norm_y(py as u32, height);
                 for px in 0..width as usize {
-                    let nx    = norm_x(px as u32, width);
+                    let nx = norm_x(px as u32, width);
                     let angle = clock_angle(nx, ny);
                     // Same convention as apply: blend_byte(ya, yb, a) → a=0→frame_a, a=1→frame_b
-                    let a     = wipe_alpha(sweep, angle, FEATHER);
-                    let base  = px * 4;
-                    o_row[base]     = blend_byte(a_row[base],     b_row[base],     a);
-                    o_row[base + 1] = blend_byte(a_row[base + 1], b_row[base + 1], a);
-                    o_row[base + 2] = blend_byte(a_row[base + 2], b_row[base + 2], a);
+                    let a = wipe_alpha(sweep, angle, FEATHER);
+                    let base = px * 4;
+                    // Integer blend with a per-pixel weight (the feather
+                    // makes every pixel's alpha different, so the weight is
+                    // hoisted per pixel, not per frame).
+                    let w = fixed_weight(a);
+                    let inv = fixed_inverse(w);
+                    o_row[base] = blend_byte_fixed(a_row[base], b_row[base], inv, w);
+                    o_row[base + 1] = blend_byte_fixed(a_row[base + 1], b_row[base + 1], inv, w);
+                    o_row[base + 2] = blend_byte_fixed(a_row[base + 2], b_row[base + 2], inv, w);
                     o_row[base + 3] = 255;
                 }
             });
-        out
     }
 }
 
@@ -166,9 +193,13 @@ mod tests {
     use super::*;
 
     fn packed(y: u8, uv: u8, w: u32, h: u32) -> Vec<u8> {
-        let yl = y_len(w, h); let uvl = uv_len(w, h);
+        let yl = y_len(w, h);
+        let uvl = uv_len(w, h);
         let mut b = vec![0u8; yl + uvl * 2];
-        b[..yl].fill(y); b[yl..yl+uvl].fill(uv); b[yl+uvl..].fill(uv); b
+        b[..yl].fill(y);
+        b[yl..yl + uvl].fill(uv);
+        b[yl + uvl..].fill(uv);
+        b
     }
 
     #[test]
@@ -186,7 +217,7 @@ mod tests {
         let b = packed(200, 64, w, h);
         let result = ClockWipe.apply(&a, &b, w, h, 0.0);
         // sweep=0 → nothing swept → all frame_a
-        assert!(result[..y_len(w,h)].iter().all(|&v| v == 100));
+        assert!(result[..y_len(w, h)].iter().all(|&v| v == 100));
     }
 
     #[test]
@@ -196,7 +227,7 @@ mod tests {
         let b = packed(200, 64, w, h);
         let result = ClockWipe.apply(&a, &b, w, h, 1.0);
         // sweep=2π → full revolution → all frame_b (allow 1-value feather tolerance)
-        assert!(result[..y_len(w,h)].iter().all(|&v| v >= 198));
+        assert!(result[..y_len(w, h)].iter().all(|&v| v >= 198));
     }
 
     #[test]
@@ -211,8 +242,10 @@ mod tests {
         // Right-center pixel → ~π/2
         let angle = clock_angle(0.9, 0.5);
         let expected = std::f32::consts::FRAC_PI_2;
-        assert!((angle - expected).abs() < 0.2,
-            "3 o'clock should be near π/2, got {angle}");
+        assert!(
+            (angle - expected).abs() < 0.2,
+            "3 o'clock should be near π/2, got {angle}"
+        );
     }
 
     #[test]
@@ -226,7 +259,9 @@ mod tests {
         let result = ClockWipe.apply(&a, &b, w, h, 0.397);
         let top_right = result[(h / 4 * w + w * 3 / 4) as usize];
         let bottom_left = result[(h * 3 / 4 * w + w / 4) as usize];
-        assert!(top_right > bottom_left,
-            "top-right ({top_right}) should be more revealed than bottom-left ({bottom_left})");
+        assert!(
+            top_right > bottom_left,
+            "top-right ({top_right}) should be more revealed than bottom-left ({bottom_left})"
+        );
     }
 }

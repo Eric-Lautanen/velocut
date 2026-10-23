@@ -12,10 +12,10 @@
 // Both halves use ease_in_out so the flash accelerates in and out
 // rather than burning at a constant rate.
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{
     alloc_frame, blend_byte, ease_in_out, split_planes, uv_len, y_len,
 };
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 pub struct DipToWhite;
 
@@ -44,14 +44,17 @@ impl VideoTransition for DipToWhite {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "DipToWhite::apply — frame size mismatch");
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "DipToWhite::apply — frame size mismatch"
+        );
 
-        let yl  = y_len(width, height);
+        let yl = y_len(width, height);
         let uvl = uv_len(width, height);
         let mut out = alloc_frame(width, height);
 
@@ -61,15 +64,27 @@ impl VideoTransition for DipToWhite {
         if alpha < 0.5 {
             // ── frame_a → white ───────────────────────────────────────────────
             let t = ease_in_out(alpha * 2.0);
-            for i in 0..yl  { out[i]          = blend_byte(ya[i], 255, t); }
-            for i in 0..uvl { out[yl + i]     = blend_byte(ua[i], 128, t); }
-            for i in 0..uvl { out[yl+uvl + i] = blend_byte(va[i], 128, t); }
+            for i in 0..yl {
+                out[i] = blend_byte(ya[i], 255, t);
+            }
+            for i in 0..uvl {
+                out[yl + i] = blend_byte(ua[i], 128, t);
+            }
+            for i in 0..uvl {
+                out[yl + uvl + i] = blend_byte(va[i], 128, t);
+            }
         } else {
             // ── white → frame_b ───────────────────────────────────────────────
             let t = ease_in_out((alpha - 0.5) * 2.0);
-            for i in 0..yl  { out[i]          = blend_byte(255, yb[i], t); }
-            for i in 0..uvl { out[yl + i]     = blend_byte(128, ub[i], t); }
-            for i in 0..uvl { out[yl+uvl + i] = blend_byte(128, vb[i], t); }
+            for i in 0..yl {
+                out[i] = blend_byte(255, yb[i], t);
+            }
+            for i in 0..uvl {
+                out[yl + i] = blend_byte(128, ub[i], t);
+            }
+            for i in 0..uvl {
+                out[yl + uvl + i] = blend_byte(128, vb[i], t);
+            }
         }
 
         out
@@ -81,14 +96,31 @@ impl VideoTransition for DipToWhite {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        _width:  u32,
-        _height: u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        _width: u32,
+        _height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "DipToWhite::apply_rgba — frame size mismatch");
-        let mut out = vec![0u8; frame_a.len()];
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "DipToWhite::apply_rgba_into — frame size mismatch"
+        );
+        out.resize(frame_a.len(), 0);
         if alpha < 0.5 {
             let t = ease_in_out(alpha * 2.0);
             out.par_chunks_mut(4)
@@ -110,7 +142,6 @@ impl VideoTransition for DipToWhite {
                     o[3] = 255;
                 });
         }
-        out
     }
 }
 
@@ -119,9 +150,13 @@ mod tests {
     use super::*;
 
     fn packed(y: u8, uv: u8, w: u32, h: u32) -> Vec<u8> {
-        let yl = y_len(w, h); let uvl = uv_len(w, h);
+        let yl = y_len(w, h);
+        let uvl = uv_len(w, h);
         let mut b = vec![0u8; yl + uvl * 2];
-        b[..yl].fill(y); b[yl..yl+uvl].fill(uv); b[yl+uvl..].fill(uv); b
+        b[..yl].fill(y);
+        b[yl..yl + uvl].fill(uv);
+        b[yl + uvl..].fill(uv);
+        b
     }
 
     #[test]
@@ -138,7 +173,7 @@ mod tests {
         let a = packed(100, 128, w, h);
         let b = packed(200, 64, w, h);
         let result = DipToWhite.apply(&a, &b, w, h, 0.0);
-        assert!(result[..y_len(w,h)].iter().all(|&v| v == 100));
+        assert!(result[..y_len(w, h)].iter().all(|&v| v == 100));
     }
 
     #[test]
@@ -147,7 +182,7 @@ mod tests {
         let a = packed(100, 128, w, h);
         let b = packed(200, 64, w, h);
         let result = DipToWhite.apply(&a, &b, w, h, 1.0);
-        assert!(result[..y_len(w,h)].iter().all(|&v| v == 200));
+        assert!(result[..y_len(w, h)].iter().all(|&v| v == 200));
     }
 
     #[test]
@@ -157,6 +192,6 @@ mod tests {
         let b = packed(0, 128, w, h);
         let result = DipToWhite.apply(&a, &b, w, h, 0.5);
         // At exact midpoint ease_in_out(1.0) = 1.0 → full white
-        assert!(result[..y_len(w,h)].iter().all(|&v| v == 255));
+        assert!(result[..y_len(w, h)].iter().all(|&v| v == 255));
     }
 }

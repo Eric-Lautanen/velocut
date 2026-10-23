@@ -16,8 +16,8 @@
 // toward 0 is an acceptable SDR approximation and keeps the algorithm
 // consistent with crossfade.rs's `blend_byte` approach.
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{blend_byte, ease_in_out, y_len};
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 /// Fade-to-black between two clips.
 ///
@@ -35,11 +35,11 @@ impl VideoTransition for DipToBlack {
     }
 
     fn icon(&self) -> &'static str {
-        "■"  // U+2B1B U+FE0F — variation selector required for emoji rendering
+        "■" // U+2B1B U+FE0F — variation selector required for emoji rendering
     }
 
     fn default_duration_secs(&self) -> f32 {
-        2.0  // slightly longer than crossfade — the double-fade needs room to breathe
+        2.0 // slightly longer than crossfade — the double-fade needs room to breathe
     }
 
     fn build(&self, duration_secs: f32) -> TransitionType {
@@ -60,9 +60,9 @@ impl VideoTransition for DipToBlack {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:  u32,
+        width: u32,
         height: u32,
-        alpha:   f32,
+        alpha: f32,
     ) -> Vec<u8> {
         debug_assert_eq!(
             frame_a.len(),
@@ -77,17 +77,23 @@ impl VideoTransition for DipToBlack {
         let luma_len = y_len(width, height);
 
         let blend_to_black = |src: &[u8], ramp: f32| -> Vec<u8> {
-            src.iter().enumerate().map(|(i, &v)| {
-                let black = if i < luma_len { 0u8 } else { 128u8 };
-                blend_byte(v, black, ramp)
-            }).collect()
+            src.iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let black = if i < luma_len { 0u8 } else { 128u8 };
+                    blend_byte(v, black, ramp)
+                })
+                .collect()
         };
 
         let blend_from_black = |src: &[u8], ramp: f32| -> Vec<u8> {
-            src.iter().enumerate().map(|(i, &v)| {
-                let black = if i < luma_len { 0u8 } else { 128u8 };
-                blend_byte(black, v, ramp)
-            }).collect()
+            src.iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let black = if i < luma_len { 0u8 } else { 128u8 };
+                    blend_byte(black, v, ramp)
+                })
+                .collect()
         };
 
         if alpha <= 0.5 {
@@ -109,14 +115,31 @@ impl VideoTransition for DipToBlack {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        _width:  u32,
-        _height: u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        _width: u32,
+        _height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "DipToBlack::apply_rgba — frame size mismatch");
-        let mut out = vec![0u8; frame_a.len()];
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "DipToBlack::apply_rgba_into — frame size mismatch"
+        );
+        out.resize(frame_a.len(), 0);
         if alpha <= 0.5 {
             let ramp = ease_in_out(alpha * 2.0);
             out.par_chunks_mut(4)
@@ -138,7 +161,6 @@ impl VideoTransition for DipToBlack {
                     o[3] = 255;
                 });
         }
-        out
     }
 }
 
@@ -177,7 +199,11 @@ mod tests {
         let b = make_frame(255, 12);
         let result = t.apply(&a, &b, 4, 3, 0.5);
         // First half at alpha=0.5: ease_in_out(1.0) = 1.0 → blend(255, 0, 1.0) = 0
-        assert!(result.iter().all(|&v| v == 0), "midpoint should be black, got {:?}", result);
+        assert!(
+            result.iter().all(|&v| v == 0),
+            "midpoint should be black, got {:?}",
+            result
+        );
     }
 
     #[test]

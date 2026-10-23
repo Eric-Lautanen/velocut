@@ -18,10 +18,11 @@
 //   edge   = ease_in_out(alpha)           — bar position 0→1 as alpha goes 0→1
 //   per-px = blend_byte(b, a, wipe_alpha) — frame_b left of bar, frame_a right
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{
-    ease_in_out, norm_x, split_planes, wipe_alpha, blend_byte,
+    blend_byte, blend_byte_fixed, ease_in_out, fixed_inverse, fixed_weight, norm_x, split_planes,
+    wipe_alpha,
 };
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 /// Feather width as a fraction of frame width.
 ///
@@ -64,14 +65,16 @@ impl VideoTransition for Wipe {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
         debug_assert_eq!(
-            frame_a.len(), frame_b.len(),
+            frame_a.len(),
+            frame_b.len(),
             "Wipe::apply — frame size mismatch: {} vs {}",
-            frame_a.len(), frame_b.len(),
+            frame_a.len(),
+            frame_b.len(),
         );
 
         // Eased bar position in [0, 1]: the normalised x-coordinate of the leading edge.
@@ -85,21 +88,21 @@ impl VideoTransition for Wipe {
         // ── Y plane (full resolution) ────────────────────────────────────────
         for py in 0..height {
             for px in 0..width {
-                let nx  = norm_x(px, width);
-                let wa  = wipe_alpha(nx, edge, FEATHER);
+                let nx = norm_x(px, width);
+                let wa = wipe_alpha(nx, edge, FEATHER);
                 let idx = (py * width + px) as usize;
                 out.push(blend_byte(by[idx], ay[idx], wa));
             }
         }
 
         // ── Chroma planes (half resolution each dimension) ───────────────────
-        let uw = width  / 2;
+        let uw = width / 2;
         let uh = height / 2;
 
         for py in 0..uh {
             for px in 0..uw {
-                let nx  = norm_x(px, uw);
-                let wa  = wipe_alpha(nx, edge, FEATHER);
+                let nx = norm_x(px, uw);
+                let wa = wipe_alpha(nx, edge, FEATHER);
                 let idx = (py * uw + px) as usize;
                 out.push(blend_byte(bu[idx], au[idx], wa));
             }
@@ -107,8 +110,8 @@ impl VideoTransition for Wipe {
 
         for py in 0..uh {
             for px in 0..uw {
-                let nx  = norm_x(px, uw);
-                let wa  = wipe_alpha(nx, edge, FEATHER);
+                let nx = norm_x(px, uw);
+                let wa = wipe_alpha(nx, edge, FEATHER);
                 let idx = (py * uw + px) as usize;
                 out.push(blend_byte(bv[idx], av[idx], wa));
             }
@@ -123,39 +126,60 @@ impl VideoTransition for Wipe {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        _height: u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width: u32,
+        _height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "Wipe::apply_rgba — frame size mismatch");
-        let edge      = ease_in_out(alpha);
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "Wipe::apply_rgba_into — frame size mismatch"
+        );
+        let edge = ease_in_out(alpha);
         let row_bytes = (width * 4) as usize;
-        let mut out   = vec![0u8; frame_a.len()];
+        out.resize(frame_a.len(), 0);
         out.par_chunks_mut(row_bytes)
             .zip(frame_a.par_chunks(row_bytes))
             .zip(frame_b.par_chunks(row_bytes))
             .for_each(|((o_row, a_row), b_row)| {
                 for px in 0..width as usize {
-                    let nx   = norm_x(px as u32, width);
-                    let wa   = wipe_alpha(nx, edge, FEATHER);
+                    let nx = norm_x(px as u32, width);
+                    let wa = wipe_alpha(nx, edge, FEATHER);
                     let base = px * 4;
                     // Same convention as apply: blend_byte(b, a, wa) → wa=0→b, wa=1→a
-                    o_row[base]     = blend_byte(b_row[base],     a_row[base],     wa);
-                    o_row[base + 1] = blend_byte(b_row[base + 1], a_row[base + 1], wa);
-                    o_row[base + 2] = blend_byte(b_row[base + 2], a_row[base + 2], wa);
+                    // Integer blend with a per-pixel weight (the feather
+                    // makes every pixel's alpha different, so the weight is
+                    // hoisted per pixel, not per frame).
+                    let w = fixed_weight(wa);
+                    let inv = fixed_inverse(w);
+                    o_row[base] = blend_byte_fixed(b_row[base], a_row[base], inv, w);
+                    o_row[base + 1] = blend_byte_fixed(b_row[base + 1], a_row[base + 1], inv, w);
+                    o_row[base + 2] = blend_byte_fixed(b_row[base + 2], a_row[base + 2], inv, w);
                     o_row[base + 3] = 255;
                 }
             });
-        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transitions::helpers::{y_len, uv_len};
+    use crate::transitions::helpers::{uv_len, y_len};
 
     fn yuv_frame(y_val: u8, uv_val: u8, w: u32, h: u32) -> Vec<u8> {
         let mut buf = vec![y_val; y_len(w, h)];
@@ -168,7 +192,7 @@ mod tests {
         let t = Wipe;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 0.0);
         // edge = ease_in_out(0) = 0.0; all nx > 0+feather/2 → wa = 1.0 → frame_a
         assert!(
@@ -182,7 +206,7 @@ mod tests {
         let t = Wipe;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 1.0);
         // edge = ease_in_out(1) = 1.0; all nx < 1.0-feather/2 → wa = 0.0 → frame_b
         assert!(
@@ -196,12 +220,15 @@ mod tests {
         let t = Wipe;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 0.5);
         // edge = 0.5; col 0 (nx=0.0625) left of bar → frame_b (50)
-        assert_eq!(out[0], 50,  "leftmost pixel should be frame_b at alpha=0.5");
+        assert_eq!(out[0], 50, "leftmost pixel should be frame_b at alpha=0.5");
         // col 7 (nx=0.9375) right of bar → frame_a (200)
-        assert_eq!(out[7], 200, "rightmost pixel should be frame_a at alpha=0.5");
+        assert_eq!(
+            out[7], 200,
+            "rightmost pixel should be frame_a at alpha=0.5"
+        );
     }
 
     #[test]

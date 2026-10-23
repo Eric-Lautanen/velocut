@@ -17,11 +17,11 @@
 // UV plane pixels are processed at (w/2 × h/2) — norm_x/norm_y are called
 // with the chroma dims so the circle stays geometrically correct.
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{
-    blend_byte, center_dist, ease_in_out_cubic, norm_x, norm_y,
-    split_planes, uv_len, wipe_alpha, y_len,
+    blend_byte, blend_byte_fixed, center_dist, ease_in_out_cubic, fixed_inverse, fixed_weight,
+    norm_x, norm_y, split_planes, uv_len, wipe_alpha, y_len,
 };
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 /// Feather width as a fraction of the frame — 4 % gives a smooth anti-aliased
 /// edge that reads well on most content without going mushy.
@@ -43,7 +43,7 @@ impl VideoTransition for Iris {
     }
 
     fn icon(&self) -> &'static str {
-        "○"  // U+2B55 U+FE0F — variation selector required
+        "○" // U+2B55 U+FE0F — variation selector required
     }
 
     fn default_duration_secs(&self) -> f32 {
@@ -62,9 +62,9 @@ impl VideoTransition for Iris {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
         debug_assert_eq!(
             frame_a.len(),
@@ -78,7 +78,7 @@ impl VideoTransition for Iris {
         // at a constant rate, which tends to feel mechanical.
         let radius = ease_in_out_cubic(alpha) * MAX_RADIUS;
 
-        let yl  = y_len(width, height);
+        let yl = y_len(width, height);
         let uvl = uv_len(width, height);
         let mut out = vec![0u8; yl + uvl * 2];
 
@@ -89,7 +89,7 @@ impl VideoTransition for Iris {
         for py in 0..height {
             let ny = norm_y(py, height);
             for px in 0..width {
-                let nx   = norm_x(px, width);
+                let nx = norm_x(px, width);
                 let dist = center_dist(nx, ny);
                 // wipe_alpha(coord=radius, edge=dist): when dist < radius → coord > edge → 1.0 (frame_b)
                 //                                      when dist > radius → coord < edge → 0.0 (frame_a)
@@ -100,15 +100,15 @@ impl VideoTransition for Iris {
         }
 
         // ── U plane ───────────────────────────────────────────────────────────
-        let uw = width  / 2;
+        let uw = width / 2;
         let uh = height / 2;
         for py in 0..uh {
             let ny = norm_y(py, uh);
             for px in 0..uw {
-                let nx   = norm_x(px, uw);
+                let nx = norm_x(px, uw);
                 let dist = center_dist(nx, ny);
-                let a    = wipe_alpha(radius, dist, FEATHER);
-                let i    = (py * uw + px) as usize;
+                let a = wipe_alpha(radius, dist, FEATHER);
+                let i = (py * uw + px) as usize;
                 out[yl + i] = blend_byte(ua[i], ub[i], a);
             }
         }
@@ -117,10 +117,10 @@ impl VideoTransition for Iris {
         for py in 0..uh {
             let ny = norm_y(py, uh);
             for px in 0..uw {
-                let nx   = norm_x(px, uw);
+                let nx = norm_x(px, uw);
                 let dist = center_dist(nx, ny);
-                let a    = wipe_alpha(radius, dist, FEATHER);
-                let i    = (py * uw + px) as usize;
+                let a = wipe_alpha(radius, dist, FEATHER);
+                let i = (py * uw + px) as usize;
                 out[yl + uvl + i] = blend_byte(va[i], vb[i], a);
             }
         }
@@ -134,16 +134,33 @@ impl VideoTransition for Iris {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width: u32,
+        height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "Iris::apply_rgba — frame size mismatch");
-        let radius    = ease_in_out_cubic(alpha) * MAX_RADIUS;
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "Iris::apply_rgba_into — frame size mismatch"
+        );
+        let radius = ease_in_out_cubic(alpha) * MAX_RADIUS;
         let row_bytes = (width * 4) as usize;
-        let mut out   = vec![0u8; frame_a.len()];
+        out.resize(frame_a.len(), 0);
         out.par_chunks_mut(row_bytes)
             .zip(frame_a.par_chunks(row_bytes))
             .zip(frame_b.par_chunks(row_bytes))
@@ -151,18 +168,22 @@ impl VideoTransition for Iris {
             .for_each(|(py, ((o_row, a_row), b_row))| {
                 let ny = norm_y(py as u32, height);
                 for px in 0..width as usize {
-                    let nx   = norm_x(px as u32, width);
+                    let nx = norm_x(px as u32, width);
                     let dist = center_dist(nx, ny);
-                    let a    = wipe_alpha(radius, dist, FEATHER);
+                    let a = wipe_alpha(radius, dist, FEATHER);
                     let base = px * 4;
                     // Same convention as apply: blend_byte(ya, yb, a) → a=0→frame_a, a=1→frame_b
-                    o_row[base]     = blend_byte(a_row[base],     b_row[base],     a);
-                    o_row[base + 1] = blend_byte(a_row[base + 1], b_row[base + 1], a);
-                    o_row[base + 2] = blend_byte(a_row[base + 2], b_row[base + 2], a);
+                    // Integer blend with a per-pixel weight (the feather
+                    // makes every pixel's alpha different, so the weight is
+                    // hoisted per pixel, not per frame).
+                    let w = fixed_weight(a);
+                    let inv = fixed_inverse(w);
+                    o_row[base] = blend_byte_fixed(a_row[base], b_row[base], inv, w);
+                    o_row[base + 1] = blend_byte_fixed(a_row[base + 1], b_row[base + 1], inv, w);
+                    o_row[base + 2] = blend_byte_fixed(a_row[base + 2], b_row[base + 2], inv, w);
                     o_row[base + 3] = 255;
                 }
             });
-        out
     }
 }
 
@@ -171,7 +192,7 @@ mod tests {
     use super::*;
 
     fn packed_frame(y: u8, uv: u8, w: u32, h: u32) -> Vec<u8> {
-        let yl  = y_len(w, h);
+        let yl = y_len(w, h);
         let uvl = uv_len(w, h);
         let mut buf = vec![0u8; yl + uvl * 2];
         buf[..yl].fill(y);
@@ -185,12 +206,14 @@ mod tests {
         let iris = Iris;
         let (w, h) = (8, 4);
         let a = packed_frame(100, 128, w, h);
-        let b = packed_frame(200, 64,  w, h);
+        let b = packed_frame(200, 64, w, h);
         let result = iris.apply(&a, &b, w, h, 0.0);
         // radius = 0 → every pixel is outside the iris → all frame_a
         let yl = y_len(w, h);
-        assert!(result[..yl].iter().all(|&v| v == 100),
-            "Y plane should be frame_a at alpha=0");
+        assert!(
+            result[..yl].iter().all(|&v| v == 100),
+            "Y plane should be frame_a at alpha=0"
+        );
     }
 
     #[test]
@@ -198,13 +221,16 @@ mod tests {
         let iris = Iris;
         let (w, h) = (8, 4);
         let a = packed_frame(100, 128, w, h);
-        let b = packed_frame(200, 64,  w, h);
+        let b = packed_frame(200, 64, w, h);
         let result = iris.apply(&a, &b, w, h, 1.0);
         // radius = MAX_RADIUS → every pixel is inside the iris → all frame_b
         let yl = y_len(w, h);
         // Allow a 1-value rounding tolerance at feather boundary pixels
-        assert!(result[..yl].iter().all(|&v| v >= 198),
-            "Y plane should be frame_b at alpha=1, got min={}", result[..yl].iter().min().unwrap());
+        assert!(
+            result[..yl].iter().all(|&v| v >= 198),
+            "Y plane should be frame_b at alpha=1, got min={}",
+            result[..yl].iter().min().unwrap()
+        );
     }
 
     #[test]
@@ -227,7 +253,9 @@ mod tests {
         // Center pixel (4,4) should be more frame_b than corner pixel (0,0)
         let center = result[(h / 2 * w + w / 2) as usize];
         let corner = result[0];
-        assert!(center > corner,
-            "center ({center}) should be brighter than corner ({corner}) at mid-iris");
+        assert!(
+            center > corner,
+            "center ({center}) should be brighter than corner ({corner}) at mid-iris"
+        );
     }
 }

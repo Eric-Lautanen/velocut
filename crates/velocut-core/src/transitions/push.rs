@@ -24,8 +24,8 @@
 // UV planes use the same displacement logic at half-resolution: dividing
 // pixel coordinates by 2 (integer) gives the correct chroma sample.
 
-use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 use crate::transitions::helpers::{ease_in_out_cubic, split_planes};
+use crate::transitions::{TransitionKind, TransitionType, VideoTransition};
 
 /// Horizontal push: frame_b enters from the right, frame_a exits left.
 pub struct Push;
@@ -60,14 +60,16 @@ impl VideoTransition for Push {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        height:  u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
         debug_assert_eq!(
-            frame_a.len(), frame_b.len(),
+            frame_a.len(),
+            frame_b.len(),
             "Push::apply — frame size mismatch: {} vs {}",
-            frame_a.len(), frame_b.len(),
+            frame_a.len(),
+            frame_b.len(),
         );
 
         // Cubic ease for a momentum-based feel.
@@ -76,7 +78,7 @@ impl VideoTransition for Push {
         // The screen x-column at which frame_b's left edge sits.
         // Everything to the left of this column belongs to frame_a (shifted).
         let boundary_f = (1.0 - p) * width as f32;
-        let boundary   = boundary_f.round() as u32;
+        let boundary = boundary_f.round() as u32;
 
         let (ay, au, av) = split_planes(frame_a, width, height);
         let (by, bu, bv) = split_planes(frame_b, width, height);
@@ -93,12 +95,12 @@ impl VideoTransition for Push {
                 let idx = (py * width + px) as usize;
                 if px < boundary {
                     // frame_a region — sample shifted right within frame_a
-                    let src_x  = (px + shift_a).min(width - 1);
+                    let src_x = (px + shift_a).min(width - 1);
                     let src_idx = (py * width + src_x) as usize;
                     out.push(ay[src_idx]);
                 } else {
                     // frame_b region — sample from frame_b's left edge
-                    let src_x   = px - boundary;
+                    let src_x = px - boundary;
                     let src_idx = (py * width + src_x) as usize;
                     out.push(by[src_idx]);
                 }
@@ -108,20 +110,20 @@ impl VideoTransition for Push {
 
         // ── Chroma planes (half resolution each dimension) ───────────────────
         // Scale boundary and shift to chroma resolution by halving.
-        let uw         = width  / 2;
-        let uh         = height / 2;
+        let uw = width / 2;
+        let uh = height / 2;
         let c_boundary = (boundary_f * 0.5).round() as u32;
-        let c_shift_a  = ((p * width as f32) * 0.5).round() as u32;
+        let c_shift_a = ((p * width as f32) * 0.5).round() as u32;
 
         let process_chroma = |src_a: &[u8], src_b: &[u8], out: &mut Vec<u8>| {
             for py in 0..uh {
                 for px in 0..uw {
                     if px < c_boundary {
-                        let src_x   = (px + c_shift_a).min(uw - 1);
+                        let src_x = (px + c_shift_a).min(uw - 1);
                         let src_idx = (py * uw + src_x) as usize;
                         out.push(src_a[src_idx]);
                     } else {
-                        let src_x   = px - c_boundary;
+                        let src_x = px - c_boundary;
                         let src_idx = (py * uw + src_x) as usize;
                         out.push(src_b[src_idx]);
                     }
@@ -141,19 +143,36 @@ impl VideoTransition for Push {
         &self,
         frame_a: &[u8],
         frame_b: &[u8],
-        width:   u32,
-        _height: u32,
-        alpha:   f32,
+        width: u32,
+        height: u32,
+        alpha: f32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.apply_rgba_into(frame_a, frame_b, width, height, alpha, &mut out);
+        out
+    }
+
+    fn apply_rgba_into(
+        &self,
+        frame_a: &[u8],
+        frame_b: &[u8],
+        width: u32,
+        _height: u32,
+        alpha: f32,
+        out: &mut Vec<u8>,
+    ) {
         use rayon::prelude::*;
-        debug_assert_eq!(frame_a.len(), frame_b.len(),
-            "Push::apply_rgba — frame size mismatch");
-        let p        = ease_in_out_cubic(alpha);
+        debug_assert_eq!(
+            frame_a.len(),
+            frame_b.len(),
+            "Push::apply_rgba_into — frame size mismatch"
+        );
+        let p = ease_in_out_cubic(alpha);
         let boundary = ((1.0 - p) * width as f32).round() as usize;
-        let shift_a  = (p * width as f32).round() as usize;
-        let w        = width as usize;
+        let shift_a = (p * width as f32).round() as usize;
+        let w = width as usize;
         let row_bytes = w * 4;
-        let mut out  = vec![0u8; frame_a.len()];
+        out.resize(frame_a.len(), 0);
         out.par_chunks_mut(row_bytes)
             .zip(frame_a.par_chunks(row_bytes))
             .zip(frame_b.par_chunks(row_bytes))
@@ -169,14 +188,13 @@ impl VideoTransition for Push {
                     }
                 }
             });
-        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transitions::helpers::{y_len, uv_len};
+    use crate::transitions::helpers::{uv_len, y_len};
 
     fn yuv_frame(y_val: u8, uv_val: u8, w: u32, h: u32) -> Vec<u8> {
         let mut buf = vec![y_val; y_len(w, h)];
@@ -204,7 +222,7 @@ mod tests {
         let t = Push;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 0.0);
         // p=0 → boundary=width → all pixels from frame_a at src_x=x+0 → 200
         assert!(
@@ -218,7 +236,7 @@ mod tests {
         let t = Push;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 1.0);
         // p=1 → boundary=0 → all pixels from frame_b at src_x=x−0 → 50
         assert!(
@@ -244,7 +262,7 @@ mod tests {
         let t = Push;
         let (w, h) = (8_u32, 4_u32);
         let a = yuv_frame(200, 100, w, h);
-        let b = yuv_frame(50,  128, w, h);
+        let b = yuv_frame(50, 128, w, h);
         let out = t.apply(&a, &b, w, h, 0.5);
         // No pixel should be 0 (black) — both clips fill the screen.
         assert!(
@@ -262,7 +280,7 @@ mod tests {
         let (w, h) = (8_u32, 2_u32);
 
         let a = gradient_frame(w, h); // Y values: 0,1,2,3,4,5,6,7 per row
-        // Build frame_b manually: col x → x+100
+                                      // Build frame_b manually: col x → x+100
         let yl = y_len(w, h);
         let cl = uv_len(w, h);
         let mut b = Vec::with_capacity(yl + cl * 2);
