@@ -164,8 +164,31 @@ pub(super) fn blend_rgba_transition(
     alpha: f32,
     kind: TransitionKind,
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    blend_rgba_transition_into(a, b, w, h, alpha, kind, &mut out);
+    out
+}
+
+/// Same blend, into a caller-owned buffer.
+///
+/// `out` is resized to the frame size and fully overwritten. During playback
+/// this is the difference between faulting ~1200 fresh pages per displayed
+/// frame and writing into memory that is already mapped: a 5 MB frame buffer
+/// that is allocated and freed every frame is handed back by the allocator to
+/// the OS, so every write pays a page fault again.
+pub(super) fn blend_rgba_transition_into(
+    a: &[u8],
+    b: &[u8],
+    w: u32,
+    h: u32,
+    alpha: f32,
+    kind: TransitionKind,
+    out: &mut Vec<u8>,
+) {
     if kind == TransitionKind::Cut {
-        return a.to_vec();
+        out.clear();
+        out.extend_from_slice(a);
+        return;
     }
 
     let reg = registry();
@@ -174,5 +197,191 @@ pub(super) fn blend_rgba_transition(
         .expect(
             "blend_rgba_transition: unregistered TransitionKind — add it to declare_transitions!",
         )
-        .apply_rgba(a, b, w, h, alpha)
+        .apply_rgba_into(a, b, w, h, alpha, out)
+}
+
+/// Rotate a freshly blended frame into `held` and return the copy that goes out
+/// on the channel.
+///
+/// The playback thread keeps two buffers alive: `scratch` (where the next blend
+/// is written) and `held` (the last blended frame, re-sent when decoder_b is
+/// still burning). Swapping them costs two pointer moves, so the blend always
+/// writes into already-faulted pages and the only allocation per frame is the
+/// copy the channel takes ownership of.
+///
+/// `send_into` is the buffer the outgoing copy goes into — normally one the UI
+/// has finished with and handed back, which is what keeps the copy from faulting
+/// fresh pages. An empty `Vec` is fine and simply allocates.
+///
+/// Returns the frame to send. On the first blend, or after a resolution change,
+/// `scratch` is left empty and the next blend re-allocates it once.
+pub(super) fn rotate_blended_frame(
+    scratch: &mut Vec<u8>,
+    held: &mut Option<Vec<u8>>,
+    send_into: Vec<u8>,
+) -> Vec<u8> {
+    let mut previous = Some(std::mem::take(scratch));
+    std::mem::swap(held, &mut previous);
+    if let Some(recycled) = previous {
+        *scratch = recycled;
+    }
+
+    let frame = held
+        .as_ref()
+        .expect("rotate_blended_frame called with nothing blended");
+    let mut out = send_into;
+    out.clear();
+    out.extend_from_slice(frame);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in for the blend: leave `scratch` holding a frame of `tag` bytes.
+    fn fill(scratch: &mut Vec<u8>, tag: u8, len: usize) {
+        scratch.clear();
+        scratch.resize(len, tag);
+    }
+
+    #[test]
+    fn rotation_keeps_the_sent_frame_and_recycles_the_previous_one() {
+        const LEN: usize = 64;
+        let len = LEN;
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut held: Option<Vec<u8>> = None;
+
+        // Frame 1: nothing held yet, so there is no buffer to recycle.
+        fill(&mut scratch, 1, len);
+        let sent = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+        assert_eq!(sent, vec![1u8; len]);
+        assert_eq!(held.as_deref(), Some(&[1u8; LEN][..]));
+        assert!(
+            scratch.is_empty(),
+            "scratch should be empty after the first frame"
+        );
+
+        // Frame 2: the sent copy is the only positive; scratch still cold.
+        fill(&mut scratch, 2, len);
+        let sent = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+        assert_eq!(sent, vec![2u8; len]);
+        assert_eq!(held.as_deref(), Some(&[2u8; LEN][..]));
+        assert_eq!(
+            scratch.len(),
+            len,
+            "old held frame becomes the next scratch"
+        );
+        assert_eq!(scratch, vec![1u8; len]);
+
+        // Frame 3: steady state — the scratch is the previous held buffer, so the
+        // blend writes into memory that is already faulted in.
+        let capacity = scratch.capacity();
+        scratch.clear();
+        scratch.resize(len, 3);
+        assert_eq!(scratch.capacity(), capacity, "scratch must not reallocate");
+        let sent = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+        assert_eq!(sent, vec![3u8; len]);
+        assert_eq!(held.as_deref(), Some(&[3u8; LEN][..]));
+        assert_eq!(scratch, vec![2u8; len]);
+    }
+
+    #[test]
+    fn resolution_change_does_not_mix_frame_sizes() {
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut held: Option<Vec<u8>> = None;
+
+        fill(&mut scratch, 1, 64);
+        let _ = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+
+        // New resolution: the held frame is a different size, so whoever reads it
+        // (the held/burn path) must not treat it as a frame at the new size, and
+        // the recycled scratch is resized by the next blend rather than trusted.
+        fill(&mut scratch, 2, 256);
+        let sent = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+        assert_eq!(sent.len(), 256);
+        assert_eq!(held.as_ref().map(|h| h.len()), Some(256));
+        assert_eq!(scratch.len(), 64, "recycled buffer keeps its old size");
+    }
+
+    #[test]
+    fn the_sent_copy_reuses_a_returned_buffer_instead_of_allocating() {
+        let len = 1024;
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut held: Option<Vec<u8>> = None;
+
+        // Prime held + scratch.
+        fill(&mut scratch, 1, len);
+        let _ = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+
+        // A buffer the UI returned, holding its previous (now irrelevant) pixels.
+        let returned = vec![0x5Au8; len];
+        let capacity = returned.capacity();
+        let address = returned.as_ptr();
+
+        fill(&mut scratch, 2, len);
+        let sent = rotate_blended_frame(&mut scratch, &mut held, returned);
+        assert_eq!(
+            sent,
+            vec![2u8; len],
+            "returned buffer must be fully overwritten"
+        );
+        assert_eq!(
+            sent.capacity(),
+            capacity,
+            "the returned allocation was reused"
+        );
+        assert_eq!(
+            sent.as_ptr(),
+            address,
+            "the copy landed in a new allocation"
+        );
+    }
+
+    #[test]
+    fn a_short_returned_buffer_still_produces_a_full_frame() {
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut held: Option<Vec<u8>> = None;
+        fill(&mut scratch, 1, 256);
+        let _ = rotate_blended_frame(&mut scratch, &mut held, Vec::new());
+
+        // e.g. a buffer from the previous resolution.
+        fill(&mut scratch, 2, 256);
+        let sent = rotate_blended_frame(&mut scratch, &mut held, Vec::with_capacity(8));
+        assert_eq!(sent.len(), 256);
+        assert_eq!(sent, vec![2u8; 256]);
+    }
+
+    #[test]
+    fn blending_into_a_buffer_matches_the_allocating_path() {
+        let (w, h) = (16u32, 9u32);
+        let len = (w * h * 4) as usize;
+        let a: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..len).map(|i| ((i * 7) % 253) as u8).collect();
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::Wipe,
+            TransitionKind::Iris,
+            TransitionKind::ClockWipe,
+        ] {
+            let mut out = Vec::new();
+            for step in 0..=4 {
+                let alpha = step as f32 / 4.0;
+                blend_rgba_transition_into(&a, &b, w, h, alpha, kind, &mut out);
+                let want = blend_rgba_transition(&a, &b, w, h, alpha, kind);
+                assert_eq!(out, want, "{kind:?} at alpha={alpha}");
+            }
+        }
+    }
+
+    #[test]
+    fn cut_copies_frame_a_into_the_reused_buffer() {
+        let (w, h) = (4u32, 2u32);
+        let len = (w * h * 4) as usize;
+        let a = vec![7u8; len];
+        let b = vec![9u8; len];
+        let mut out = vec![0xFFu8; len + 32]; // deliberately dirty and too long
+        blend_rgba_transition_into(&a, &b, w, h, 0.5, TransitionKind::Cut, &mut out);
+        assert_eq!(out, a);
+    }
 }

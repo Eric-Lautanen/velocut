@@ -5,5 +5,6 @@
 // not part of the public API consumed by velocut-ui.
 
 pub mod log;
+pub mod resample;
 pub mod seek;
 pub mod yuv;

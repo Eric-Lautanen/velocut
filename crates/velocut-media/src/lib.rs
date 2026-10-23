@@ -10,4 +10,4 @@ pub mod worker; // internal — not pub, not re-exported
 
 pub use encode::{ClipSpec, EncodeSpec};
 pub use velocut_core::media_types::{MediaResult, PlaybackFrame};
-pub use worker::MediaWorker;
+pub use worker::{FrameRequest, MediaWorker};

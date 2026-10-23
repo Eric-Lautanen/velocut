@@ -4,21 +4,107 @@
 // handles transitions (blend), coast mode, and prebuffer.
 // Extracted from MediaWorker::new() in worker.rs.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use uuid::Uuid;
 
-use velocut_core::media_types::PlaybackFrame;
+use velocut_core::media_types::{FrameBuf, PlaybackFrame, PlaybackTransitionSpec};
 
 use crate::decode::LiveDecoder;
 
-use super::blend::{blend_rgba_transition, ActiveBlend};
+use super::blend::{blend_rgba_transition_into, rotate_blended_frame, ActiveBlend};
 use super::types::PlaybackCmd;
+
+/// Alpha the incoming half of a centred transition starts from.
+///
+/// A transition is rendered in two halves: the outgoing clip blends out while
+/// its primary decoder is live, then the primary switches to the incoming clip
+/// and the blend continues from the cut to the end of the zone. The second half
+/// is built with a nominal `alpha_start` of 0.5, which is only exactly right when
+/// the switch lands on the cut frame. Real handoffs land a frame or two either
+/// side — decode latency, a held frame during decoder_b's burn — and restarting
+/// at the nominal value then snaps the effect forwards or backwards on that one
+/// frame: the iris radius pops, the wipe bar jumps, the push slides back.
+///
+/// Continuing from the alpha of the frame that is actually on screen keeps the
+/// motion monotonic. `last_alpha <= 0.0` means no outgoing blend frame was ever
+/// produced, so the nominal midpoint is the right start.
+pub(super) fn incoming_alpha_start(nominal: f32, last_alpha: f32) -> f32 {
+    if !last_alpha.is_finite() || last_alpha <= 0.0 {
+        return nominal;
+    }
+    // Never hand over a finished blend: 1.0 would make the incoming half a
+    // one-frame no-op and drop the effect early.
+    last_alpha.clamp(0.0, 0.999)
+}
+
+/// Whether an incoming-half StartBlend continues the *same transition zone*
+/// whose outgoing half (or coast over it) is currently recorded in `prev`.
+///
+/// The handoff carry (`last_blend_alpha`) and the coast bridge run on state
+/// that is loop-local, not keyed to a zone — `last_blend_alpha`,
+/// `blend_frame_count`, `held_blend`, `coast_last_alpha/primary`. Those survive
+/// sessions, so an incoming StartBlend from a DIFFERENT zone (possible when a
+/// Stop command was dropped, or when a session ended without a Stop) must not
+/// carry them: a foreign zone's alpha makes the incoming half start
+/// near-complete and visibly collapses the effect. Callers reset the
+/// continuity state in that case instead.
+///
+/// Same-zone identity: the recorded blend must be an outgoing half
+/// (`invert_ab == false`), its clip_b must be this command's primary clip (both
+/// halves of a zone name the same incoming clip), and the transition must
+/// agree on duration and kind — both halves compute those from the same
+/// `clamped_secs` call, so equality means the same zone.
+pub(super) fn continues_same_zone(
+    prev: Option<&ActiveBlend>,
+    cmd_id: Uuid,
+    spec: &PlaybackTransitionSpec,
+) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    !prev.spec.invert_ab
+        && prev.spec.clip_b_id == cmd_id
+        && prev.spec.duration == spec.duration
+        && prev.spec.kind == spec.kind
+}
+
+/// Seconds of transition time one coast frame covers, from the real interval
+/// between coast frames. The lower bound keeps an ultra-high-refresh drain from
+/// stalling the blend; the upper bound means a long UI stall costs at most a
+/// tenth of a second of blend instead of jumping the effect to its end.
+pub(super) fn coast_frame_dt(dt_secs: f64) -> f64 {
+    if !dt_secs.is_finite() {
+        return 1.0 / 30.0;
+    }
+    dt_secs.clamp(1.0 / 240.0, 0.1)
+}
+
+/// Collect the buffers the UI has handed back, up to the pool cap (anything
+/// beyond it is dropped rather than kept forever after a resolution change).
+fn refill_pool(pool: &mut Vec<Vec<u8>>, recycle_rx: &Receiver<Vec<u8>>) {
+    while pool.len() < FRAME_POOL_MAX {
+        match recycle_rx.try_recv() {
+            Ok(buf) => pool.push(buf),
+            Err(_) => return,
+        }
+    }
+    while recycle_rx.try_recv().is_ok() {}
+}
+
+/// How many returned frame buffers the playback thread keeps. The channel holds
+/// six frames and the UI holds one pending, so this covers everything in flight.
+const FRAME_POOL_MAX: usize = 6;
 
 pub(super) struct PbThread {
     pub cmd_rx: Receiver<PlaybackCmd>,
     pub frame_tx: Sender<PlaybackFrame>,
+    /// Buffers of frames the UI has finished with.
+    pub recycle_rx: Receiver<Vec<u8>>,
+    /// Stamped onto every sent frame so its buffer finds its way back here.
+    pub recycle: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
 impl PbThread {
@@ -26,9 +112,17 @@ impl PbThread {
         let Self {
             cmd_rx: pb_cmd_rx,
             frame_tx: pb_frame_tx,
+            recycle_rx: pb_recycle_rx,
+            recycle: pb_recycle,
         } = self;
 
         let mut decoder: Option<(Uuid, LiveDecoder)> = None;
+        // Playback-session generation. Bumped on every Start / StartBlend by the
+        // worker and carried in on the command; stamped onto every frame this
+        // thread sends so the UI can reject frames still in flight from an older
+        // session (they would otherwise slip past the wrong_clip / too_old
+        // windows at a session boundary and flash a wrong-spec blend).
+        let mut generation: u64 = 0;
         // Active transition blend state.
         // Set by StartBlend, cleared by Start / Stop / primary-EOF / decoder_b-EOF.
         let mut blend: Option<ActiveBlend> = None;
@@ -42,6 +136,16 @@ impl PbThread {
         // PRESERVED on StartBlend(invert_ab=true) — the clip_a outgoing phase left
         // alpha≈0.5 here, which is the correct frozen frame for the decoder_b burn window.
         let mut held_blend: Option<Vec<u8>> = None;
+        // Scratch destination for decoder_b's frames. decoder_b is read once per
+        // blended frame; without this it allocates a 5 MB frame per frame, faults
+        // and all.
+        let mut decoder_b_buf: Vec<u8> = Vec::new();
+        // Scratch destination for the next blend. Kept alive across frames so the
+        // blend writes into already-faulted pages instead of a fresh 5 MB buffer
+        // every time — see `blend::rotate_blended_frame`.
+        let mut blend_out: Vec<u8> = Vec::new();
+        // Buffers the UI has handed back, ready to be written into again.
+        let mut frame_pool: Vec<Vec<u8>> = Vec::new();
         // Diagnostics: count consecutive held_blend frames, log alpha of every blend frame.
         let mut held_streak: u32 = 0;
         let mut blend_frame_count: u64 = 0;
@@ -50,6 +154,10 @@ impl PbThread {
         // so pb_rx stays fed and the UI doesn't freeze while clip_changed fires.
         // The last-frame metadata fields provide the id/dims/ts for the synthetic coast frames.
         let mut coasting: bool = false;
+        // Wall clock of the previous coast frame. Coast frames are produced at the
+        // rate the UI drains them (display refresh), not at the 30 fps timeline
+        // rate, so the blend must advance by real elapsed time.
+        let mut coast_clock: Option<Instant> = None;
         let mut coast_id: Uuid = Uuid::nil();
         let mut coast_w: u32 = 0;
         let mut coast_h: u32 = 0;
@@ -82,7 +190,9 @@ impl PbThread {
                         ts,
                         aspect,
                         preview_size,
+                        gen,
                     }) => {
+                        generation = gen;
                         blend = None;
                         held_blend = None;
                         last_blend_alpha = 0.0;
@@ -129,12 +239,57 @@ impl PbThread {
                         path,
                         ts,
                         aspect,
-                        blend: spec,
+                        blend: mut spec,
                         preview_size,
+                        gen,
                     }) => {
+                        generation = gen;
                         let invert = spec.invert_ab;
 
-                        let recycled_decoder_b = if invert {
+                        // Phase handoff of a centred transition: the outgoing half is
+                        // still live and has already put a blended frame on screen.
+                        // Continue from that frame's alpha instead of snapping back to
+                        // the nominal midpoint (see `incoming_alpha_start`) — but only
+                        // for the SAME transition zone (see `continues_same_zone`).
+                        // The continuity state survives sessions, so a StartBlend
+                        // from a different zone resets it instead of carrying it.
+                        let same_zone = continues_same_zone(blend.as_ref(), new_id, &spec);
+                        if invert && same_zone {
+                            let outgoing_frames = blend
+                                .as_ref()
+                                .filter(|b| !b.spec.invert_ab)
+                                .map(|_| blend_frame_count)
+                                .unwrap_or(0);
+                            if outgoing_frames > 0 {
+                                let carried =
+                                    incoming_alpha_start(spec.alpha_start, last_blend_alpha);
+                                crate::media_log!(
+                                    "[pb] handoff: alpha_start {:.3} → {:.3} carried from last outgoing frame ({} frames)",
+                                    spec.alpha_start,
+                                    carried,
+                                    outgoing_frames
+                                );
+                                spec.alpha_start = carried;
+                            }
+                        } else if !same_zone {
+                            crate::media_log!(
+                                "[pb] StartBlend continues a different zone — resetting continuity \
+                                 (last_blend_alpha={last_blend_alpha:.3}, blend_frame_count={blend_frame_count}, invert={invert})"
+                            );
+                            last_blend_alpha = 0.0;
+                            coast_last_alpha = 0.5;
+                            // blend_frame_count is reset unconditionally later in
+                            // this arm; no separate write here.
+                            held_blend = None;
+                            coast_last_primary = None;
+                            coast_clock = None;
+                        }
+
+                        // The outgoing half's live primary decoder is only worth
+                        // recycling as clip_a's tail decoder for the same zone;
+                        // for a different zone it is simply discarded (and a new
+                        // decoder_b is lazy-opened against the new spec).
+                        let recycled_decoder_b = if invert && same_zone {
                             let d = decoder.take().map(|(_, d)| d);
                             if let Some(ref db) = d {
                                 crate::media_log!("[pb] recycling old primary as decoder_b: last_pts={} (ts≈{:.3}s)",
@@ -144,6 +299,14 @@ impl PbThread {
                             }
                             d
                         } else {
+                            if invert {
+                                crate::media_log!(
+                                    "[pb] different zone — dropping the old primary instead of recycling it as decoder_b"
+                                );
+                            }
+                            if invert {
+                                decoder.take();
+                            }
                             None
                         };
 
@@ -270,8 +433,16 @@ impl PbThread {
                 }
                 // Decode next frame. send() blocks when channel is full —
                 // that IS the rate-limiter, no sleep needed.
-                match d.next_frame() {
-                    Some((data, w, h, ts_secs)) => {
+                // Decode into a buffer the UI has finished with, when one is
+                // available: a fresh 5 MB frame costs ~1230 page faults to write,
+                // which is real time on every single frame. `next_frame` would
+                // allocate one per frame.
+                refill_pool(&mut frame_pool, &pb_recycle_rx);
+                let mut decoded_into = frame_pool.pop().unwrap_or_default();
+                let decoded = d.next_frame_into(&mut decoded_into);
+                match decoded {
+                    Some((w, h, ts_secs)) => {
+                        let data = decoded_into;
                         // Phase 1: read-only borrow to extract blend parameters.
                         let blend_params = {
                             blend.as_ref().and_then(|b| {
@@ -303,7 +474,12 @@ impl PbThread {
                         if blend_params.is_some()
                             && blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false)
                         {
-                            coast_last_primary = Some(data.clone());
+                            // Copy into the existing buffer rather than allocating one
+                            // per frame: this runs on every frame of an outgoing blend.
+                            match coast_last_primary.as_mut() {
+                                Some(buf) if buf.len() == data.len() => buf.copy_from_slice(&data),
+                                _ => coast_last_primary = Some(data.clone()),
+                            }
                         }
 
                         let blend_params = if blend_params
@@ -330,7 +506,7 @@ impl PbThread {
                             decoder_b_aspect,
                         )) = blend_params
                         {
-                            let blended = (|| -> Option<Vec<u8>> {
+                            let blended = (|| -> Option<()> {
                                 if let Some(b) = blend.as_mut() {
                                     let invert = b.spec.invert_ab;
                                     if b.decoder_b.is_none() {
@@ -370,16 +546,25 @@ impl PbThread {
                                                 if invert {
                                                     if let Some(hb) = held_blend.as_ref() {
                                                         if hb.len() == data.len() {
-                                                            return Some(blend_rgba_transition(
-                                                                hb, &data, w, h, alpha, kind,
-                                                            ));
+                                                            blend_rgba_transition_into(
+                                                                hb,
+                                                                &data,
+                                                                w,
+                                                                h,
+                                                                alpha,
+                                                                kind,
+                                                                &mut blend_out,
+                                                            );
+                                                            return Some(());
                                                         }
                                                     }
                                                 }
                                                 return None;
                                             }
                                         }
-                                        if let Some((data_b, wb, hb, _)) = db.next_frame() {
+                                        let decoded_b = db.next_frame_into(&mut decoder_b_buf);
+                                        if let Some((wb, hb, _)) = decoded_b {
+                                            let data_b = decoder_b_buf.as_slice();
                                             if data_b.len() != data.len() || wb != w || hb != h {
                                                 crate::media_log!(
                                                     "[pb] blend size mismatch — primary {}×{} ({} B) \
@@ -388,16 +573,28 @@ impl PbThread {
                                                 );
                                                 return None;
                                             }
-                                            let blended = if invert {
-                                                blend_rgba_transition(
-                                                    &data_b, &data, w, h, alpha, kind,
-                                                )
+                                            if invert {
+                                                blend_rgba_transition_into(
+                                                    data_b,
+                                                    &data,
+                                                    w,
+                                                    h,
+                                                    alpha,
+                                                    kind,
+                                                    &mut blend_out,
+                                                );
                                             } else {
-                                                blend_rgba_transition(
-                                                    &data, &data_b, w, h, alpha, kind,
-                                                )
-                                            };
-                                            return Some(blended);
+                                                blend_rgba_transition_into(
+                                                    &data,
+                                                    data_b,
+                                                    w,
+                                                    h,
+                                                    alpha,
+                                                    kind,
+                                                    &mut blend_out,
+                                                );
+                                            }
+                                            return Some(());
                                         } else {
                                             let still_burning = b
                                                 .decoder_b
@@ -412,9 +609,16 @@ impl PbThread {
                                                     if let Some(hb) = held_blend.as_ref() {
                                                         if hb.len() == data.len() {
                                                             crate::media_log!("[blend] still_burning animated: alpha={alpha:.3}");
-                                                            return Some(blend_rgba_transition(
-                                                                hb, &data, w, h, alpha, kind,
-                                                            ));
+                                                            blend_rgba_transition_into(
+                                                                hb,
+                                                                &data,
+                                                                w,
+                                                                h,
+                                                                alpha,
+                                                                kind,
+                                                                &mut blend_out,
+                                                            );
+                                                            return Some(());
                                                         }
                                                     }
                                                 }
@@ -435,28 +639,44 @@ impl PbThread {
                             if decoder_b_exhausted {
                                 blend = None;
                             }
-                            // [Fix 2] Avoid double-allocation in the blend hot path.
-                            // Previously: held_blend = Some(b.clone()); b
-                            // — two Vec<u8> of equal size lived simultaneously.
-                            // Now: move b into held_blend, clone once for the return.
-                            // One allocation instead of two per blended frame.
+                            // The frame was blended into `blend_out`; rotate it into
+                            // `held_blend` and clone once for the channel. The clone is
+                            // the only allocation per blended frame, and the buffer it
+                            // replaces goes back to `blend_out` — so both long-lived
+                            // buffers stay warm and the blend never faults pages in.
+                            // Collect whatever the UI has finished with before making
+                            // the outgoing copy, so the copy writes into a warm buffer.
+                            refill_pool(&mut frame_pool, &pb_recycle_rx);
                             match blended {
-                                Some(b) => {
+                                Some(()) => {
                                     if held_streak > 0 {
                                         crate::media_log!("[blend] held_blend streak ended after {held_streak} frames");
                                         held_streak = 0;
                                     }
                                     blend_frame_count += 1;
-                                    let out = b.clone();
-                                    held_blend = Some(b);
-                                    out
+                                    rotate_blended_frame(
+                                        &mut blend_out,
+                                        &mut held_blend,
+                                        frame_pool.pop().unwrap_or_default(),
+                                    )
                                 }
                                 None => {
                                     held_streak += 1;
                                     if held_streak == 1 {
                                         crate::media_log!("[blend] held_blend streak START (ts={ts_secs:.3} alpha from blend_params pending)");
                                     }
-                                    held_blend.clone().unwrap_or(data)
+                                    // Repeat the last blended frame from a recycled
+                                    // buffer instead of allocating a copy of it.
+                                    match held_blend.as_ref() {
+                                        Some(hb) => {
+                                            refill_pool(&mut frame_pool, &pb_recycle_rx);
+                                            let mut out = frame_pool.pop().unwrap_or_default();
+                                            out.clear();
+                                            out.extend_from_slice(hb);
+                                            out
+                                        }
+                                        None => data,
+                                    }
                                 }
                             }
                         } else {
@@ -471,14 +691,23 @@ impl PbThread {
                         // At EOF, this lets coast mode re-send the last frame of clip_a
                         // to keep the channel fed while waiting for Start.
                         if prebuffered.is_some() && blend.is_none() {
-                            held_blend = Some(send_data.clone());
+                            // Keep the last frame for the hard-cut coast, but copy into
+                            // the buffer already held: this runs on every frame while a
+                            // prebuffer is open, so an allocation here is per-frame.
+                            match held_blend.as_mut() {
+                                Some(buf) if buf.len() == send_data.len() => {
+                                    buf.copy_from_slice(&send_data)
+                                }
+                                _ => held_blend = Some(send_data.clone()),
+                            }
                         }
                         let f = PlaybackFrame {
                             id,
                             timestamp: ts_secs,
                             width: w,
                             height: h,
-                            data: send_data,
+                            data: FrameBuf::recycled(send_data, pb_recycle.clone()),
+                            generation,
                         };
                         frame_count += 1;
                         if frame_count.is_multiple_of(60) {
@@ -503,6 +732,11 @@ impl PbThread {
                         }
                     }
                     None => {
+                        // EOF or a burn in progress: keep the decode buffer for the
+                        // next frame instead of dropping it back to the allocator.
+                        if decoded_into.capacity() > 0 {
+                            frame_pool.push(decoded_into);
+                        }
                         let outgoing_blend =
                             blend.as_ref().map(|b| !b.spec.invert_ab).unwrap_or(false);
                         if outgoing_blend && held_blend.is_some() {
@@ -513,6 +747,7 @@ impl PbThread {
                                        decoder_b preserved for animated coast)"
                             );
                             coasting = true;
+                            coast_clock = None;
                             decoder = None;
                         } else if prebuffered.is_some() && held_blend.is_some() {
                             // Hard-cut coast: prebuffered decoder is ready for the next
@@ -564,7 +799,9 @@ impl PbThread {
                             ts,
                             aspect,
                             preview_size,
+                            gen,
                         } => {
+                            generation = gen;
                             blend = None;
                             held_blend = None;
                             last_blend_alpha = 0.0;
@@ -608,10 +845,38 @@ impl PbThread {
                             aspect,
                             blend: mut spec,
                             preview_size,
+                            gen,
                         } => {
+                            generation = gen;
                             let invert = spec.invert_ab;
 
-                            if invert && was_coasting {
+                            // Same continuity rule as the active branch: an outgoing
+                            // blend that EOF'd without entering coast still left a frame
+                            // on screen at `last_blend_alpha` — but only for the SAME
+                            // transition zone (see `continues_same_zone`). A StartBlend
+                            // from a different zone resets the continuity state instead
+                            // of carrying it, and must not ride the old zone's coast.
+                            let same_zone = continues_same_zone(blend.as_ref(), id, &spec);
+                            if invert && same_zone && !was_coasting {
+                                let outgoing_frames = blend
+                                    .as_ref()
+                                    .filter(|b| !b.spec.invert_ab)
+                                    .map(|_| blend_frame_count)
+                                    .unwrap_or(0);
+                                if outgoing_frames > 0 {
+                                    let carried =
+                                        incoming_alpha_start(spec.alpha_start, last_blend_alpha);
+                                    crate::media_log!(
+                                        "[pb] handoff (idle): alpha_start {:.3} → {:.3} carried from last outgoing frame ({} frames)",
+                                        spec.alpha_start,
+                                        carried,
+                                        outgoing_frames
+                                    );
+                                    spec.alpha_start = carried;
+                                }
+                            }
+
+                            if invert && same_zone && was_coasting {
                                 crate::media_log!(
                                     "[pb] incoming StartBlend while coasting: overriding \
                                            alpha_start {:.3} → {:.3} (coast_last_alpha)",
@@ -621,14 +886,27 @@ impl PbThread {
                                 spec.alpha_start = coast_last_alpha;
                             }
 
-                            let coast_blend_db = if was_coasting && invert {
+                            if !same_zone {
+                                crate::media_log!(
+                                    "[pb] StartBlend continues a different zone — resetting continuity \
+                                     (last_blend_alpha={last_blend_alpha:.3}, blend_frame_count={blend_frame_count}, was_coasting={was_coasting}, invert={invert})"
+                                );
+                                last_blend_alpha = 0.0;
+                                coast_last_alpha = 0.5;
+                                blend_frame_count = 0;
+                                held_blend = None;
+                                coast_last_primary = None;
+                                coast_clock = None;
+                            }
+
+                            let coast_blend_db = if was_coasting && invert && same_zone {
                                 blend.take().and_then(|b| b.decoder_b)
                             } else {
                                 drop(blend.take());
                                 None
                             };
 
-                            let prebuilt_db = if was_coasting && invert {
+                            let prebuilt_db = if was_coasting && invert && same_zone {
                                 let db_path = spec.clip_b_path.clone();
                                 let db_start = spec.clip_b_source_start;
                                 let t_db = Instant::now();
@@ -672,41 +950,50 @@ impl PbThread {
                                 // is preserved (4/6 ≈ 67%), ensuring the channel stays
                                 // fed through the primary burn without flooding it.
                                 const BRIDGE_TARGET: usize = 2; // 2/3 fill ratio matches old 4/6
+                                                                // decoder_b's frame for the bridge, reused across the
+                                                                // handful of frames the bridge produces.
+                                let mut bridge_buf: Vec<u8> = Vec::new();
                                 while pb_frame_tx.len() < BRIDGE_TARGET {
                                     let fa = match coast_last_primary.as_ref() {
                                         Some(f) => f,
                                         None => break,
                                     };
-                                    let (data_b, _, _, _) = match bridge_db.next_frame() {
-                                        Some(f) => f,
-                                        None => break,
-                                    };
-                                    if data_b.len() != (coast_w * coast_h * 4) as usize {
+                                    if bridge_db.next_frame_into(&mut bridge_buf).is_none() {
+                                        break;
+                                    }
+                                    if bridge_buf.len() != (coast_w * coast_h * 4) as usize {
                                         break;
                                     }
                                     let step = (1.0_f32 / 30.0) / bridge_duration;
                                     coast_last_alpha = (coast_last_alpha + step).min(1.0);
                                     bridge_ts += 1.0 / 30.0;
-                                    let blended = blend_rgba_transition(
+                                    blend_rgba_transition_into(
                                         fa,
-                                        &data_b,
+                                        &bridge_buf,
                                         coast_w,
                                         coast_h,
                                         coast_last_alpha,
                                         bridge_kind,
+                                        &mut blend_out,
                                     );
                                     crate::media_log!("[pb] bridge: ts={bridge_ts:.3} alpha={coast_last_alpha:.3} chan={}", pb_frame_tx.len());
-                                    // [Fix 2] Move blended into held_blend, clone for send.
-                                    // Previously: held_blend = Some(blended.clone()); ... data: blended
-                                    // — two equal-sized allocations per bridge frame.
-                                    let send = blended.clone();
-                                    held_blend = Some(blended);
+                                    // Same rotation as the main blend path: the bridge
+                                    // frame goes into held_blend, its predecessor's buffer
+                                    // becomes the next blend destination, and the copy handed
+                                    // to the channel reuses a buffer the UI returned.
+                                    refill_pool(&mut frame_pool, &pb_recycle_rx);
+                                    let send = rotate_blended_frame(
+                                        &mut blend_out,
+                                        &mut held_blend,
+                                        frame_pool.pop().unwrap_or_default(),
+                                    );
                                     let f = PlaybackFrame {
                                         id,
                                         timestamp: bridge_ts,
                                         width: coast_w,
                                         height: coast_h,
-                                        data: send,
+                                        data: FrameBuf::recycled(send, pb_recycle.clone()),
+                                        generation,
                                     };
                                     if pb_frame_tx.send(f).is_err() {
                                         return;
@@ -798,37 +1085,66 @@ impl PbThread {
                 } else {
                     // Coast mode, no command yet.
                     // Produce an animated blend frame or repeat held_blend.
-                    let animated = (|| -> Option<Vec<u8>> {
+                    let animated = (|| -> Option<()> {
                         let b = blend.as_mut()?;
                         let fa = coast_last_primary.as_ref()?;
                         let db = b.decoder_b.as_mut()?;
-                        let (data_b, _, _, _) = db.next_frame()?;
-                        if data_b.len() != fa.len() {
+                        // Same buffers as the live blend path: decoder_b's frame in,
+                        // the blended frame out. Coast frames arrive at display rate,
+                        // so allocating two 5 MB frames each was pure churn.
+                        db.next_frame_into(&mut decoder_b_buf)?;
+                        if decoder_b_buf.len() != fa.len() {
                             return None;
                         }
-                        let step = (1.0_f32 / 30.0) / b.spec.duration;
+                        // Advance by wall-clock time: a fixed 1/30 per frame made
+                        // the effect crawl on high-refresh displays (twice as many
+                        // frames drained per second → alpha advanced at half the
+                        // intended rate) and let coast_ts drift behind the playhead.
+                        let now = Instant::now();
+                        let dt = coast_frame_dt(
+                            coast_clock
+                                .map(|t| (now - t).as_secs_f64())
+                                .unwrap_or(1.0 / 30.0),
+                        );
+                        coast_clock = Some(now);
+                        let step = (dt / b.spec.duration as f64) as f32;
                         coast_last_alpha = (coast_last_alpha + step).min(1.0);
-                        coast_ts += 1.0 / 30.0;
-                        Some(blend_rgba_transition(
+                        coast_ts += dt;
+                        blend_rgba_transition_into(
                             fa,
-                            &data_b,
+                            &decoder_b_buf,
                             coast_w,
                             coast_h,
                             coast_last_alpha,
                             b.spec.kind,
-                        ))
+                            &mut blend_out,
+                        );
+                        Some(())
                     })();
 
-                    let send_data = if let Some(blended) = animated {
+                    let send_data = if animated.is_some() {
                         crate::media_log!(
                             "[pb] coast animated: ts={coast_ts:.3} alpha={coast_last_alpha:.3}"
                         );
-                        // [Fix 2] Move into held_blend, clone for send.
-                        let out = blended.clone();
-                        held_blend = Some(blended);
-                        Some(out)
+                        refill_pool(&mut frame_pool, &pb_recycle_rx);
+                        Some(rotate_blended_frame(
+                            &mut blend_out,
+                            &mut held_blend,
+                            frame_pool.pop().unwrap_or_default(),
+                        ))
                     } else {
-                        held_blend.clone()
+                        // No animated frame: re-send the last one from a recycled
+                        // buffer rather than allocating a copy per coast frame.
+                        match held_blend.as_ref() {
+                            Some(hb) => {
+                                refill_pool(&mut frame_pool, &pb_recycle_rx);
+                                let mut out = frame_pool.pop().unwrap_or_default();
+                                out.clear();
+                                out.extend_from_slice(hb);
+                                Some(out)
+                            }
+                            None => None,
+                        }
                     };
 
                     if let Some(data) = send_data {
@@ -837,7 +1153,8 @@ impl PbThread {
                             timestamp: coast_ts,
                             width: coast_w,
                             height: coast_h,
-                            data,
+                            data: FrameBuf::recycled(data, pb_recycle.clone()),
+                            generation,
                         };
                         // Blocking send — rate-limits coast to UI consumption speed.
                         if pb_frame_tx.send(f).is_err() {
@@ -852,5 +1169,215 @@ impl PbThread {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::incoming_alpha_start;
+
+    #[test]
+    fn no_outgoing_frames_keeps_the_nominal_midpoint() {
+        assert_eq!(incoming_alpha_start(0.5, 0.0), 0.5);
+    }
+
+    #[test]
+    fn continues_from_the_frame_that_is_already_on_screen() {
+        // Frames ran a little ahead of the cut: keep going, don't rewind.
+        assert!((incoming_alpha_start(0.5, 0.58) - 0.58).abs() < 1e-6);
+        // Frames lagged behind the cut: same rule, no forward snap either.
+        assert!((incoming_alpha_start(0.5, 0.42) - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn never_hands_over_a_finished_blend() {
+        assert!((incoming_alpha_start(0.5, 1.0) - 0.999).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_non_finite_alpha() {
+        assert_eq!(incoming_alpha_start(0.5, f32::NAN), 0.5);
+    }
+}
+
+#[cfg(test)]
+mod same_zone_tests {
+    //! Pins the handoff-carry identity gate for the idle/active StartBlend
+    //! branches (see the audit's sessionless-carry finding): carry only when
+    //! the incoming half continues the same transition zone, otherwise reset.
+
+    use super::*;
+    use std::path::PathBuf;
+    use velocut_core::transitions::TransitionKind;
+
+    fn outgoing_blend(zone_b: u128, duration: f64, kind: TransitionKind) -> ActiveBlend {
+        ActiveBlend {
+            spec: PlaybackTransitionSpec {
+                clip_b_id: Uuid::from_u128(zone_b),
+                clip_b_path: PathBuf::new(),
+                clip_b_source_start: 0.0,
+                blend_start_ts: 10.0,
+                duration: duration as f32,
+                kind,
+                alpha_start: 0.0,
+                invert_ab: false,
+            },
+            aspect: 1.0,
+            decoder_b: None, // tests never touch the decoder
+        }
+    }
+
+    fn incoming_cmd_id(zone_b: u128) -> Uuid {
+        Uuid::from_u128(zone_b)
+    }
+
+    fn incoming_spec(duration: f64, kind: TransitionKind) -> PlaybackTransitionSpec {
+        PlaybackTransitionSpec {
+            clip_b_id: Uuid::nil(), // the outgoing clip — irrelevant to the gate
+            clip_b_path: PathBuf::new(),
+            clip_b_source_start: 0.0,
+            blend_start_ts: 20.0,
+            duration: duration as f32,
+            kind,
+            alpha_start: 0.5,
+            invert_ab: true,
+        }
+    }
+
+    #[test]
+    fn the_zone_incoming_half_continues_the_recorded_outgoing_state() {
+        // Normal handoff: the outgoing half is live, both halves name the same
+        // incoming clip and agree on the clamped duration + kind.
+        let prev = outgoing_blend(0xA001, 1.0, TransitionKind::Iris);
+        let spec = incoming_spec(1.0, TransitionKind::Iris);
+        assert!(continues_same_zone(
+            Some(&prev),
+            incoming_cmd_id(0xA001),
+            &spec
+        ));
+    }
+
+    #[test]
+    fn a_startblend_for_another_clip_is_a_different_zone() {
+        // The dropped-Stop scenario: a fresh incoming StartBlend whose primary
+        // clip is not the old zone's incoming clip must not carry alpha.
+        let prev = outgoing_blend(0xA001, 1.0, TransitionKind::Iris);
+        let spec = incoming_spec(1.0, TransitionKind::Iris);
+        assert!(!continues_same_zone(
+            Some(&prev),
+            incoming_cmd_id(0xB002),
+            &spec
+        ));
+    }
+
+    #[test]
+    fn a_startblend_of_different_duration_or_kind_is_a_different_zone() {
+        // Compensations changed the effective transition — identity requires
+        // an exact match on both, they come from the same clamped computation.
+        let a = outgoing_blend(0xA001, 1.0, TransitionKind::Iris);
+        assert!(!continues_same_zone(
+            Some(&a),
+            incoming_cmd_id(0xA001),
+            &incoming_spec(0.5, TransitionKind::Iris)
+        ));
+        assert!(!continues_same_zone(
+            Some(&a),
+            incoming_cmd_id(0xA001),
+            &incoming_spec(1.0, TransitionKind::Wipe)
+        ));
+    }
+
+    #[test]
+    fn only_an_outgoing_half_plays_the_handoff_role() {
+        // A recorded incoming blend can never hand alpha to anyone — and an
+        // incoming StartBlend is not a continuation target in either branch.
+        let mut prev = outgoing_blend(0xA001, 1.0, TransitionKind::Iris);
+        prev.spec.invert_ab = true;
+        assert!(!continues_same_zone(
+            Some(&prev),
+            incoming_cmd_id(0xA001),
+            &incoming_spec(1.0, TransitionKind::Iris)
+        ));
+    }
+
+    #[test]
+    fn no_recorded_blend_cannot_continue_anything() {
+        assert!(!continues_same_zone(
+            None,
+            incoming_cmd_id(0xA001),
+            &incoming_spec(1.0, TransitionKind::Iris)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod coast_dt_tests {
+    use super::coast_frame_dt;
+
+    #[test]
+    fn sixty_hertz_drain_advances_half_a_frame_per_frame() {
+        // 1/60 s of transition time per coast frame, not 1/30 — this is the
+        // double-speed bug the wall clock fixes.
+        assert!((coast_frame_dt(1.0 / 60.0) - 1.0 / 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stall_costs_at_most_a_tenth_of_a_second() {
+        assert!((coast_frame_dt(5.0) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sub_frame_intervals_are_floored() {
+        assert!((coast_frame_dt(0.0) - 1.0 / 240.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_finite_interval_falls_back_to_a_thirtieth() {
+        assert!((coast_frame_dt(f64::NAN) - 1.0 / 30.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod frame_pool_tests {
+    use super::{refill_pool, FRAME_POOL_MAX};
+    use crossbeam_channel::bounded;
+
+    #[test]
+    fn returned_buffers_fill_the_pool_up_to_its_cap() {
+        let (tx, rx) = bounded::<Vec<u8>>(16);
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        for i in 0..(FRAME_POOL_MAX + 3) {
+            tx.send(vec![i as u8; 8]).unwrap();
+        }
+
+        refill_pool(&mut pool, &rx);
+        assert_eq!(pool.len(), FRAME_POOL_MAX, "pool must stay bounded");
+        // Surplus returns are dropped, not queued for later.
+        assert!(rx.is_empty(), "channel must be drained");
+
+        // Draining again is a no-op rather than an error.
+        refill_pool(&mut pool, &rx);
+        assert_eq!(pool.len(), FRAME_POOL_MAX);
+    }
+
+    #[test]
+    fn an_empty_channel_leaves_the_pool_alone() {
+        let (_tx, rx) = bounded::<Vec<u8>>(4);
+        let mut pool: Vec<Vec<u8>> = vec![vec![1, 2, 3]];
+        refill_pool(&mut pool, &rx);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0], vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_disconnected_pool_does_not_spin() {
+        let (tx, rx) = bounded::<Vec<u8>>(4);
+        tx.send(vec![9; 4]).unwrap();
+        drop(tx);
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        refill_pool(&mut pool, &rx);
+        assert_eq!(pool.len(), 1);
+        refill_pool(&mut pool, &rx);
+        assert_eq!(pool.len(), 1);
     }
 }
