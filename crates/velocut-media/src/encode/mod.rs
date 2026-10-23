@@ -95,7 +95,7 @@ mod audio;
 use audio::{decode_overlay, AudioEncState, AudioFifo};
 
 mod clip;
-use clip::{apply_transition, encode_clip, send_video_frame};
+use clip::{apply_transition, encode_clip, send_video_frame, EncodeCtx};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -104,6 +104,14 @@ use clip::{apply_transition, encode_clip, send_video_frame};
 pub struct ClipSpec {
     /// Absolute path to the source media file.
     pub path: PathBuf,
+    /// Where this clip starts on the output timeline, in seconds.
+    ///
+    /// `run_encode` concatenates clips, so consecutive specs would otherwise
+    /// collapse any gap the user left on the timeline. The encoder emits black
+    /// frames (and silence) for `timeline_start - previous_end` before the
+    /// clip, which also keeps standalone audio overlays — mixed at absolute
+    /// `timeline_start` — aligned with the video.
+    pub timeline_start: f64,
     /// Seconds into the source file at which this clip begins.
     pub source_offset: f64,
     /// Duration in seconds to include from this clip.
@@ -171,6 +179,37 @@ pub struct HwEncodeCapabilities {
 pub(super) const PROGRESS_INTERVAL: u64 = 15;
 pub(super) const AUDIO_RATE: i32 = 44100;
 
+/// Merged absolute sample ranges in which a V clip contributes its own audio.
+///
+/// This reproduces the preview's mix model: exactly one primary clip is heard
+/// at a time, so overlapping V lanes count once, and `skip_audio` clips are
+/// excluded because their audio is absent or carried by an A overlay. Used to
+/// scale the primary and overlays by `1/sqrt(N)` in `AudioEncState::drain_fifo`.
+fn primary_sample_spans(clips: &[ClipSpec]) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = clips
+        .iter()
+        .filter(|clip| !clip.skip_audio)
+        .filter_map(|clip| {
+            let start = (clip.timeline_start * AUDIO_RATE as f64).round() as i64;
+            let end = ((clip.timeline_start + clip.duration) * AUDIO_RATE as f64).round() as i64;
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    spans.sort_unstable();
+
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
 // ── Center-crop scaler ────────────────────────────────────────────────────────
 
 // CropScaler moved to clip.rs
@@ -178,12 +217,25 @@ pub(super) const AUDIO_RATE: i32 = 44100;
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn encode_timeline(spec: EncodeSpec, cancel: Arc<AtomicBool>, tx: Sender<MediaResult>) {
-    let total_frames: u64 = spec
-        .clips
+    // Clips are laid out at their absolute timeline positions, so gaps count
+    // towards the output (they are emitted as black frames + silence). Standalone
+    // audio overlays can run past the last video clip, and the encoder extends
+    // the video to cover them, so they can raise the total as well.
+    let mut cursor = 0.0_f64;
+    let mut clip_frames = 0_u64;
+    for c in &spec.clips {
+        let gap = (c.timeline_start - cursor).max(0.0);
+        clip_frames += (gap * spec.fps as f64).round() as u64;
+        clip_frames += (c.duration * spec.fps as f64).ceil() as u64;
+        cursor = c.timeline_start + c.duration;
+    }
+    let overlay_frames = spec
+        .audio_overlays
         .iter()
-        .map(|c| (c.duration * spec.fps as f64).ceil() as u64)
-        .sum::<u64>()
-        .max(1);
+        .map(|o| ((o.timeline_start + o.duration) * spec.fps as f64).ceil() as u64)
+        .max()
+        .unwrap_or(0);
+    let total_frames = clip_frames.max(overlay_frames).max(1);
 
     match run_encode(&spec, cancel, total_frames, &tx) {
         Ok(()) => {
@@ -204,6 +256,131 @@ pub fn encode_timeline(spec: EncodeSpec, cancel: Arc<AtomicBool>, tx: Sender<Med
 // ── Audio ── see audio.rs
 
 // ── Internal implementation ───────────────────────────────────────────────────
+
+/// Emit `count` black video frames (with matching silence in the audio FIFO).
+///
+/// Used for timeline gaps and for the overlay tail past the last clip. Both
+/// need the same three things per frame: a YUV limited-range black frame, a
+/// zero-padded audio FIFO so overlays keep mixing at the right sample offset,
+/// and monotonic packet DTS. Bundling the mutable encoder/audio state here
+/// keeps the call sites from duplicating that sequence.
+struct BlankFrameJob<'a> {
+    spec: &'a EncodeSpec,
+    count: i64,
+    frame_tb: Rational,
+    total_frames: u64,
+    octx: &'a mut ffmpeg::format::context::Output,
+    video_encoder: &'a mut ffmpeg::encoder::Video,
+    hw_frames_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef,
+    hw_backend: HwBackend,
+    output_frame_idx: &'a mut i64,
+    last_video_dts: &'a mut i64,
+    audio_state: &'a mut AudioEncState,
+    cancel: &'a AtomicBool,
+    tx: &'a Sender<MediaResult>,
+}
+
+impl BlankFrameJob<'_> {
+    fn run(self) -> Result<(), String> {
+        if self.count <= 0 {
+            return Ok(());
+        }
+
+        // Pre-allocate one black YUV420P frame and reuse it for every frame.
+        // Y=16 (black, BT.709 limited), U=V=128 (neutral chroma).
+        let mut blank = VideoFrame::new(Pixel::YUV420P, self.spec.width, self.spec.height);
+        unsafe {
+            let ptr = blank.as_mut_ptr();
+            let y_stride = (*ptr).linesize[0] as usize;
+            let uv_stride = (*ptr).linesize[1] as usize;
+            for row in 0..self.spec.height as usize {
+                let p = (*ptr).data[0].add(row * y_stride);
+                std::slice::from_raw_parts_mut(p, self.spec.width as usize).fill(16u8);
+            }
+            for row in 0..(self.spec.height as usize / 2) {
+                let pu = (*ptr).data[1].add(row * uv_stride);
+                let pv = (*ptr).data[2].add(row * uv_stride);
+                std::slice::from_raw_parts_mut(pu, self.spec.width as usize / 2).fill(128u8);
+                std::slice::from_raw_parts_mut(pv, self.spec.width as usize / 2).fill(128u8);
+            }
+            (*ptr).sample_aspect_ratio = ffmpeg::ffi::AVRational { num: 1, den: 1 };
+        }
+
+        let ost_video_tb = self.octx.stream(0).unwrap().time_base();
+
+        for _ in 0..self.count {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err("cancelled".into());
+            }
+
+            blank.set_pts(Some(*self.output_frame_idx));
+            send_video_frame(
+                &blank,
+                self.video_encoder,
+                self.hw_frames_ctx_ptr,
+                self.hw_backend,
+            )?;
+
+            let mut pkt = Packet::empty();
+            while self.video_encoder.receive_packet(&mut pkt).is_ok() {
+                pkt.set_stream(0);
+                pkt.rescale_ts(self.frame_tb, ost_video_tb);
+                let raw_dts = pkt.dts().unwrap_or(0);
+                if *self.last_video_dts != i64::MIN {
+                    let prev_s = *self.last_video_dts as f64 * f64::from(ost_video_tb);
+                    let dts_s = raw_dts as f64 * f64::from(ost_video_tb);
+                    if dts_s < prev_s {
+                        let clamped = *self.last_video_dts + 1;
+                        crate::media_log!(
+                            "[encode] blank-frame non-monotonic DTS \
+                             ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
+                        );
+                        unsafe {
+                            (*pkt.as_mut_ptr()).dts = clamped;
+                        }
+                    }
+                }
+                *self.last_video_dts = pkt.dts().unwrap_or(raw_dts);
+                pkt.write_interleaved(self.octx)
+                    .map_err(|e| format!("write blank video packet: {e}"))?;
+            }
+
+            *self.output_frame_idx += 1;
+
+            // Yield after every frame for the same reason the clip loop does:
+            // keep the UI and audio threads responsive during a long render.
+            std::thread::yield_now();
+
+            // Pad silence up to this frame so mixable overlays are advanced by
+            // drain_fifo at the correct absolute sample position.
+            let expected = *self.output_frame_idx * AUDIO_RATE as i64 / self.spec.fps as i64;
+            let have = self.audio_state.out_sample_idx + self.audio_state.fifo.len() as i64;
+            let gap = (expected - have).max(0) as usize;
+            if gap > 0 {
+                self.audio_state
+                    .fifo
+                    .left
+                    .extend(std::iter::repeat_n(0.0f32, gap));
+                self.audio_state
+                    .fifo
+                    .right
+                    .extend(std::iter::repeat_n(0.0f32, gap));
+            }
+
+            self.audio_state.drain_fifo(self.octx, false)?;
+
+            if (*self.output_frame_idx as u64).is_multiple_of(PROGRESS_INTERVAL) {
+                let _ = self.tx.send(MediaResult::EncodeProgress {
+                    job_id: self.spec.job_id,
+                    frame: *self.output_frame_idx as u64,
+                    total_frames: self.total_frames,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
 
 fn run_encode(
     spec: &EncodeSpec,
@@ -344,6 +521,7 @@ fn run_encode(
                 }
             })
             .collect(),
+        primary_spans: primary_sample_spans(&spec.clips),
         fifo_overrun_count: 0,
     };
 
@@ -351,11 +529,42 @@ fn run_encode(
     let mut output_frame_idx: i64 = 0;
     let mut last_video_dts: i64 = i64::MIN;
     let mut incoming_skip_secs: f64 = 0.0;
+    // End of the previous clip in timeline seconds, used to turn a gap into
+    // black frames before the next clip.
+    let mut timeline_cursor = 0.0_f64;
     let transition_registry = registry();
 
     for (clip_idx, clip) in spec.clips.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled".into());
+        }
+
+        // Preserve a gap/leading silence before this clip. Without this the
+        // concatenated output shifts every later clip earlier and desyncs all
+        // standalone audio overlays, which are mixed at absolute timeline time.
+        let gap_secs = (clip.timeline_start - timeline_cursor).max(0.0);
+        let gap_frames = (gap_secs * spec.fps as f64).round() as i64;
+        if gap_frames > 0 {
+            crate::media_log!(
+                "[encode] timeline gap: {gap_secs:.3}s before clip {clip_idx} — \
+                 appending {gap_frames} blank frame(s)"
+            );
+            BlankFrameJob {
+                spec,
+                count: gap_frames,
+                frame_tb,
+                total_frames,
+                octx: &mut octx,
+                video_encoder: &mut video_encoder,
+                hw_frames_ctx_ptr,
+                hw_backend,
+                output_frame_idx: &mut output_frame_idx,
+                last_video_dts: &mut last_video_dts,
+                audio_state: &mut audio_state,
+                cancel: cancel.as_ref(),
+                tx,
+            }
+            .run()?;
         }
 
         let skip = incoming_skip_secs;
@@ -370,14 +579,32 @@ fn run_encode(
             None
         };
 
+        // A transition is a zone of `transition_secs` centred on the cut, so it
+        // takes half its length from each side — the model the preview, the zone
+        // math and the timeline badge all use. Each half therefore needs D/2 of
+        // material, which is why the clamp is 2 × the shorter neighbour: without
+        // it, a 3s transition on a 1s clip decoded past the end of the source.
+        // The clamp lives in core (`TransitionType::clamped_secs`) so this site,
+        // the preview zone math and the SetTransition handler all stay in
+        // agreement — diverging here would make export blend different spans
+        // than the timeline view shows.
         let transition_secs: f64 = transition_entry
-            .map(|t| t.kind.duration_secs as f64)
+            .map(|t| {
+                let next_dur = spec
+                    .clips
+                    .get(clip_idx + 1)
+                    .map(|c| c.duration)
+                    .unwrap_or(0.0);
+                t.kind.clamped_secs(clip.duration, next_dur)
+            })
             .unwrap_or(0.0);
+        let half_transition_secs = transition_secs / 2.0;
 
         let effective = ClipSpec {
             path: clip.path.clone(),
+            timeline_start: clip.timeline_start + skip,
             source_offset: clip.source_offset + skip,
-            duration: (clip.duration - skip - transition_secs).max(0.0),
+            duration: (clip.duration - skip - half_transition_secs).max(0.0),
             volume: clip.volume,
             skip_audio: clip.skip_audio,
             fade_in_secs: clip.fade_in_secs,
@@ -389,18 +616,20 @@ fn run_encode(
 
         output_frame_idx = encode_clip(
             &effective,
-            spec,
-            &mut octx,
-            &mut video_encoder,
-            hw_frames_ctx_ptr,
-            hw_backend,
-            &mut audio_state,
-            output_frame_idx,
-            total_frames,
-            frame_tb,
-            &cancel,
-            tx,
-            &mut last_video_dts,
+            EncodeCtx {
+                spec,
+                octx: &mut octx,
+                video_encoder: &mut video_encoder,
+                hw_frames_ctx: hw_frames_ctx_ptr,
+                hw_backend,
+                audio_state: &mut audio_state,
+                out_frame_idx: output_frame_idx,
+                total_frames,
+                frame_tb,
+                cancel: &cancel,
+                tx,
+                last_video_dts: &mut last_video_dts,
+            },
         )?;
 
         if let Some(entry) = transition_entry {
@@ -408,10 +637,11 @@ fn run_encode(
 
             let tail_spec = ClipSpec {
                 path: clip.path.clone(),
+                timeline_start: effective.timeline_start + effective.duration,
                 source_offset: effective.source_offset + effective.duration,
-                duration: transition_secs,
+                duration: half_transition_secs,
                 volume: clip.volume,
-                skip_audio: false,
+                skip_audio: clip.skip_audio,
                 fade_in_secs: 0.0,
                 fade_in_start_secs: 0.0,
                 fade_out_secs: 0.0,
@@ -420,10 +650,11 @@ fn run_encode(
             };
             let head_spec = ClipSpec {
                 path: next_clip.path.clone(),
+                timeline_start: next_clip.timeline_start,
                 source_offset: next_clip.source_offset,
-                duration: transition_secs,
+                duration: half_transition_secs,
                 volume: next_clip.volume,
-                skip_audio: false,
+                skip_audio: next_clip.skip_audio,
                 fade_in_secs: 0.0,
                 fade_in_start_secs: 0.0,
                 fade_out_secs: 0.0,
@@ -436,23 +667,27 @@ fn run_encode(
                     transition_impl.as_ref(),
                     &tail_spec,
                     &head_spec,
-                    spec,
-                    &mut octx,
-                    &mut video_encoder,
-                    hw_frames_ctx_ptr,
-                    hw_backend,
-                    &mut audio_state,
-                    output_frame_idx,
-                    total_frames,
-                    frame_tb,
-                    &cancel,
-                    tx,
-                    &mut last_video_dts,
+                    EncodeCtx {
+                        spec,
+                        octx: &mut octx,
+                        video_encoder: &mut video_encoder,
+                        hw_frames_ctx: hw_frames_ctx_ptr,
+                        hw_backend,
+                        audio_state: &mut audio_state,
+                        out_frame_idx: output_frame_idx,
+                        total_frames,
+                        frame_tb,
+                        cancel: &cancel,
+                        tx,
+                        last_video_dts: &mut last_video_dts,
+                    },
                 )?;
 
-                incoming_skip_secs = transition_secs;
+                incoming_skip_secs = half_transition_secs;
             }
         }
+
+        timeline_cursor = clip.timeline_start + clip.duration;
 
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled".into());
@@ -487,96 +722,22 @@ fn run_encode(
                 extra_frames,
             );
 
-            let ost_video_tb = octx.stream(0).unwrap().time_base();
-
-            // Pre-allocate one black YUV420P frame and reuse it for all blank frames.
-            // Y=16 (black, BT.709 limited), U=V=128 (neutral chroma).
-            let mut blank = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
-            unsafe {
-                let ptr = blank.as_mut_ptr();
-                let y_stride = (*ptr).linesize[0] as usize;
-                let uv_stride = (*ptr).linesize[1] as usize;
-                for row in 0..spec.height as usize {
-                    let p = (*ptr).data[0].add(row * y_stride);
-                    std::slice::from_raw_parts_mut(p, spec.width as usize).fill(16u8);
-                }
-                for row in 0..(spec.height as usize / 2) {
-                    let pu = (*ptr).data[1].add(row * uv_stride);
-                    let pv = (*ptr).data[2].add(row * uv_stride);
-                    std::slice::from_raw_parts_mut(pu, spec.width as usize / 2).fill(128u8);
-                    std::slice::from_raw_parts_mut(pv, spec.width as usize / 2).fill(128u8);
-                }
-                (*ptr).sample_aspect_ratio = ffmpeg::ffi::AVRational { num: 1, den: 1 };
+            BlankFrameJob {
+                spec,
+                count: extra_frames,
+                frame_tb,
+                total_frames,
+                octx: &mut octx,
+                video_encoder: &mut video_encoder,
+                hw_frames_ctx_ptr,
+                hw_backend,
+                output_frame_idx: &mut output_frame_idx,
+                last_video_dts: &mut last_video_dts,
+                audio_state: &mut audio_state,
+                cancel: cancel.as_ref(),
+                tx,
             }
-
-            for _ in 0..extra_frames {
-                if cancel.load(Ordering::Acquire) {
-                    return Err("cancelled".into());
-                }
-
-                blank.set_pts(Some(output_frame_idx));
-                send_video_frame(&blank, &mut video_encoder, hw_frames_ctx_ptr, hw_backend)?;
-
-                let mut pkt = Packet::empty();
-                while video_encoder.receive_packet(&mut pkt).is_ok() {
-                    pkt.set_stream(0);
-                    pkt.rescale_ts(frame_tb, ost_video_tb);
-                    let raw_dts = pkt.dts().unwrap_or(0);
-                    if last_video_dts != i64::MIN {
-                        let prev_s = last_video_dts as f64 * f64::from(ost_video_tb);
-                        let dts_s = raw_dts as f64 * f64::from(ost_video_tb);
-                        if dts_s < prev_s {
-                            let clamped = last_video_dts + 1;
-                            crate::media_log!(
-                                "[encode] blank-frame non-monotonic DTS \
-                                 ({prev_s:.4}s → {dts_s:.4}s); clamping {raw_dts} → {clamped}"
-                            );
-                            unsafe {
-                                (*pkt.as_mut_ptr()).dts = clamped;
-                            }
-                        }
-                    }
-                    last_video_dts = pkt.dts().unwrap_or(raw_dts);
-                    pkt.write_interleaved(&mut octx)
-                        .map_err(|e| format!("write blank video packet: {e}"))?;
-                }
-
-                output_frame_idx += 1;
-
-                // Yield to the OS scheduler after every encoded frame.
-                // SW encodes: combined with the n_cores/2 thread cap and
-                // BELOW_NORMAL priority this keeps the system responsive at
-                // all resolutions (480p through 4K), not just at 2K/4K.
-                // HW encodes: the CPU decode+scale loop feeding the GPU runs
-                // flat-out; yield_now() lets UI, audio, and scrub threads
-                // preempt it whenever they need a core.
-                std::thread::yield_now();
-
-                // Pad silence into the FIFO so drain_fifo can mix the overlay tail.
-                let expected = output_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
-                let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
-                let gap = (expected - have).max(0) as usize;
-                if gap > 0 {
-                    audio_state
-                        .fifo
-                        .left
-                        .extend(std::iter::repeat_n(0.0f32, gap));
-                    audio_state
-                        .fifo
-                        .right
-                        .extend(std::iter::repeat_n(0.0f32, gap));
-                }
-
-                audio_state.drain_fifo(&mut octx, false)?;
-
-                if (output_frame_idx as u64).is_multiple_of(PROGRESS_INTERVAL) {
-                    let _ = tx.send(MediaResult::EncodeProgress {
-                        job_id: spec.job_id,
-                        frame: output_frame_idx as u64,
-                        total_frames,
-                    });
-                }
-            }
+            .run()?;
         }
     }
 

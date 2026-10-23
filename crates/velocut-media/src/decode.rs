@@ -44,18 +44,14 @@ pub struct LiveDecoder {
     /// the thread on advance_to() — which scales every skipped frame needlessly.
     pub skip_until_pts: i64,
 
-    /// [Opt 1] Reusable RGBA output buffer — avoids a heap allocation per frame.
-    /// Capacity is pre-sized to out_w * out_h * 4 at construction and maintained
-    /// across calls. Each call: clear() + extend_from_slice per row (bulk memcpy),
-    /// then clone() once to hand off to the caller.  Saves the flat_map().collect()
-    /// iterator overhead and guarantees no mid-frame realloc.
-    frame_buf: Vec<u8>,
-
     /// D3D11VA hardware device context.  Some when hwaccel init succeeded;
     /// None when unavailable or init failed (automatic CPU fallback).
-    /// Kept alive for the lifetime of the decoder — FFmpeg ref-counts it internally.
-    #[allow(dead_code)]
-    hw_device_ctx: Option<HwDeviceCtx>,
+    ///
+    /// The decoder owns this reference for its lifetime: it is never read after
+    /// construction, only held so the device context outlives every surface
+    /// allocated from it. The leading underscore states that intent and exempts
+    /// it from `dead_code` without an `allow`.
+    _hw_device_ctx: Option<HwDeviceCtx>,
     pub filter: Option<FilterParams>,
 
     /// Cached raw SwsContext pointer for center_crop_and_scale.
@@ -63,8 +59,28 @@ pub struct LiveDecoder {
     /// region and output dimensions are unchanged (steady-state playback).
     /// Key: (crop_w, crop_h, src_pixel_format_i32, dst_w, dst_h).
     crop_sws: CachedCropSws,
-    /// Reusable output buffer for the center_crop_and_scale path.
-    crop_buf: Vec<u8>,
+
+    /// Reusable AVFrame slot: `receive_frame` target.
+    ///
+    /// The decode loops used to call `Video::empty()` once per packet and again
+    /// per decoded frame, i.e. an `av_frame_alloc` + `av_frame_free` for every
+    /// frame. One frame struct now lives for the decoder's lifetime; the decode
+    /// loops hand it to `avcodec_receive_frame`, which unreferences it first.
+    dec_frame: ffmpeg::util::frame::video::Video,
+
+    /// Reusable AVFrame slot: the CPU-accessible copy of the decoded frame that
+    /// the scaler reads. Filled by `decode_into_cpu_frame` — moved for software
+    /// frames, hw-transferred for GPU frames — and unreferenced before the next
+    /// frame is requested so the decoder's buffer pool gets it back promptly.
+    cpu_frame: ffmpeg::util::frame::video::Video,
+
+    /// Reusable AVFrame slot: the stretch-scaler destination (fallback path only).
+    ///
+    /// Unlike the other two this keeps its *buffer*: `SwsContext::run` allocates
+    /// only when the output frame is empty, so a retained preview-sized RGBA
+    /// buffer turns the fallback into a write into already-faulted pages instead
+    /// of a fresh allocation per frame.
+    scale_frame: ffmpeg::util::frame::video::Video,
 }
 
 /// Send-safe wrapper for a raw `*mut SwsContext` (FFmpeg scaler context).
@@ -310,34 +326,45 @@ unsafe fn allocate_d3d11va_vld_frames_ctx(ctx: *mut ffi::AVCodecContext) -> bool
     true
 }
 
-/// Transfer a hardware frame (D3D11 surface) to a CPU-accessible frame.
+/// Materialise the decoded frame `src` in `dst` as a CPU-accessible frame.
 ///
-/// GPU frames are detected via `hw_frames_ctx != NULL` — more robust than
-/// pixel format integer constants, which can vary between FFmpeg builds.
-/// Returns the transferred frame on success, or the original frame unchanged
-/// if it is already a CPU frame.
-fn ensure_cpu_frame(frame: ffmpeg::util::frame::video::Video) -> ffmpeg::util::frame::video::Video {
-    unsafe {
-        // hw_frames_ctx is non-NULL on every hardware-accelerated frame.
-        // CPU frames always have a NULL hw_frames_ctx.
-        if (*frame.as_ptr()).hw_frames_ctx.is_null() {
-            return frame;
-        }
-        let mut cpu_frame = ffmpeg::util::frame::video::Video::empty();
-        let ret = ffi::av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_ptr(), 0);
-        if ret < 0 {
-            crate::media_log!(
-                "[hwaccel] av_hwframe_transfer_data failed ({}), dropping frame",
-                ret
-            );
-            return frame;
-        }
-        // Copy presentation metadata — FFmpeg does not propagate this during transfer.
-        (*cpu_frame.as_mut_ptr()).pts = (*frame.as_ptr()).pts;
-        (*cpu_frame.as_mut_ptr()).pkt_dts = (*frame.as_ptr()).pkt_dts;
-        (*cpu_frame.as_mut_ptr()).best_effort_timestamp = (*frame.as_ptr()).best_effort_timestamp;
-        cpu_frame
+/// GPU frames are detected via `hw_frames_ctx != NULL` — more robust than pixel
+/// format integer constants, which can vary between FFmpeg builds.
+///
+/// Software frames are *moved* (`av_frame_move_ref`): the decoder's own buffers
+/// are taken over by reference, so no pixel copy and no allocation happens.
+/// Hardware frames go through `av_hwframe_transfer_data`, which allocates the
+/// CPU-side buffer itself — the destination must be a clean frame, so that
+/// allocation is inside FFmpeg's contract and cannot be hoisted out. What can be
+/// reused is the AVFrame struct, which is why this writes into a slot instead of
+/// returning a fresh frame.
+///
+/// `dst` is unreferenced first, so one slot serves every frame. Returns false
+/// when a hardware transfer failed; the caller should drop the frame and try the
+/// next one.
+///
+/// # Safety
+/// `src` and `dst` must be valid, distinct, decoder-owned `AVFrame`s; `src` must
+/// not be referenced by any other owner after this call.
+unsafe fn decode_into_cpu_frame(src: *mut ffi::AVFrame, dst: *mut ffi::AVFrame) -> bool {
+    ffi::av_frame_unref(dst);
+    if (*src).hw_frames_ctx.is_null() {
+        ffi::av_frame_move_ref(dst, src);
+        return true;
     }
+    let ret = ffi::av_hwframe_transfer_data(dst, src, 0);
+    if ret < 0 {
+        crate::media_log!(
+            "[hwaccel] av_hwframe_transfer_data failed ({}), dropping frame",
+            ret
+        );
+        return false;
+    }
+    // Copy presentation metadata — FFmpeg does not propagate this during transfer.
+    (*dst).pts = (*src).pts;
+    (*dst).pkt_dts = (*src).pkt_dts;
+    (*dst).best_effort_timestamp = (*src).best_effort_timestamp;
+    true
 }
 
 // ── Stateful per-clip decoder ─────────────────────────────────────────────────
@@ -508,11 +535,12 @@ impl LiveDecoder {
             decoder_w: dec_w,
             decoder_h: dec_h,
             skip_until_pts: 0,
-            frame_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
-            hw_device_ctx,
+            _hw_device_ctx: hw_device_ctx,
             filter: None,
             crop_sws: CachedCropSws(None),
-            crop_buf: Vec::with_capacity(out_w as usize * out_h as usize * 4),
+            dec_frame: ffmpeg::util::frame::video::Video::empty(),
+            cpu_frame: ffmpeg::util::frame::video::Video::empty(),
+            scale_frame: ffmpeg::util::frame::video::Video::empty(),
         })
     }
 
@@ -544,18 +572,20 @@ impl LiveDecoder {
         pts as f64 * self.tb_num as f64 / self.tb_den as f64
     }
 
-    /// Decode the next frame sequentially (no seek). Returns `(pixels, w, h, ts_secs)` or None at EOF.
+    /// Decode the next frame sequentially (no seek) into a buffer the caller owns.
+    /// Returns `(w, h, ts_secs)` or None at EOF.
+    ///
+    /// `out` is resized to `out_w * out_h * 4` and fully overwritten, so a caller
+    /// that keeps one buffer across frames never allocates. That matters more than
+    /// it sounds: writing a fresh 5 MB frame costs about 1230 page faults, which is
+    /// a substantial part of the work for a preview-sized frame. `next_frame` is the
+    /// allocating convenience wrapper for one-shot callers (scrub, extract).
     ///
     /// If `skip_until_pts` is set (non-zero), frames before that PTS are decoded
     /// but not scaled — decode-only is ~4x faster than decode+scale+alloc, so this
     /// burns through a GOP in ~50 ms instead of ~200 ms.  Once the threshold is
     /// reached the field is cleared and normal decode+scale resumes.
-    ///
-    /// [Opt 1] RGBA output is assembled via extend_from_slice (bulk memcpy per row)
-    /// into a reused self.frame_buf, then cloned once for the return value.  This
-    /// avoids the flat_map().collect() iterator overhead and the implicit Vec growth
-    /// that could occur when the size_hint is imprecise.
-    pub fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
+    pub fn next_frame_into(&mut self, out: &mut Vec<u8>) -> Option<(u32, u32, f64)> {
         // Max video packets to process per call while in skip mode.
         // Keeps each call bounded at ~30 ms so the pb thread stays responsive.
         // Caller detects "still burning" vs EOF by checking skip_until_pts > 0
@@ -572,9 +602,12 @@ impl LiveDecoder {
             if self.decoder.send_packet(&packet).is_err() {
                 continue;
             }
-            let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+            // Release the previous frame's buffers before asking the decoder for
+            // another: the slot is reused, so holding one while receiving would
+            // push each decoder's buffer pool to two frames instead of one.
+            unsafe { ffi::av_frame_unref(self.cpu_frame.as_mut_ptr()) };
+            while self.decoder.receive_frame(&mut self.dec_frame).is_ok() {
+                let pts = self.dec_frame.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
                 // Burn-through: skip scaler for pre-target frames after a seek.
                 // Avoids decode+scale+alloc for every GOP frame we don't need.
@@ -584,26 +617,29 @@ impl LiveDecoder {
                 self.skip_until_pts = 0; // reached target — disable skip
                 let ts_secs = pts as f64 * tb_num as f64 / tb_den as f64;
 
-                // Transfer GPU surface to CPU.  ensure_cpu_frame takes ownership of
-                // `decoded` by value, so reinitialise the outer binding immediately
-                // so receive_frame() gets a live &mut on the next loop iteration.
-                let cpu = ensure_cpu_frame(decoded);
-                decoded = ffmpeg::util::frame::video::Video::empty();
+                // Move the frame into the CPU slot (software) or transfer the GPU
+                // surface into it. Neither allocates an AVFrame.
+                let cpu_ok = unsafe {
+                    decode_into_cpu_frame(self.dec_frame.as_mut_ptr(), self.cpu_frame.as_mut_ptr())
+                };
+                if !cpu_ok {
+                    continue;
+                }
 
                 // Inline scale: try cached crop path, fallback to stretch scaler.
-                let mut data_opt = unsafe {
+                let mut scaled = unsafe {
                     center_crop_and_scale_cached(
                         &mut self.crop_sws,
-                        &mut self.crop_buf,
+                        out,
                         self.out_w,
                         self.out_h,
-                        &cpu,
+                        &self.cpu_frame,
                     )
                 };
-                if data_opt.is_none() {
-                    let af = cpu.format();
-                    let aw = cpu.width();
-                    let ah = cpu.height();
+                if !scaled {
+                    let af = self.cpu_frame.format();
+                    let aw = self.cpu_frame.width();
+                    let ah = self.cpu_frame.height();
                     if af != self.decoder_fmt || aw != self.decoder_w || ah != self.decoder_h {
                         if let Ok(sws) = SwsContext::get(
                             af,
@@ -620,21 +656,17 @@ impl LiveDecoder {
                             self.decoder_h = ah;
                         }
                     }
-                    let mut out = ffmpeg::util::frame::video::Video::empty();
-                    if self.scaler.run(&cpu, &mut out).is_ok() {
-                        data_opt = Some(copy_frame_rgba(
-                            &mut self.frame_buf,
-                            &out,
-                            self.out_w,
-                            self.out_h,
-                        ));
+                    if scale_stretch_into(&mut self.scaler, &self.cpu_frame, &mut self.scale_frame)
+                    {
+                        copy_frame_rgba_into(out, &self.scale_frame, self.out_w, self.out_h);
+                        scaled = true;
                     }
                 }
-                if let Some(mut data) = data_opt {
+                if scaled {
                     if let Some(ref params) = self.filter {
-                        apply_filter_rgba(&mut data, params);
+                        apply_filter_rgba(out, params);
                     }
-                    return Some((data, self.out_w, self.out_h, ts_secs));
+                    return Some((self.out_w, self.out_h, ts_secs));
                 }
                 // Both paths failed (e.g. GPU→CPU transfer error, scaler mismatch):
                 // skip this frame; the while loop retries automatically.
@@ -651,6 +683,17 @@ impl LiveDecoder {
             }
         }
         None
+    }
+
+    /// Decode the next frame into a fresh allocation.
+    ///
+    /// Convenience wrapper for one-shot callers that hand the pixels straight to
+    /// another thread. Playback uses `next_frame_into` with a buffer it recycles, so
+    /// it pays neither the allocation nor the page faults.
+    pub fn next_frame(&mut self) -> Option<(Vec<u8>, u32, u32, f64)> {
+        let mut out = Vec::new();
+        self.next_frame_into(&mut out)
+            .map(|(w, h, ts)| (out, w, h, ts))
     }
 
     /// [Opt 2] Read forward until we find a frame at or past `target_pts`.
@@ -674,9 +717,11 @@ impl LiveDecoder {
             if self.decoder.send_packet(&packet).is_err() {
                 continue;
             }
-            let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+            // Release the previous frame's buffers before receiving another (see
+            // next_frame_into): one buffer per decoder in the pool, not two.
+            unsafe { ffi::av_frame_unref(self.cpu_frame.as_mut_ptr()) };
+            while self.decoder.receive_frame(&mut self.dec_frame).is_ok() {
+                let pts = self.dec_frame.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
                 // [Opt 2] Decode-only for all frames before the target PTS.
                 // ~4x faster than decode+scale+alloc for the same set of frames.
@@ -684,25 +729,30 @@ impl LiveDecoder {
                     continue;
                 }
                 // Target reached — center-crop source to canvas AR and scale.
-                // Same pattern as next_frame: reinitialise `decoded` after the move
-                // so the while loop can retry on failure without a borrow-after-move.
-                let cpu = ensure_cpu_frame(decoded);
-                decoded = ffmpeg::util::frame::video::Video::empty();
+                // The frame goes into the reusable CPU slot: moved for software
+                // frames, hw-transferred for GPU frames.
+                let cpu_ok = unsafe {
+                    decode_into_cpu_frame(self.dec_frame.as_mut_ptr(), self.cpu_frame.as_mut_ptr())
+                };
+                if !cpu_ok {
+                    continue;
+                }
 
                 // Inline scale: try cached crop path, fallback to stretch scaler.
-                let mut data_opt = unsafe {
+                let mut data = Vec::new();
+                let mut scaled = unsafe {
                     center_crop_and_scale_cached(
                         &mut self.crop_sws,
-                        &mut self.crop_buf,
+                        &mut data,
                         self.out_w,
                         self.out_h,
-                        &cpu,
+                        &self.cpu_frame,
                     )
                 };
-                if data_opt.is_none() {
-                    let af = cpu.format();
-                    let aw = cpu.width();
-                    let ah = cpu.height();
+                if !scaled {
+                    let af = self.cpu_frame.format();
+                    let aw = self.cpu_frame.width();
+                    let ah = self.cpu_frame.height();
                     if af != self.decoder_fmt || aw != self.decoder_w || ah != self.decoder_h {
                         if let Ok(sws) = SwsContext::get(
                             af,
@@ -719,17 +769,13 @@ impl LiveDecoder {
                             self.decoder_h = ah;
                         }
                     }
-                    let mut out = ffmpeg::util::frame::video::Video::empty();
-                    if self.scaler.run(&cpu, &mut out).is_ok() {
-                        data_opt = Some(copy_frame_rgba(
-                            &mut self.frame_buf,
-                            &out,
-                            self.out_w,
-                            self.out_h,
-                        ));
+                    if scale_stretch_into(&mut self.scaler, &self.cpu_frame, &mut self.scale_frame)
+                    {
+                        copy_frame_rgba_into(&mut data, &self.scale_frame, self.out_w, self.out_h);
+                        scaled = true;
                     }
                 }
-                if let Some(mut data) = data_opt {
+                if scaled {
                     if let Some(ref params) = self.filter {
                         apply_filter_rgba(&mut data, params);
                     }
@@ -762,9 +808,8 @@ impl LiveDecoder {
             if self.decoder.send_packet(&packet).is_err() {
                 continue;
             }
-            let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+            while self.decoder.receive_frame(&mut self.dec_frame).is_ok() {
+                let pts = self.dec_frame.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
                 if pts >= target_pts {
                     break 'outer;
@@ -795,9 +840,8 @@ impl LiveDecoder {
             if self.decoder.send_packet(&packet).is_err() {
                 continue;
             }
-            let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(self.last_pts + 1);
+            while self.decoder.receive_frame(&mut self.dec_frame).is_ok() {
+                let pts = self.dec_frame.pts().unwrap_or(self.last_pts + 1);
                 self.last_pts = pts;
                 if pts >= self.skip_until_pts {
                     self.skip_until_pts = 0;
@@ -831,6 +875,27 @@ impl LiveDecoder {
     }
 }
 
+/// Scale `input` into `output` with the stretch scaler (the fallback path, taken
+/// only for sources `center_crop_and_scale_cached` does not handle: anything other
+/// than NV12/YUV420P/YUVJ420P/P010LE).
+///
+/// `output` keeps its buffer across frames — `SwsContext::run` allocates only when
+/// the frame is empty — so the scaler writes into pages that are already faulted
+/// in instead of a fresh preview-sized allocation per frame. A retained frame
+/// whose shape no longer matches the scaler is dropped once and reallocated,
+/// rather than failing every frame from then on.
+fn scale_stretch_into(
+    scaler: &mut SwsContext,
+    input: &ffmpeg::util::frame::video::Video,
+    output: &mut ffmpeg::util::frame::video::Video,
+) -> bool {
+    if scaler.run(input, output).is_ok() {
+        return true;
+    }
+    unsafe { ffi::av_frame_unref(output.as_mut_ptr()) };
+    scaler.run(input, output).is_ok()
+}
+
 /// Center-crop and scale a decoded frame using a cached raw SwsContext.
 ///
 /// Free function (not a method) so it can be called inside a loop that borrows
@@ -844,16 +909,16 @@ unsafe fn center_crop_and_scale_cached(
     out_w: u32,
     out_h: u32,
     frame: &ffmpeg::util::frame::video::Video,
-) -> Option<Vec<u8>> {
+) -> bool {
     let dst_w = out_w;
     let dst_h = out_h;
     if dst_w == 0 || dst_h == 0 {
-        return None;
+        return false;
     }
     let src_w = frame.width();
     let src_h = frame.height();
     if src_w == 0 || src_h == 0 {
-        return None;
+        return false;
     }
 
     let src_ar = src_w as f32 / src_h as f32;
@@ -877,7 +942,7 @@ unsafe fn center_crop_and_scale_cached(
     let p010le = ffi::AVPixelFormat::AV_PIX_FMT_P010LE as i32;
 
     if fmt_i != nv12 && fmt_i != yuv420p && fmt_i != yuvj420p && fmt_i != p010le {
-        return None;
+        return false;
     }
 
     let s0 = (*raw).linesize[0] as usize;
@@ -944,7 +1009,7 @@ unsafe fn center_crop_and_scale_cached(
             std::ptr::null(),
         );
         if ctx.is_null() {
-            return None;
+            return false;
         }
         crop_sws.0 = Some((crop_w, crop_h, fmt_i, dst_w, dst_h, RawSwsCtx(ctx)));
     }
@@ -974,12 +1039,9 @@ unsafe fn center_crop_and_scale_cached(
         dst_strides.as_mut_ptr(),
     );
 
-    if rows > 0 {
-        // Move the buffer out instead of cloning. The caller takes ownership.
-        Some(std::mem::take(crop_buf))
-    } else {
-        None
-    }
+    // The caller owns the buffer: sws_scale wrote straight into it, so there is
+    // nothing to hand back and nothing to copy.
+    rows > 0
 }
 
 // ── Frame copy helper ─────────────────────────────────────────────────────────
@@ -991,44 +1053,60 @@ unsafe fn center_crop_and_scale_cached(
 /// exceeds its current capacity (i.e. never in steady state for a fixed-resolution
 /// source).  The returned Vec is a single allocation of the exact frame size.
 #[inline]
-fn copy_frame_rgba(
+fn copy_frame_rgba_into(
     buf: &mut Vec<u8>,
     frame: &ffmpeg::util::frame::video::Video,
     out_w: u32,
     out_h: u32,
-) -> Vec<u8> {
+) {
     let stride = frame.stride(0);
     let raw = frame.data(0);
     let row_bytes = out_w as usize * 4;
     let needed = row_bytes * out_h as usize;
 
-    buf.clear();
-    // Reserve only triggers a realloc when dimensions change (e.g. first frame,
-    // or aspect ratio change mid-session).
-    if buf.capacity() < needed {
-        buf.reserve(needed);
-    }
+    // Resize, not clear+extend: for a buffer that is already frame-sized this is
+    // a no-op and the rows are overwritten in place.
+    buf.resize(needed, 0);
     for row in 0..out_h as usize {
         let s = row * stride;
-        buf.extend_from_slice(&raw[s..s + row_bytes]);
+        buf[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(&raw[s..s + row_bytes]);
     }
-    // Move the buffer out instead of cloning. The caller takes ownership.
-    std::mem::take(buf)
 }
 
 // ── One-shot frame decode (preview + PNG save) ────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-pub fn decode_frame(
-    path: &PathBuf,
-    id: Uuid,
-    timestamp: f64,
-    aspect: f32,    // 0.0 = use native resolution (or preview_size if set)
-    save_png: bool, // true = write PNG to dest, false = send VideoFrame
-    dest: Option<PathBuf>,
-    tx: &Sender<MediaResult>,
-    preview_size: Option<(u32, u32)>, // UI panel dims — decode at this size when aspect<=0; ignored for PNG
-) -> Result<()> {
+/// Inputs for one one-shot frame decode (`decode_frame`).
+///
+/// Grouped so the entry point takes a request plus the result channel rather
+/// than the nine positional arguments it had grown into: half of them are
+/// optional overrides or bare booleans, and the call sites were unreadable.
+pub struct DecodeFrameRequest<'a> {
+    pub path: &'a PathBuf,
+    pub id: Uuid,
+    pub timestamp: f64,
+    /// 0.0 → native resolution (or `preview_size` when set); > 0 → 320 px scrub.
+    pub aspect: f32,
+    /// true → write a PNG to `dest` and send `FrameSaved`; false → decode and
+    /// send a `VideoFrame`.
+    pub save_png: bool,
+    pub dest: Option<PathBuf>,
+    /// UI request sequence echoed on the `VideoFrame` result.
+    pub req_seq: u64,
+    /// Panel dimensions used when `aspect <= 0`; ignored for PNG writes.
+    pub preview_size: Option<(u32, u32)>,
+}
+
+pub fn decode_frame(req: DecodeFrameRequest<'_>, tx: &Sender<MediaResult>) -> Result<()> {
+    let DecodeFrameRequest {
+        path,
+        id,
+        timestamp,
+        aspect,
+        save_png,
+        dest,
+        req_seq,
+        preview_size,
+    } = req;
     let mut ictx = input(path)?;
 
     // Build codec context in the same block as the stream borrow.
@@ -1154,7 +1232,19 @@ pub fn decode_frame(
                     continue;
                 }
             }
-            emit_frame(&out_frame, id, out_w, out_h, save_png, &dest, tx)?;
+            emit_frame(
+                &out_frame,
+                &FrameMeta {
+                    id,
+                    req_ts: timestamp,
+                    req_seq,
+                    out_w,
+                    out_h,
+                },
+                save_png,
+                &dest,
+                tx,
+            )?;
             return Ok(());
         }
     }
@@ -1164,19 +1254,41 @@ pub fn decode_frame(
         if out_w == 0 {
             return Err(anyhow::anyhow!("no frame found at t={timestamp:.3}"));
         }
-        emit_frame(&out_frame, id, out_w, out_h, save_png, &dest, tx)?;
+        emit_frame(
+            &out_frame,
+            &FrameMeta {
+                id,
+                req_ts: timestamp,
+                req_seq,
+                out_w,
+                out_h,
+            },
+            save_png,
+            &dest,
+            tx,
+        )?;
         return Ok(());
     }
 
     Err(anyhow::anyhow!("no frame found at t={timestamp:.3}"))
 }
 
+/// Static metadata needed by `emit_frame` regardless of output target.
+struct FrameMeta {
+    id: Uuid,
+    /// Source timestamp the decode was requested for — copied onto the
+    /// `MediaResult::VideoFrame` result so the UI can reject stale frames.
+    req_ts: f64,
+    /// UI request sequence echoed onto `MediaResult::VideoFrame` (0 = untracked).
+    req_seq: u64,
+    out_w: u32,
+    out_h: u32,
+}
+
 /// Emit a decoded frame: either write a PNG to disk or send a VideoFrame result.
 fn emit_frame(
     out_frame: &ffmpeg::util::frame::video::Video,
-    id: Uuid,
-    out_w: u32,
-    out_h: u32,
+    meta: &FrameMeta,
     save_png: bool,
     dest: &Option<PathBuf>,
     tx: &Sender<MediaResult>,
@@ -1191,29 +1303,31 @@ fn emit_frame(
             .ok_or_else(|| anyhow::anyhow!("no dest path for PNG save"))?;
         let file = std::fs::File::create(&dest_path)?;
         let w = &mut BufWriter::new(file);
-        let mut encoder = png::Encoder::new(w, out_w, out_h);
+        let mut encoder = png::Encoder::new(w, meta.out_w, meta.out_h);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header()?;
-        let row_bytes = out_w as usize * 3;
-        let rows: Vec<&[u8]> = (0..out_h as usize)
+        let row_bytes = meta.out_w as usize * 3;
+        let rows: Vec<&[u8]> = (0..meta.out_h as usize)
             .map(|row| &raw[row * stride..row * stride + row_bytes])
             .collect();
         writer.write_image_data(&rows.concat())?;
         crate::media_log!("[media] PNG saved → {}", dest_path.display());
         let _ = tx.send(MediaResult::FrameSaved { path: dest_path });
     } else {
-        let data: Vec<u8> = (0..out_h as usize)
+        let data: Vec<u8> = (0..meta.out_h as usize)
             .flat_map(|row| {
                 let start = row * stride;
-                &raw[start..start + out_w as usize * 4]
+                &raw[start..start + meta.out_w as usize * 4]
             })
             .copied()
             .collect();
         let _ = tx.send(MediaResult::VideoFrame {
-            id,
-            width: out_w,
-            height: out_h,
+            id: meta.id,
+            req_ts: meta.req_ts,
+            req_seq: meta.req_seq,
+            width: meta.out_w,
+            height: meta.out_h,
             data,
         });
     }

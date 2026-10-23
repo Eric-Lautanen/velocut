@@ -31,7 +31,7 @@ use velocut_core::filters::FilterParams;
 use velocut_core::media_types::MediaResult;
 use velocut_core::transitions::VideoTransition;
 
-use super::audio::{fade_gain, flush_audio_resampler, AudioEncState};
+use super::audio::{cut_gate, fade_gain, flush_audio_resampler, AudioEncState};
 use super::hw::{upload_frame_to_hw, HwBackend};
 use super::{ClipSpec, EncodeSpec, AUDIO_RATE, PROGRESS_INTERVAL};
 
@@ -186,22 +186,45 @@ pub(super) fn apply_filter_to_yuv_frame(
 
 // ── Per-clip encode ────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn encode_clip(
-    clip: &ClipSpec,
-    spec: &EncodeSpec,
-    octx: &mut ffmpeg::format::context::Output,
-    video_encoder: &mut ffmpeg::encoder::Video,
-    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
-    hw_backend: HwBackend,
-    audio_state: &mut AudioEncState,
-    mut out_frame_idx: i64,
-    total_frames: u64,
-    frame_tb: Rational,
-    cancel: &Arc<AtomicBool>,
-    tx: &Sender<MediaResult>,
-    last_video_dts: &mut i64,
-) -> Result<i64, String> {
+/// Encode-sink plumbing shared by the per-clip writer and the transition
+/// writer: where frames go, how they are encoded, the audio FIFO to mix into,
+/// and the counters that must carry across clips.
+///
+/// Grouped into one struct instead of a dozen positional arguments, which had
+/// become impossible to read at the call sites — two of them were adjacent
+/// `&mut`s and the frame counter was both an input and an output.
+pub(super) struct EncodeCtx<'a> {
+    pub(super) spec: &'a EncodeSpec,
+    pub(super) octx: &'a mut ffmpeg::format::context::Output,
+    pub(super) video_encoder: &'a mut ffmpeg::encoder::Video,
+    pub(super) hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    pub(super) hw_backend: HwBackend,
+    pub(super) audio_state: &'a mut AudioEncState,
+    /// Next output frame index; both writers return the advanced value.
+    pub(super) out_frame_idx: i64,
+    pub(super) total_frames: u64,
+    pub(super) frame_tb: Rational,
+    pub(super) cancel: &'a Arc<AtomicBool>,
+    pub(super) tx: &'a Sender<MediaResult>,
+    pub(super) last_video_dts: &'a mut i64,
+}
+
+pub(super) fn encode_clip(clip: &ClipSpec, ctx: EncodeCtx<'_>) -> Result<i64, String> {
+    let EncodeCtx {
+        spec,
+        octx,
+        video_encoder,
+        hw_frames_ctx,
+        hw_backend,
+        audio_state,
+        out_frame_idx,
+        total_frames,
+        frame_tb,
+        cancel,
+        tx,
+        last_video_dts,
+    } = ctx;
+    let mut out_frame_idx = out_frame_idx;
     let mut ictx =
         open_input(&clip.path).map_err(|e| format!("open '{}': {e}", clip.path.display()))?;
 
@@ -283,7 +306,6 @@ pub(super) fn encode_clip(
 
     let clip_start_frame_idx = out_frame_idx;
     let mut video_clip_done = false;
-    let mut audio_has_started = false;
 
     for result in ictx.packets() {
         let (stream, packet) =
@@ -420,23 +442,19 @@ pub(super) fn encode_clip(
                         break;
                     }
 
-                    audio_has_started = true;
-
                     let pre_roll = ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64)
                         .round() as usize;
 
-                    let src_channels = raw.ch_layout().channels();
+                    let src_layout = {
+                        crate::helpers::resample::ensure_layout(&mut raw);
+                        raw.ch_layout()
+                    };
                     let needs_resample = raw.format() != Sample::F32(SampleType::Planar)
                         || raw.rate() != AUDIO_RATE as u32
-                        || src_channels != 2;
+                        || src_layout.channels() != 2;
 
                     if needs_resample {
                         let rs = audio_resampler.get_or_insert_with(|| {
-                            let src_layout = if src_channels >= 2 {
-                                raw.ch_layout()
-                            } else {
-                                ChannelLayout::MONO
-                            };
                             resampling::Context::get2(
                                 raw.format(),
                                 src_layout,
@@ -565,10 +583,13 @@ pub(super) fn encode_clip(
                 break;
             }
 
-            let src_channels = raw.ch_layout().channels();
+            let src_layout = {
+                crate::helpers::resample::ensure_layout(&mut raw);
+                raw.ch_layout()
+            };
             let needs_resample = raw.format() != Sample::F32(SampleType::Planar)
                 || raw.rate() != AUDIO_RATE as u32
-                || src_channels != 2;
+                || src_layout.channels() != 2;
 
             if needs_resample {
                 if let Some(rs) = &mut audio_resampler {
@@ -606,27 +627,42 @@ pub(super) fn encode_clip(
         }
     }
 
-    // ── FIFO final drain for this clip ────────────────────────────────────────
-    // Keep the video output frame count tightly coupled to the FIFO state:
-    // if the FIFO is deeper than expected (audio ahead of video, common at
-    // high bitrates or GPU encodes where video runs fast), drain it fully
-    // BEFORE the transition tail, then trim the FIFO to the clip's expected
-    // sample count so overlay audio on the NEXT clip sees the right base level.
-    if audio_has_started {
-        let expected_samples =
-            ((clip.duration * AUDIO_RATE as f64).round() as usize).min(audio_state.fifo.len());
-        let excess = audio_state.fifo.len().saturating_sub(expected_samples);
+    // ── Align the audio stream to this clip's video boundary ──────────────────
+    // AAC packet PTS come from `out_sample_idx`, so a clip that contributes no
+    // audio (skip_audio, a source with no audio stream, or a track that ends
+    // before the video) would end the audio stream early and drag every later
+    // clip and every absolute-time overlay earlier than the picture. Pad the
+    // shortfall with silence; keep the overshoot trim for the usual case where
+    // the decoder delivers slightly more than the clip's span.
+    let target_samples = out_frame_idx * AUDIO_RATE as i64 / spec.fps as i64;
+    let have = audio_state.out_sample_idx + audio_state.fifo.len() as i64;
+    if have < target_samples {
+        let shortfall = (target_samples - have) as usize;
+        crate::media_log!(
+            "[encode] clip '{}' audio short by {:.3}s — padding silence",
+            clip.path.display(),
+            shortfall as f64 / AUDIO_RATE as f64,
+        );
+        audio_state
+            .fifo
+            .left
+            .extend(std::iter::repeat_n(0.0f32, shortfall));
+        audio_state
+            .fifo
+            .right
+            .extend(std::iter::repeat_n(0.0f32, shortfall));
+    } else if have > target_samples {
+        let excess = ((have - target_samples) as usize).min(audio_state.fifo.len());
         if excess > 0 {
             crate::media_log!(
-                "[encode] clip '{}' FIFO overrun: {} extra samples — draining {}",
+                "[encode] clip '{}' FIFO overrun: {} extra samples — trimming",
                 clip.path.display(),
                 excess,
-                expected_samples,
             );
+            let new_len = audio_state.fifo.left.len().saturating_sub(excess);
+            audio_state.fifo.left.truncate(new_len);
+            audio_state.fifo.right.truncate(new_len);
         }
-        let new_len = audio_state.fifo.left.len().saturating_sub(excess);
-        audio_state.fifo.left.truncate(new_len);
-        audio_state.fifo.right.truncate(new_len);
     }
 
     audio_state.drain_fifo(octx, false)?;
@@ -725,6 +761,11 @@ pub(super) fn decode_clip_frames(
         }
     }
 
+    // Decoder flush. These are the frames still held back by B-frame reordering,
+    // i.e. the ones closest to the clip's end — for a transition tail that is the
+    // most visible part of the blend, so it has to go through exactly the same
+    // start guard, scaler and colour filter as the main loop. Skipping the filter
+    // here made graded clips lose their grade on the final frames of the overlap.
     let _ = video_decoder.send_eof();
     let mut decoded = VideoFrame::empty();
     while video_decoder.receive_frame(&mut decoded).is_ok() {
@@ -732,15 +773,28 @@ pub(super) fn decode_clip_frames(
             .pts()
             .map(|pts| pts as f64 * f64::from(in_video_tb))
             .unwrap_or(0.0);
+        if pts_secs < clip.source_offset - half_frame {
+            continue;
+        }
         if pts_secs >= clip_end {
             break;
         }
 
-        if let Some(sc) = &mut video_scaler {
-            let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
-            if sc.run(&decoded, &mut yuv).is_ok() {
-                frames.push(extract_yuv(&yuv, w, h));
-            }
+        // Build the scaler here too: a clip short enough that the main loop
+        // produced no frame would otherwise drop its only (flushed) frames.
+        let sc = video_scaler.get_or_insert_with(|| {
+            CropScaler::build(
+                decoded.format(),
+                src_display_w,
+                src_display_h,
+                spec.width,
+                spec.height,
+            )
+        });
+        let mut yuv = VideoFrame::new(Pixel::YUV420P, spec.width, spec.height);
+        if sc.run(&decoded, &mut yuv).is_ok() {
+            apply_filter_to_yuv_frame(&mut yuv, &clip.filter, spec.width, spec.height);
+            frames.push(extract_yuv(&yuv, w, h));
         }
     }
 
@@ -748,6 +802,10 @@ pub(super) fn decode_clip_frames(
 }
 
 pub(super) fn decode_clip_audio(clip: &ClipSpec) -> Result<(Vec<f32>, Vec<f32>), String> {
+    if clip.skip_audio {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
     let mut ictx = open_input(&clip.path)
         .map_err(|e| format!("transition audio open '{}': {e}", clip.path.display()))?;
 
@@ -832,17 +890,16 @@ pub(super) fn decode_clip_audio(clip: &ClipSpec) -> Result<(Vec<f32>, Vec<f32>),
             let pre_roll =
                 ((clip.source_offset - pts_secs).max(0.0) * AUDIO_RATE as f64).round() as usize;
 
-            let raw_channels = raw.ch_layout().channels();
-            let needs_resample =
-                raw.format() != target_fmt || raw.rate() != AUDIO_RATE as u32 || raw_channels != 2;
+            let src_layout = {
+                crate::helpers::resample::ensure_layout(&mut raw);
+                raw.ch_layout()
+            };
+            let needs_resample = raw.format() != target_fmt
+                || raw.rate() != AUDIO_RATE as u32
+                || src_layout.channels() != 2;
 
             if needs_resample {
                 let rs = audio_resampler.get_or_insert_with(|| {
-                    let src_layout = if raw.ch_layout().channels() >= 2 {
-                        raw.ch_layout()
-                    } else {
-                        ChannelLayout::MONO
-                    };
                     resampling::Context::get2(
                         raw.format(),
                         src_layout,
@@ -874,9 +931,13 @@ pub(super) fn decode_clip_audio(clip: &ClipSpec) -> Result<(Vec<f32>, Vec<f32>),
             break;
         }
 
-        let raw_channels = raw.ch_layout().channels();
-        let needs_resample =
-            raw.format() != target_fmt || raw.rate() != AUDIO_RATE as u32 || raw_channels != 2;
+        let src_layout = {
+            crate::helpers::resample::ensure_layout(&mut raw);
+            raw.ch_layout()
+        };
+        let needs_resample = raw.format() != target_fmt
+            || raw.rate() != AUDIO_RATE as u32
+            || src_layout.channels() != 2;
 
         if needs_resample {
             if let Some(rs) = &mut audio_resampler {
@@ -919,26 +980,60 @@ pub(super) fn decode_clip_audio(clip: &ClipSpec) -> Result<(Vec<f32>, Vec<f32>),
     Ok((left, right))
 }
 
+// ── Centred transition math ───────────────────────────────────────────────────
+//
+// Export renders a transition the same way the preview does: a zone of `D`
+// seconds centred on the cut, taking D/2 from each side. Each half therefore
+// only has D/2 seconds of material, so the blend holds:
+//
+//   output frames 0 .. n/2   — outgoing half plays, incoming half holds its first frame
+//   output frames n/2 .. n   — outgoing half holds its last frame, incoming half plays
+//
+// Keeping this identical to `clip_query::active_transition_at` is what makes an
+// exported transition look like what the timeline showed.
+
+/// Source frame of each half that drives output frame `i` of a centred blend.
+///
+/// `n` is the total number of blend frames, `tail_len`/`head_len` the number of
+/// decoded frames available per half. Returns `None` when either half is empty.
+pub(super) fn centred_blend_indices(
+    i: usize,
+    n: usize,
+    tail_len: usize,
+    head_len: usize,
+) -> Option<(usize, usize)> {
+    if tail_len == 0 || head_len == 0 || n == 0 {
+        return None;
+    }
+    let half = n / 2;
+    let tail_idx = i.min(tail_len - 1);
+    let head_idx = i.saturating_sub(half).min(head_len - 1);
+    Some((tail_idx, head_idx))
+}
+
 // ── Transition application ────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_transition(
     transition: &dyn VideoTransition,
     tail_spec: &ClipSpec,
     head_spec: &ClipSpec,
-    spec: &EncodeSpec,
-    octx: &mut ffmpeg::format::context::Output,
-    video_encoder: &mut ffmpeg::encoder::Video,
-    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
-    hw_backend: HwBackend,
-    audio_state: &mut AudioEncState,
-    mut out_frame_idx: i64,
-    total_frames: u64,
-    frame_tb: Rational,
-    cancel: &Arc<AtomicBool>,
-    tx: &Sender<MediaResult>,
-    last_video_dts: &mut i64,
+    ctx: EncodeCtx<'_>,
 ) -> Result<i64, String> {
+    let EncodeCtx {
+        spec,
+        octx,
+        video_encoder,
+        hw_frames_ctx,
+        hw_backend,
+        audio_state,
+        out_frame_idx,
+        total_frames,
+        frame_tb,
+        cancel,
+        tx,
+        last_video_dts,
+    } = ctx;
+    let mut out_frame_idx = out_frame_idx;
     let tail_frames = decode_clip_frames(tail_spec, spec)?;
     let head_frames = decode_clip_frames(head_spec, spec)?;
 
@@ -947,8 +1042,12 @@ pub(super) fn apply_transition(
 
     let samples_per_frame_f = AUDIO_RATE as f64 / spec.fps as f64;
 
-    let n = tail_frames.len().min(head_frames.len());
-    if n == 0 {
+    // Each half carries D/2 seconds of material, and the blend as a whole lasts
+    // the full D — the same span the preview's centred zone covers.
+    let n = ((tail_spec.duration * 2.0) * spec.fps as f64)
+        .round()
+        .max(1.0) as usize;
+    if tail_frames.is_empty() || head_frames.is_empty() {
         return Ok(out_frame_idx);
     }
 
@@ -956,6 +1055,9 @@ pub(super) fn apply_transition(
     let h = spec.height as usize;
     let _uv_w = w / 2;
     let _uv_h = h / 2;
+    // Output sample offset of the blend's second half, in the head half's own
+    // audio timebase.
+    let head_sample_offset = ((n / 2) as f64 * samples_per_frame_f).round() as usize;
     let ost_tb = octx.stream(0).unwrap().time_base();
 
     for i in 0..n {
@@ -964,9 +1066,14 @@ pub(super) fn apply_transition(
         }
 
         let alpha = velocut_core::transitions::helpers::frame_alpha(i, n);
+        let Some((tail_idx, head_idx)) =
+            centred_blend_indices(i, n, tail_frames.len(), head_frames.len())
+        else {
+            return Ok(out_frame_idx);
+        };
         let blended = transition.apply(
-            &tail_frames[i],
-            &head_frames[i],
+            &tail_frames[tail_idx],
+            &head_frames[head_idx],
             spec.width,
             spec.height,
             alpha,
@@ -1008,26 +1115,38 @@ pub(super) fn apply_transition(
 
         let sample_start = (i as f64 * samples_per_frame_f).round() as usize;
         let sample_end = ((i + 1) as f64 * samples_per_frame_f).round() as usize;
-        let af = alpha as f32;
-
-        let tail_last_l = tail_audio_l.last().copied().unwrap_or(0.0);
-        let tail_last_r = tail_audio_r.last().copied().unwrap_or(0.0);
-        let head_last_l = head_audio_l.last().copied().unwrap_or(0.0);
-        let head_last_r = head_audio_r.last().copied().unwrap_or(0.0);
+        let first_half = i < n / 2;
+        // Each half's audio covers D/2 seconds only, so it is indexed from its own
+        // start while that half is the one playing. The other half stays silent
+        // rather than holding a sample — a held sample is a DC offset.
+        let tail_last = tail_audio_l.len().saturating_sub(1);
+        let head_last = head_audio_l.len().saturating_sub(1);
 
         for s in sample_start..sample_end {
-            let t_l = tail_audio_l.get(s).copied().unwrap_or(tail_last_l);
-            let t_r = tail_audio_r.get(s).copied().unwrap_or(tail_last_r);
-            let h_l = head_audio_l.get(s).copied().unwrap_or(head_last_l);
-            let h_r = head_audio_r.get(s).copied().unwrap_or(head_last_r);
+            let (t_l, t_r) = if first_half && !tail_audio_l.is_empty() {
+                let idx = s.min(tail_last);
+                (tail_audio_l[idx], tail_audio_r[idx])
+            } else {
+                (0.0, 0.0)
+            };
+            let (h_l, h_r) = if !first_half && !head_audio_l.is_empty() {
+                let idx = s.saturating_sub(head_sample_offset).min(head_last);
+                (head_audio_l[idx], head_audio_r[idx])
+            } else {
+                (0.0, 0.0)
+            };
+            // Level matches playback: full across each half, with only the 40 ms
+            // gate around the cut. Ramping across a whole half made an exported
+            // transition sound ducked and stepping 0.707/0.707 at the cut clicks.
+            let (gain_out, gain_in) = cut_gate(s as i64 - head_sample_offset as i64, AUDIO_RATE);
             audio_state
                 .fifo
                 .left
-                .push((t_l * (1.0 - af) + h_l * af).clamp(-1.0, 1.0));
+                .push((t_l * gain_out + h_l * gain_in).clamp(-1.0, 1.0));
             audio_state
                 .fifo
                 .right
-                .push((t_r * (1.0 - af) + h_r * af).clamp(-1.0, 1.0));
+                .push((t_r * gain_out + h_r * gain_in).clamp(-1.0, 1.0));
         }
 
         audio_state.drain_fifo(octx, false)?;
@@ -1046,4 +1165,94 @@ pub(super) fn apply_transition(
     }
 
     Ok(out_frame_idx)
+}
+
+#[cfg(test)]
+mod centred_transition_tests {
+    use super::centred_blend_indices;
+    use crate::encode::audio::cut_gate;
+
+    #[test]
+    fn outgoing_half_plays_then_holds() {
+        // 20 output frames (10 per half), 10 tail frames, 10 head frames.
+        let (t0, h0) = centred_blend_indices(0, 20, 10, 10).unwrap();
+        assert_eq!(
+            (t0, h0),
+            (0, 0),
+            "blend must start on both clips' first tail/head frame"
+        );
+
+        let (t9, h9) = centred_blend_indices(9, 20, 10, 10).unwrap();
+        assert_eq!(
+            (t9, h9),
+            (9, 0),
+            "incoming half holds frame 0 until the cut"
+        );
+
+        let (t10, h10) = centred_blend_indices(10, 20, 10, 10).unwrap();
+        assert_eq!(
+            (t10, h10),
+            (10 - 1, 0),
+            "tail holds its last frame at the cut"
+        );
+    }
+
+    #[test]
+    fn incoming_half_starts_at_the_cut_and_plays_out() {
+        let (t15, h5) = centred_blend_indices(15, 20, 10, 10).unwrap();
+        // Second half index 5 → head frame 5, tail frozen on its last frame.
+        assert_eq!((t15, h5), (9, 5));
+
+        let (t19, h9) = centred_blend_indices(19, 20, 10, 10).unwrap();
+        assert_eq!(
+            (t19, h9),
+            (9, 9),
+            "blend must end on the incoming clip's last head frame"
+        );
+    }
+
+    #[test]
+    fn holds_clamp_instead_of_panicking_when_a_half_is_short() {
+        // A decode that yielded fewer frames than requested must not index out
+        // of bounds — it holds the last frame it has.
+        assert_eq!(centred_blend_indices(18, 20, 3, 2).unwrap(), (2, 1));
+        assert_eq!(centred_blend_indices(19, 20, 1, 1).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn empty_half_reports_no_blend() {
+        assert_eq!(centred_blend_indices(0, 20, 0, 10), None);
+        assert_eq!(centred_blend_indices(0, 20, 10, 0), None);
+        assert_eq!(centred_blend_indices(0, 0, 10, 10), None);
+    }
+
+    #[test]
+    fn audio_is_full_level_away_from_the_cut() {
+        let rate: i32 = 44_100;
+        let rate_i = rate as i64;
+        // Well before the cut: outgoing at unity, incoming silent.
+        assert_eq!(cut_gate(-rate_i / 2, rate), (1.0, 0.0));
+        // Well after it: incoming at unity, outgoing silent.
+        assert_eq!(cut_gate(rate_i / 2, rate), (0.0, 1.0));
+    }
+
+    #[test]
+    fn audio_gate_straddles_the_cut() {
+        let rate: i32 = 44_100;
+        // Just inside the 40 ms window on either side: halfway through the ramp.
+        let half = (rate as f64 * 0.020).round() as i64;
+        let (out, inc) = cut_gate(-half, rate);
+        assert!((out - 0.5).abs() < 0.02, "outgoing {out}");
+        assert_eq!(inc, 0.0);
+        let (out, inc) = cut_gate(half, rate);
+        assert_eq!(out, 0.0);
+        assert!((inc - 0.5).abs() < 0.02, "incoming {inc}");
+    }
+
+    #[test]
+    fn audio_gate_is_silent_exactly_at_the_cut() {
+        // The swap itself must be silent on both sides, which is what stops the
+        // click playback avoids with the same 40 ms gate.
+        assert_eq!(cut_gate(0, 44_100), (0.0, 0.0));
+    }
 }

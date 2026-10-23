@@ -127,11 +127,34 @@ pub(super) struct AudioEncState {
     pub(super) audio_tb: Rational,
     pub(super) ost_audio_tb: Rational,
     pub(super) overlays: Vec<DecodedOverlay>,
+    /// Absolute output-sample spans covered by a V clip that contributes audio.
+    /// Sorted and merged, so overlapping lanes still count once — the preview
+    /// plays a single primary clip and normalizes the mix by the sink count.
+    pub(super) primary_spans: Vec<(i64, i64)>,
     /// Counts FIFO overrun events; used to throttle log spam at 1080p SW encode.
     pub(super) fifo_overrun_count: u64,
 }
 
 impl AudioEncState {
+    /// Whether a V clip's own audio is under `sample`.
+    ///
+    /// `primary_spans` is sorted and merged, so this is a binary search rather
+    /// than a scan per sample of every mix frame.
+    #[inline]
+    fn primary_active_at(&self, sample: i64) -> bool {
+        self.primary_spans
+            .binary_search_by(|&(start, end)| {
+                if sample < start {
+                    std::cmp::Ordering::Greater
+                } else if sample >= end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
     pub(super) fn drain_fifo(
         &mut self,
         octx: &mut ffmpeg::format::context::Output,
@@ -158,15 +181,37 @@ impl AudioEncState {
                     let fptr = frame.as_mut_ptr();
                     let ldst = std::slice::from_raw_parts_mut((*fptr).data[0] as *mut f32, n);
                     let rdst = std::slice::from_raw_parts_mut((*fptr).data[1] as *mut f32, n);
-                    for ov in &self.overlays {
-                        for i in 0..n {
-                            let ov_s = self.out_sample_idx + i as i64 - ov.start_sample;
+                    // The preview mixes every active sink at 1/sqrt(N) (equal
+                    // power): one primary audio source plus each standalone
+                    // overlay. Mirror that here so adding music changes the
+                    // export exactly as it changes playback, instead of leaving
+                    // the primary 3 dB hot and risking clipping.
+                    for i in 0..n {
+                        let sample = self.out_sample_idx + i as i64;
+                        let mut active = usize::from(self.primary_active_at(sample));
+                        for ov in &self.overlays {
+                            let ov_s = sample - ov.start_sample;
                             if ov_s >= 0 && (ov_s as usize) < ov.sample_count {
-                                let idx = ov_s as usize;
-                                ldst[i] = (ldst[i] + ov.left[idx]).clamp(-1.0, 1.0);
-                                rdst[i] = (rdst[i] + ov.right[idx]).clamp(-1.0, 1.0);
+                                active += 1;
                             }
                         }
+                        let gain = if active > 1 {
+                            1.0 / (active as f32).sqrt()
+                        } else {
+                            1.0
+                        };
+                        let mut l = ldst[i] * gain;
+                        let mut r = rdst[i] * gain;
+                        for ov in &self.overlays {
+                            let ov_s = sample - ov.start_sample;
+                            if ov_s >= 0 && (ov_s as usize) < ov.sample_count {
+                                let idx = ov_s as usize;
+                                l += ov.left[idx] * gain;
+                                r += ov.right[idx] * gain;
+                            }
+                        }
+                        ldst[i] = l.clamp(-1.0, 1.0);
+                        rdst[i] = r.clamp(-1.0, 1.0);
                     }
                 }
             }
@@ -219,6 +264,31 @@ impl AudioEncState {
 /// encoder is slow enough that the packet loop's send_packet/receive_frame
 /// interleaving leaves the resampler partially filled at clip_end, and without
 /// this flush those samples are silently discarded.
+/// Gate applied around a cut, matching playback's `audio_module::FADE_SECS`.
+///
+/// Playback keeps each clip at full level and only gates the cut itself: the
+/// outgoing sink ramps out over the last 40 ms, the incoming sink fades in over
+/// its first 40 ms. That is short enough to be inaudible as a level dip and long
+/// enough to hide any zero-crossing or DC step, which is why a hard swap of two
+/// non-silent halves clicks. Export has to use the same shape or a rendered
+/// transition sounds ducked relative to the preview.
+pub(super) const CUT_FADE_SECS: f64 = 0.040;
+
+/// Gains `(outgoing, incoming)` for a sample `offset_from_cut` samples from the
+/// cut. Negative = before the cut (outgoing side), positive = after it.
+/// Full level everywhere except the 40 ms gate straddling the cut.
+pub(super) fn cut_gate(offset_from_cut: i64, audio_rate: i32) -> (f32, f32) {
+    let fade = (CUT_FADE_SECS * audio_rate as f64).round().max(1.0);
+    if offset_from_cut < 0 {
+        // Outgoing side: full level until the final 40 ms, then ramp to silence.
+        let remaining = (-offset_from_cut) as f64;
+        ((remaining / fade).clamp(0.0, 1.0) as f32, 0.0)
+    } else {
+        // Incoming side: ramp up over the first 40 ms, then full level.
+        (0.0, (offset_from_cut as f64 / fade).clamp(0.0, 1.0) as f32)
+    }
+}
+
 pub(super) fn flush_audio_resampler(
     resampler: &mut resampling::Context,
     fifo: &mut AudioFifo,
@@ -276,11 +346,11 @@ pub(super) fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, S
         .audio()
         .map_err(|e| format!("overlay audio decoder: {e}"))?;
 
-    let seek_ts = {
-        let tb = in_tb;
-        (overlay.source_offset * tb.denominator() as f64 / tb.numerator() as f64) as i64
-    };
-    let _ = ictx.seek(seek_ts, ..=seek_ts);
+    // `avformat_seek_file` with `stream_index = -1` expects AV_TIME_BASE
+    // microseconds; the old hand-rolled conversion used the stream timebase,
+    // which sought to ~0 for long offsets and forced decoding from the start.
+    // The shared helper also skips the Windows-EPERM max_ts=0 seek at offset 0.
+    crate::helpers::seek::seek_to_secs(&mut ictx, overlay.source_offset, "decode_overlay");
 
     let mut resampler: Option<resampling::Context> = None;
     let mut left: Vec<f32> = Vec::new();
@@ -333,17 +403,15 @@ pub(super) fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, S
                 break;
             }
 
-            let src_channels = raw.ch_layout().channels();
+            let src_layout = {
+                crate::helpers::resample::ensure_layout(&mut raw);
+                raw.ch_layout()
+            };
             let needs_resample =
-                raw.format() != target_fmt || raw.rate() != OUT_RATE || src_channels != 2;
+                raw.format() != target_fmt || raw.rate() != OUT_RATE || src_layout.channels() != 2;
 
             if needs_resample {
                 let rs = resampler.get_or_insert_with(|| {
-                    let src_layout = if src_channels >= 2 {
-                        raw.ch_layout()
-                    } else {
-                        ChannelLayout::MONO
-                    };
                     resampling::Context::get2(
                         raw.format(),
                         src_layout,
@@ -393,9 +461,12 @@ pub(super) fn decode_overlay(overlay: &AudioOverlay) -> Result<DecodedOverlay, S
             break;
         }
 
-        let src_channels = raw.ch_layout().channels();
+        let src_layout = {
+            crate::helpers::resample::ensure_layout(&mut raw);
+            raw.ch_layout()
+        };
         let needs_resample =
-            raw.format() != target_fmt || raw.rate() != OUT_RATE || src_channels != 2;
+            raw.format() != target_fmt || raw.rate() != OUT_RATE || src_layout.channels() != 2;
 
         if needs_resample {
             if let Some(rs) = &mut resampler {
@@ -516,4 +587,63 @@ pub(super) fn fade_gain(
         1.0
     };
     in_gain.min(out_gain)
+}
+
+#[cfg(test)]
+mod overlay_decode_tests {
+    use super::decode_overlay;
+    use crate::encode::AudioOverlay;
+
+    /// Plain stereo PCM WAV with only the 16-byte fmt chunk: the decoder
+    /// reports two channels but no channel mask, which is exactly the layout
+    /// that used to panic inside ffmpeg-the-third's resampler constructor.
+    fn write_tone_wav(path: &std::path::Path, secs: f64) {
+        const SR: u32 = 44_100;
+        let frames = (secs * SR as f64).round() as u32;
+        let data_len = frames * 4;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&SR.to_le_bytes());
+        bytes.extend_from_slice(&(SR * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..frames {
+            let phase = std::f64::consts::TAU * 440.0 * i as f64 / SR as f64;
+            let sample = (0.5 * phase.sin() * i16::MAX as f64) as i16;
+            bytes.extend_from_slice(&sample.to_le_bytes());
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn decodes_a_pcm_wav_without_a_channel_mask() {
+        let path = std::env::temp_dir().join("velocut_overlay_unit.wav");
+        write_tone_wav(&path, 1.0);
+        let overlay = AudioOverlay {
+            path: path.clone(),
+            source_offset: 0.0,
+            timeline_start: 0.0,
+            duration: 1.0,
+            volume: 1.0,
+            fade_in_secs: 0.0,
+            fade_in_start_secs: 0.0,
+            fade_out_secs: 0.0,
+            fade_out_end_secs: 0.0,
+        };
+        let decoded = decode_overlay(&overlay).expect("decode overlayed tone");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            decoded.left.len() > 40_000,
+            "expected ~1s of samples, got {}",
+            decoded.left.len()
+        );
+    }
 }
